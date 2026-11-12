@@ -1,0 +1,37 @@
+# ggml backend GEN9, step 1 (F32 MUL_MAT, design D0), 2026-11-13 -- docs/ggml-backend-design.md
+# ggml-backend/ggml-gen9.cpp: weights packed once (gen9blas_pack_b) into a per-backend cache, gemm_pb per call;
+# non-weight src0 -> gen9blas_gemm per call. llama.cpp 2cbe0ec build-cpu (CPU only) + GGML_BACKEND_PATH.
+# UHD 620, IOMMU off, mains power. Model Qwen2.5-1.5B-Instruct F32.
+
+## test-backend-ops test -b GEN9 -o MUL_MAT
+6/6 accepted cases pass (all F32, batch >= 32, 2-D): m=100 n=33/128 k=32/48, m=32 n=509 k=2112, m=64 n=32 k=80.
+Routing: asked 3144, declined: type 2855 (F16 / quantized: not in this version), shape/layout 202, batch<32 81.
+All 6 went through the per-call path (test-backend-ops never marks src0 as WEIGHTS) -> the cache is tested below.
+
+## llama-bench -p 512 -n 0 -r 3, alternating
+First attempt invalid: f16_range (step 1b) ran at the same time and the machine swapped (13 GB swapped in during
+the session): GEN9 53.6 +- 48.5 and 11.3 +- 8.9 t/s, wall 140 / 279 s at 41-44 s CPU. Repeated alone:
+round1 GEN9 backend      108.85 +- 0.56   (wall 24.4 s, user 43.8 s, sys 4.0 s; 682 pages swapped in)
+round1 BLAS+LD_PRELOAD    80.13 +- 0.84   (build-blas, OpenBLAS + gen9blas injected: the path of 2026-11-12)
+round1 cpu-only           45.76 +- 1.75
+round2 GEN9 backend      107.33 +- 2.86   (wall 23.5 s, user 39.9 s, sys 3.1 s; 12587 pages swapped in)
+round2 BLAS+LD_PRELOAD    79.82 +- 0.53
+round2 cpu-only           49.15 +- 0.38
+Routing (each GEN9 run): 193 weights packed once, 579 MUL_MATs from the cache (3 reps x 193), 0 per call;
+2967 MUL_MAT queries declined for batch < 32 (token rows of the last layer, graph-building probes).
+-> prediction D0/F32 105-115 t/s: confirmed (107-109). 1.35x the BLAS path, 2.2-2.4x ggml-cpu without BLAS.
+
+## llama-perplexity -c 512 --chunks 10, text = docs/history.md + docs/pitfalls.md
+cpu-only:  PPL = 14.8924 +/- 0.87183
+GEN9:      PPL = 14.8924 +/- 0.87183   (identical; the head 151936 x 1536 x 512 goes through GEN9 in launch bands)
+journalctl -k: no GPU reset.
+-> criterion "perplexity within 0.1 % of ggml-cpu": met (identical to 4 decimals).
+
+## Memory
+Packed copies ~6.2 GB + model mmap 6.6 GB on a 15.8 GB machine: works alone, swaps with anything else running
+(design section 3.2 expected F32 1.5B to be tight).
+
+## Step 1b (F16 range, CPU only): results/f16-range-qwen2.5-1.5b-2026-11-13.txt
+10 chunks x 512 tokens, every 2-D weight MUL_MAT, 4 sampled rows per call with all chunks of 32 products:
+largest |chunk sum| seen 2620 (blk.26.ffn_down, max|x| 927), i.e. 25x below 65504; the a-priori bound
+max|x| * max|w| * 32 reaches 1.7e5 (blk.1.ffn_down), so overflow is not excluded: keep the non-finite flag + F32 rerun.
