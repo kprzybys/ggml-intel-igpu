@@ -1,4 +1,4 @@
-// ggml backend "GEN9" on gen9blas kernels (docs/ggml-backend-design.md). Step 1: MUL_MAT with F32 weights.
+// ggml backend "GEN9" on gen9blas kernels (docs/ggml-backend-design.md). Step 1: MUL_MAT with F32 and F16 weights.
 // One ACCEL device. Default buffer type = the CPU buffer type, as ggml-blas: weights stay in llama.cpp's own (mmap)
 // buffers and results stay in host memory (design D0). Weights (WEIGHTS-usage buffer, op NONE, not a view, not an
 // input / parameter) are packed once into GPU memory (gen9blas_pack_b) and kept in a per-backend cache; any other src0
@@ -20,6 +20,7 @@
 #include <map>
 #include <mutex>
 #include <tuple>
+#include <vector>
 
 #ifndef GEN9_BENCH_DIR
 #define GEN9_BENCH_DIR ""
@@ -27,13 +28,14 @@
 
 // ---------------- routing counter (printed at exit with GEN9_INFO=1) ----------------
 
-static std::atomic<long> n_graphs{0}, n_noop{0}, n_mm_cached{0}, n_mm_packed{0}, n_mm_percall{0};
+static std::atomic<long> n_graphs{0}, n_noop{0}, n_mm_cached{0}, n_mm_packed{0}, n_mm_percall{0}, n_mm_f16{0}, n_mm_f16_fallback{0};
 static std::atomic<long> n_mm_asked{0}, n_mm_declined_shape{0}, n_mm_declined_type{0}, n_mm_declined_batch{0},
                          n_mm_declined_hint{0}, n_mm_declined_gpu{0};
 
 static void gen9_report(void) {
-    fprintf(stderr, "gen9: graph_compute %ld; no-op nodes %ld; MUL_MAT run: cached weight %ld, packed now %ld, per call %ld\n",
-            n_graphs.load(), n_noop.load(), n_mm_cached.load(), n_mm_packed.load(), n_mm_percall.load());
+    fprintf(stderr, "gen9: graph_compute %ld; no-op nodes %ld; MUL_MAT run: cached weight %ld, packed now %ld, per call %ld; "
+            "F16 weights %ld (recomputed in F32 after FP16 overflow: %ld)\n", n_graphs.load(), n_noop.load(), n_mm_cached.load(),
+            n_mm_packed.load(), n_mm_percall.load(), n_mm_f16.load(), n_mm_f16_fallback.load());
     fprintf(stderr, "gen9: supports_op MUL_MAT asked %ld, declined: shape/layout %ld, type %ld, batch<32 %ld, hint %ld, no GPU %ld\n",
             n_mm_asked.load(), n_mm_declined_shape.load(), n_mm_declined_type.load(), n_mm_declined_batch.load(),
             n_mm_declined_hint.load(), n_mm_declined_gpu.load());
@@ -80,29 +82,54 @@ static void gen9_backend_free(ggml_backend_t backend) {
 }
 
 // dst[M x N] = src1[M x K] . src0^T with src0 stored N x K row-major: gemm(A = src1, B = src0 transposed).
+// F32 weights: SGEMM. F16 weights: accurate FP16 GEMM (gemm_pb_f16w); a call whose result overflows FP16 is recomputed
+// with the weights converted to F32 (rare: largest chunk sum seen on Qwen2.5-1.5B is 25x below the FP16 limit).
 static bool gen9_mul_mat(gen9_context * ctx, struct ggml_tensor * dst) {
     const struct ggml_tensor * w = dst->src[0], * x = dst->src[1];
+    const bool f16 = w->type == GGML_TYPE_F16;
+    const int t = f16 ? GEN9BLAS_HS : GEN9BLAS_S;
     const int K = (int) w->ne[0], N = (int) w->ne[1], M = (int) x->ne[1];
-    const int ldb = (int) (w->nb[1] / sizeof(float)), lda = (int) (x->nb[1] / sizeof(float)), ldc = (int) (dst->nb[1] / sizeof(float));
+    const int ldb = (int) (w->nb[1] / ggml_type_size(w->type));
+    const int lda = (int) (x->nb[1] / sizeof(float)), ldc = (int) (dst->nb[1] / sizeof(float));
     std::lock_guard<std::mutex> lk(gpu_mu);
+    gen9blas_packed * P = nullptr;
+    bool temp = false;
     if (is_weight(w)) {
         wkey k = { w->data, ggml_nbytes(w), (int) w->type, w->ne[0], w->ne[1] };
         auto it = ctx->cache.find(k);
-        gen9blas_packed * P;
         if (it == ctx->cache.end()) {
-            P = gen9blas_pack_b(GEN9BLAS_S, 1, K, N, w->data, ldb);
+            P = gen9blas_pack_b(t, 1, K, N, w->data, ldb);
             if (!P) { fprintf(stderr, "gen9: pack_b %s failed: %s\n", w->name, gen9blas_error()); return false; }
             ctx->cache[k] = P; n_mm_packed++;
         } else { P = it->second; n_mm_cached++; }
-        if (gen9blas_gemm_pb(GEN9BLAS_S, 0, M, 1.0, x->data, lda, P, 0.0, dst->data, ldc)) {
-            fprintf(stderr, "gen9: gemm_pb %s failed: %s\n", w->name, gen9blas_error()); return false;
+    } else {
+        n_mm_percall++;
+        if (!f16) {
+            if (gen9blas_gemm(GEN9BLAS_S, 0, 1, M, N, K, 1.0, x->data, lda, w->data, ldb, 0.0, dst->data, ldc)) {
+                fprintf(stderr, "gen9: gemm failed: %s\n", gen9blas_error()); return false;
+            }
+            return true;
         }
-        return true;
+        P = gen9blas_pack_b(t, 1, K, N, w->data, ldb);
+        if (!P) { fprintf(stderr, "gen9: pack_b failed: %s\n", gen9blas_error()); return false; }
+        temp = true;
     }
-    n_mm_percall++;
-    if (gen9blas_gemm(GEN9BLAS_S, 0, 1, M, N, K, 1.0, x->data, lda, w->data, ldb, 0.0, dst->data, ldc)) {
-        fprintf(stderr, "gen9: gemm failed: %s\n", gen9blas_error()); return false;
+    int rc;
+    if (!f16) rc = gen9blas_gemm_pb(GEN9BLAS_S, 0, M, 1.0, x->data, lda, P, 0.0, dst->data, ldc);
+    else {
+        int nonfinite = 0;
+        n_mm_f16++;
+        rc = gen9blas_gemm_pb_f16w(M, (const float *) x->data, lda, P, (float *) dst->data, ldc, &nonfinite);
+        if (!rc && nonfinite) {   // FP16 overflow somewhere: recompute this call in F32
+            n_mm_f16_fallback++;
+            std::vector<float> wf((size_t) N * K);
+            for (int n = 0; n < N; n++)
+                ggml_fp16_to_fp32_row((const ggml_fp16_t *) ((const char *) w->data + (size_t) n * w->nb[1]), wf.data() + (size_t) n * K, K);
+            rc = gen9blas_gemm(GEN9BLAS_S, 0, 1, M, N, K, 1.0, x->data, lda, wf.data(), K, 0.0, dst->data, ldc);
+        }
     }
+    if (temp) gen9blas_packed_free(P);
+    if (rc) { fprintf(stderr, "gen9: MUL_MAT %s failed: %s\n", w->name, gen9blas_error()); return false; }
     return true;
 }
 
@@ -192,15 +219,21 @@ static ggml_backend_buffer_t gen9_dev_buffer_from_host_ptr(ggml_backend_dev_t, v
 
 static bool fits_int(int64_t v) { return v > 0 && v <= INT_MAX; }
 
-// Design section 7 (F32 weights only in this version; F16 needs new kernels).
+// Design section 7: F32 or F16 weights, F32 activations and result.
 static bool gen9_supports_mul_mat(const struct ggml_tensor * op) {
     const struct ggml_tensor * w = op->src[0], * x = op->src[1];
     n_mm_asked++;
-    if (w->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) { n_mm_declined_type++; return false; }
+    if ((w->type != GGML_TYPE_F32 && w->type != GGML_TYPE_F16) || x->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
+        n_mm_declined_type++; return false;
+    }
     if (w->ne[2] != 1 || w->ne[3] != 1 || x->ne[2] != 1 || x->ne[3] != 1 || !ggml_is_contiguous(w) || !ggml_is_contiguous(x) ||
         !ggml_is_contiguous(op) || !fits_int(w->ne[0]) || !fits_int(w->ne[1]) || !fits_int(x->ne[1])) { n_mm_declined_shape++; return false; }
     if (op->ne[0] < 32 || op->ne[1] < 32 || x->ne[0] < 32) { n_mm_declined_batch++; return false; }
     if (ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_HADAMARD) { n_mm_declined_hint++; return false; }
+    if (w->type == GGML_TYPE_F16) {   // FP16 chunk sums and FP16 activations: not allowed if F32 / BF16 precision is required
+        const enum ggml_prec acc = ggml_prec_get_acc(op), p1 = ggml_prec_get_src(op, 1);
+        if (acc == GGML_PREC_F32 || acc == GGML_PREC_BF16 || p1 == GGML_PREC_F32 || p1 == GGML_PREC_BF16) { n_mm_declined_hint++; return false; }
+    }
     if (!gpu_ok()) { n_mm_declined_gpu++; return false; }
     return true;
 }

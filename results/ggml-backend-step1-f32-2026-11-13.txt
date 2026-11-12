@@ -22,10 +22,18 @@ Routing (each GEN9 run): 193 weights packed once, 579 MUL_MATs from the cache (3
 -> prediction D0/F32 105-115 t/s: confirmed (107-109). 1.35x the BLAS path, 2.2-2.4x ggml-cpu without BLAS.
 
 ## llama-perplexity -c 512 --chunks 10, text = docs/history.md + docs/pitfalls.md
-cpu-only:  PPL = 14.8924 +/- 0.87183
-GEN9:      PPL = 14.8924 +/- 0.87183   (identical; the head 151936 x 1536 x 512 goes through GEN9 in launch bands)
-journalctl -k: no GPU reset.
--> criterion "perplexity within 0.1 % of ggml-cpu": met (identical to 4 decimals).
+CORRECTED (see results/ggml-backend-step1-f16-2026-11-13.txt): the first GEN9 run below did NOT use GEN9.
+llama-perplexity (common/) calls ggml_backend_load_all(), which reads GGML_BACKEND_PATH, only on some options; in this
+shared non-DL build the CPU backend is already registered, so GGML_BACKEND_PATH was ignored. No "load_backend" line and
+no routing counter in that log; per-pass time 41 vs 46 s. llama-bench calls ggml_backend_load_all() itself, so the
+llama-bench numbers above are valid (routing counter present).
+cpu-only:              PPL = 14.8924 +/- 0.87183
+"GEN9" (CPU in fact):  PPL = 14.8924 +/- 0.87183   -- invalid comparison
+Valid run, with -ot '^gen9_load_backends_only$=CPU' to force ggml_backend_load_all():
+GEN9:                  PPL = 14.8926 +/- 0.87184   (+0.001 %; same as gen9blas via LD_PRELOAD on 2026-11-12)
+  routing: 197 weights packed (incl. output.weight: the head 151936 x 1536 x 512 per pass goes through GEN9 in bands),
+  1753 MUL_MATs from the cache, 0 per call; declined: batch<32 6501, shape/layout 36. journalctl -k: no GPU reset.
+-> criterion "perplexity within 0.1 % of ggml-cpu": met.
 
 ## Memory
 Packed copies ~6.2 GB + model mmap 6.6 GB on a 15.8 GB machine: works alone, swaps with anything else running

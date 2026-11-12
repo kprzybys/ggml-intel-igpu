@@ -1,0 +1,46 @@
+# ggml backend GEN9, step 1 F16 weights (design D0), 2026-11-13 -- docs/ggml-backend-design.md sections 4-6
+# Path: F16 weights packed once for the accurate FP16 GEMM (GEN9BLAS_HS, pk_b16_t); F32 activations packed straight to
+# FP16 (new kernel pk_a3_f32, round to nearest); main kernel hgemm_kc_v (32 FP16 products, then FP32 sums) writes FP16 into
+# a work buffer; new epilogue gen9blas_epilog_hf converts to F32 and raises a flag on non-finite values; a flagged call is
+# recomputed with the weights converted to F32 (SGEMM). No change to the assembly kernels.
+# Deviation from the design: the result is rounded to FP16 once (the asm kernel stores FP16), ~2^-11 relative.
+
+## Prediction (written before building the kernels)
+[HYP] pp512 Qwen2.5-1.5B F16: GEMM 1299 GFLOP at 550-640 GFLOPS = 2.0-2.4 s; A packing+conversion ~0.15 s; extra
+      epilogue FP16 -> F32 over all outputs (~0.66 GB read + 1.32 GB written per pass at ~20 GB/s) ~0.1 s; CPU ops 0.85 s;
+      execbuf ~0.07 s -> 3.2-3.6 s per pass -> 140-160 t/s (design said 145-165 without the epilogue).
+[HYP] Perplexity within 0.5 % of ggml-cpu with the F16 model (FP16 activations and FP16 result rounding).
+[HYP] No non-finite flag on the perplexity text (largest chunk sum 2620, results/f16-range-qwen2.5-1.5b-2026-11-13.txt);
+      the flag path itself is tested with a synthetic overflow in lib/test_packed.py.
+[HYP] test-backend-ops: F16 x F32 MUL_MAT cases with batch >= 32 pass (NMSE limit 5e-4; FP16 rounding gives ~1e-7).
+Memory: packed F16 3.1 GB + mmap 3.4 GB: comfortable on 15.8 GB.
+
+## Measurements
+
+### lib/test_packed.py (gemm_pb_f16w): all OK
+F16w 512x1536x1536 rel err 1.41e-04 | 512x8960x1536 1.31e-04 | 512x1536x8960 (|x| <= 30) 5.22e-05 | 33x100x2051 8.28e-05
+(rel err to sum|a*w|, FP16 rounding of A and of C); flag 0 in all of these.
+Flag test: 512x1536x8960 with |x| <= 900 -> flag 1, and the exact float64 result does exceed 65504 (flag iff overflow);
+x = 1000, w = 1, K = 256 (C = 256000) -> flag 1; x = 200 (C = 51200) -> flag 0, exact.
+make -C lib check including test_packed.py: exit 0 (run below in the commit).
+
+### test-backend-ops test -b GEN9 -o MUL_MAT
+11/11 accepted cases pass (6 F32 + 5 F16 weights); declined: type 2557 (quantized etc.), shape/layout 414, batch<32 162.
+
+### llama-bench -p 512 -n 0 -r 3, Qwen2.5-1.5B F16, alternating
+round1 GEN9 backend      176.42 +- 1.91   (wall 17.6 s; 193 packed, 579 cached, 0 FP16-overflow recomputations)
+round1 BLAS+LD_PRELOAD    62.18 +- 0.72   (ggml-blas converts F16 weights to F32 on the CPU before each sgemm)
+round1 cpu-only           47.27 +- 3.22
+round2 GEN9 backend      178.48 +- 3.47
+round2 BLAS+LD_PRELOAD    67.48 +- 3.21
+round2 cpu-only           52.54 +- 3.03
+-> prediction 140-160 t/s: WRONG (too low), measured 176-178 (+10-27 % above the range). Not yet explained: one of the
+   inputs to the model (HS GEMM at 550-640 GFLOPS, 0.85 s of CPU ops from the F32 BLAS-path breakdown, 0.1 s epilogue)
+   is too pessimistic; a breakdown with KCL_PROFILE_KERNELS would tell which.
+   vs F32 GEN9 (107-109 t/s, results/ggml-backend-step1-f32-2026-11-13.txt): 1.64x.
+
+### llama-perplexity -c 512 --chunks 10 (with -ot '^gen9_load_backends_only$=CPU' so that GGML_BACKEND_PATH is read)
+cpu-only F16: PPL = 14.8924 +/- 0.87183   [1]22.1591 [2]27.8666 ... [10]14.8924   (42.6 s per pass)
+GEN9 F16:     PPL = 14.8950 +/- 0.87199   [1]22.1759 [2]27.8827 ... [10]14.8950   (15.3 s per pass)
+-> +0.017 %, criterion < 0.5 %: met. 1950 F16 MUL_MATs, 0 recomputed after FP16 overflow. No GPU reset.
+(An earlier pair of runs without the -ot option did not load GEN9 at all and is discarded; see the F32 file.)
