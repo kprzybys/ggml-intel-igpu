@@ -1,0 +1,177 @@
+# llama.cpp (2cbe0ec) GGML_BLAS=ON (OpenBLAS 0.3.26) on i5-8265U + UHD 620: OpenBLAS vs LD_PRELOAD libgen9blas_blas.so
+# Model: Qwen2.5-1.5B-Instruct, F32 GGUF (converted from the official fp16 GGUF with llama-quantize ... F32)
+# Why F32: ggml-blas.cpp (lines 70-103) converts non-F32 weights to FP32 on the CPU before every cblas_sgemm; F32 skips it.
+
+## Prediction (written before any measurement)
+
+Facts from the source (ggml/src/ggml-blas/ggml-blas.cpp, 2cbe0ec):
+- MUL_MAT goes to BLAS only if ne0, ne1, ne10 >= 32 (line 420-431): prompt processing (pp) yes, token generation (tg) no.
+- Call: cblas_sgemm(RowMajor, NoTrans, Trans, ...) once per (i02, i03) plane.
+
+Model shapes (hidden 1536, FFN 8960, 28 layers, KV heads 2 x 128): per token per layer
+2 * (2*1536*1536 + 2*256*1536 + 3*8960*1536) = 93.6 MFLOP -> 2.62 GFLOP/token -> pp512 ~ 1340 GFLOP in weight GEMMs.
+Largest call: M = 512 tokens, N = 8960, K = 1536: 14.1 GFLOP, ~47 ms at 300 GFLOPS (far below the 640 ms preemption limit).
+Weight matrix per FFN call: 8960 x 1536 FP32 = 55 MB in ordinary host memory (userptr path, not USM).
+
+[HYP] OpenBLAS (8 threads) on these shapes: 200-300 GFLOPS -> 4.5-6.7 s of GEMM per pp512 -> pp512 ~ 70-110 t/s.
+[HYP] gen9blas: 200-300 GFLOPS (host memory, userptr, per-call setup) -> pp512 within +-30 % of OpenBLAS,
+      but process CPU during pp far lower (OpenBLAS ~770 %; gen9blas: only the non-GEMM ops on the CPU).
+[HYP] tg (batch 1): no change (stays on the CPU, ggml-cpu).
+[HYP] perplexity: equal to OpenBLAS within 0.1 % (FP32 accumulation on both sides).
+Falsified if: gen9blas pp512 < 0.7x OpenBLAS, or perplexity differs > 0.1 %, or GEN9BLAS_BLAS_INFO shows the big calls on the CPU.
+
+## Measurements
+
+Model file: qwen2.5-1.5b-instruct-f32.gguf (6.62 GiB, 1.78 B params, all F32). llama-bench defaults: 4 threads, ubatch 512.
+On mains power, laptop on Wi-Fi, desktop session running.
+
+### 1. Baseline: OpenBLAS (no LD_PRELOAD)
+pp512: 82.07 +- 10.27 t/s  (r = 3)    -> inside the predicted 70-110 t/s
+tg128:  2.28 +-  0.11 t/s  (r = 3)    -> memory-bound: 6.62 GiB read per token ~ 15 GB/s
+Whole llama-bench pp run (load + warm-up + 3 reps): wall 111.2 s, CPU 131 % average (includes ~6.6 GiB model load).
+Note: ggml-blas calls openblas_set_num_threads(4), so OpenBLAS runs 4 threads here, not 8.
+
+### 2. Routing check: GEN9BLAS_BLAS_INFO=1, pp512, r = 1
+386 x "gen9blas_blas: sgemm -> GPU", none on the CPU. No GPU reset in `journalctl -k`.
+
+### 3. pp512, both configurations, back to back (r = 1 and r = 6; the difference = 5 reps without load/warm-up)
+                 llama-bench t/s        /usr/bin/time: wall, user, sys (s)
+openblas r=1     107.78                 13.10   59.82   6.61
+openblas r=6      80.75 +- 15.69        44.46  204.70  21.59
+gen9blas r=1      62.81                 16.88   29.93   1.71
+gen9blas r=6      62.65 +-  0.30        57.73  102.21   3.12
+5 reps of pp512 (r=6 minus r=1):  openblas wall 31.4 s, CPU 159.9 s -> 510 % CPU
+                                  gen9blas wall 40.9 s, CPU  73.7 s -> 180 % CPU
+OpenBLAS starts at 108 t/s and falls to ~80 within seconds (shared 15 W package limit; large +-); gen9blas is steady.
+Effective weight-GEMM rate (1340 GFLOP per pp512, all other ops counted as overhead):
+openblas ~6.3 s per pp512 -> ~213 GFLOPS; gen9blas ~8.2 s -> ~164 GFLOPS.
+
+### 4. Perplexity: llama-perplexity -c 512 --chunks 10, text = docs/history.md + docs/pitfalls.md (57.8 kB)
+openblas: PPL 14.8924 +- 0.87184
+gen9blas: PPL 14.8926 +- 0.87184   (difference 0.001 %; per-chunk values agree to 4-5 digits)
+No GPU reset in `journalctl -k`.
+
+## Verdict against the prediction
+- pp512 OpenBLAS 70-110 t/s: confirmed (81, first run 108).
+- gen9blas pp512 within +-30 % of OpenBLAS: borderline. 0.78x the warm OpenBLAS mean (inside), 0.58x its first run
+  (outside). Not faster in time.
+- CPU "far lower": partly. 180 % vs 510 %, i.e. 2.8x less CPU, not the ~10x of a plain SGEMM call. [HYP] the rest is
+  ggml-cpu's own ops plus its 4 worker threads waiting (spinning) while the BLAS call runs on the GPU: to check with perf.
+- tg: not re-measured with gen9blas (batch 1 does not reach ggml-blas, min_batch = 32).
+- Perplexity equal within 0.1 %: confirmed (0.001 %).
+- Effective 164 GFLOPS vs ~340 for SGEMM alone: [HYP] per-call cost of 55 MB host weights (userptr pin/unpin of each
+  weight matrix on every call, 196 calls per pp512) and serial non-GEMM ops between calls. Next step: per-call
+  timing (GPU time vs wall) for one FFN call; keeping weights resident needs a ggml backend, not a BLAS shim.
+
+## Comparison with other GPU paths: prediction (written before measuring)
+
+A. CLBlast 1.6.2 (Ubuntu package, NEO 24.35) behind the same ggml-blas path, through a ~60-line cblas_sgemm shim
+   (bench/compare/clblast_cblas.c): per call, copy A and B into new cl_mem buffers, CLBlastSgemm, read C back.
+   Facts: CLBlast SGEMM square 248 GFLOPS at n = 1024, 44 at n = 4096 (results/compare-l3-power-2026-11-11.txt).
+   [HYP] On these shapes (M = 512, K = 1536 or 8960) 80-200 GFLOPS of kernel time, plus copying ~55 MB per FFN call
+   (~10-20 ms) -> pp512 25-55 t/s, i.e. gen9blas 1.1-2.5x faster on the same path. Perplexity equal within 0.1 %.
+B. llama.cpp Vulkan backend (Mesa ANV 25.2.8), whole model on the GPU (-ngl 99), weights resident.
+   Facts: ggml-vulkan MUL_MAT f32 square 111-142 GFLOPS (results/compare-ggml-vulkan-2026-11-11.txt), no copies.
+   [HYP] pp512 ~ 1340 GFLOP / 110-140 GFLOPS + attention -> 40-60 t/s (below gen9blas-through-BLAS at 63);
+   tg128 memory-bound like the CPU (~2-2.5 t/s); process CPU low (< 120 %). Perplexity equal within 0.1 %.
+
+## Comparison: measurements
+
+### A. CLBlast shim (bench/compare/clblast_cblas.c), same ggml-blas path
+                 llama-bench t/s        /usr/bin/time: wall, user, sys (s)
+clblast r=1       37.97                 27.53   19.81  14.94    (386 sgemm calls, 26.1 s inside cblas_sgemm)
+clblast r=6       39.22 +- 1.06         92.03   67.44  48.25    (1351 calls, 88.4 s inside cblas_sgemm)
+5 reps: wall 64.5 s, CPU 80.9 s -> 125 % CPU. ~13.1 s per pp512 -> ~103 GFLOPS effective weight-GEMM rate.
+Perplexity: 14.8926 +- 0.87184 (same as gen9blas and OpenBLAS).
+-> prediction (25-55 t/s, gen9blas 1.1-2.5x faster): confirmed, gen9blas 62.7 / 39.2 = 1.6x.
+
+### B. llama.cpp Vulkan backend (build with GGML_VULKAN=ON, Mesa ANV 25.2.8), -ngl 99
+                 llama-bench t/s        /usr/bin/time: wall, user, sys (s)
+vulkan r=1        37.07                 38.22    7.76   4.11
+vulkan r=6        37.05 +- 0.66        106.39   21.32   4.65
+5 reps: wall 68.2 s, CPU 14.1 s -> 21 % CPU.
+tg128: 3.87 +- 0.03 t/s (r = 3) vs 2.28 on the CPU (1.7x: GPU-side reads of the resident weights beat the CPU path).
+Perplexity: FAILED. llama-perplexity -ngl 99 -c 512 --chunks 10 aborted (exit 134); journalctl -k 22:33:44:
+"Resetting rcs0 for preemption time out", "context reset due to GPU hang", "GPU HANG: ecode 9:1:8ed9fff2".
+[HYP] cause: perplexity needs logits for all 512 tokens, so the output projection is one MUL_MAT of
+151936 x 1536 x 512 = 239 GFLOP (~1.7-2 s at 120-140 GFLOPS), above the 640 ms preemption limit while the desktop
+uses the GPU (llama-bench computes only the last token's logits). Same failure class as 2026-11-11 (docs/no-neo.md).
+-> prediction (40-60 t/s, CPU < 120 %): pp512 below the range (37), CPU confirmed; tg better than predicted.
+
+## IOMMU off for the GPU (intel_iommu=igfx_off): prediction (written before the reboot)
+Now: GPU in IOMMU group 0, type DMA-FQ; cmdline "quiet splash".
+Facts: userptr pinning ~0.45 us/page on this laptop (results/userptr-2026-11-12.txt); warm pinning on the HD 530 without
+IOMMU ~0.09-0.11 us/page (results/userptr-overhead-hd530-2026-11-12.txt). One pp512 pins ~6.2 GB of weights (~1.5 M pages)
+plus activations, i.e. ~0.7 s of 8.2 s now.
+[HYP] gen9blas pp512: 63 -> 66-70 t/s (pinning 0.7 -> ~0.15 s), CPU 180 % -> ~170 %.
+[HYP] CLBlast, Vulkan, OpenBLAS: no change beyond noise (no userptr path; NEO / ANV allocate their own buffers).
+Falsified if gen9blas gains < 2 % or > 20 %.
+
+## IOMMU off: measurements (after reboot 22:52, cmdline "... intel_iommu=igfx_off", dmesg "DMAR: Disable GFX device
+## mapping", 0000:00:02.0 has no iommu_group; mains power, power profile "balanced", EPP balance_performance)
+                 llama-bench t/s        /usr/bin/time: wall, user, sys (s)
+openblas r=1      59.91                 22.77   75.54  10.16   (4 min after boot)
+openblas r=6      67.36 +- 0.64         53.94  258.00  18.39
+gen9blas r=1      65.90                 16.13   30.70   1.68
+gen9blas r=6      65.96 +- 0.11         54.96  106.74   2.75
+alternating, r = 6 each:
+round1 openblas   66.80 +- 0.78         54.25  261.74  18.08
+round1 gen9blas   66.01 +- 0.27         54.87  106.52   2.76
+round2 openblas   67.66 +- 0.81         53.64  258.45  17.81
+round2 gen9blas   67.43 +- 2.94         54.06   91.05   2.63
+gen9blas 62.65 (IOMMU on) -> 66.0-67.4 (IOMMU off): +5-8 % -> inside the predicted 2-20 %, at the low end of 66-70 t/s.
+CPU per run (r = 6, whole process): gen9blas 94-109 s vs OpenBLAS 276-280 s (2.6-2.9x less) [MEAS].
+Unexplained: OpenBLAS is now 67 +- 1 t/s, before the reboot 81 +- 16 (first run 108). It does not use the GPU, so the
+IOMMU cannot explain it [HYP: different turbo / thermal state, or background load after boot: load average 3.6-5.5
+during the runs]. Under the same conditions the two are now equal in speed (66-67 t/s), gen9blas at ~1/3 of the CPU time.
+
+## Time breakdown of pp512: prediction (written before measuring; IOMMU off)
+Tools: bench/compare/sgemm_timer.c (wall time inside cblas_sgemm per shape, LD_PRELOAD in front of the BLAS),
+KCL_PHASES=1 (kcl submit phases), KCL_PROFILE_KERNELS=1 (GPU time per kernel name: packing vs GEMM vs epilogue).
+Found while preparing: KCL_USERPTR_MB defaults to 1024 MB, the F32 weights are 6.2 GB, so the userptr cache cannot hold
+them and every weight matrix is pinned again on every pass.
+[HYP] gen9blas, ~7.7 s per pp512: 5.5-6.5 s inside cblas_sgemm, 1.2-2 s in ggml-cpu ops; inside sgemm: GEMM kernels
+      ~4 s (340 GFLOPS), packing of the transposed weights 0.5-1 s, pinning ~0.15 s (IOMMU off), the rest waits/launches.
+[HYP] OpenBLAS: ~6 s of 7.6 s inside cblas_sgemm.
+[HYP] KCL_USERPTR_MB=8192 (weights stay pinned between passes): +2-6 % pp512.
+
+## Time breakdown of pp512: measurements (IOMMU off, ~23:05-23:25)
+llama-bench -p 512 -n 0 -r 3 = 4 passes (warm-up + 3); 193 cblas_sgemm calls per pass, 4 shapes, row-major, B transposed:
+1299 GFLOP of weight GEMM per pass. No attention matmul reaches BLAS.
+
+OpenBLAS (sgemm_timer):                           pp512 66.71 t/s
+  M=512 N=1536 K=1536   224 calls  3403 ms  159.0 GFLOPS
+  M=512 N=256  K=1536   224 calls   579 ms  155.8 GFLOPS
+  M=512 N=8960 K=1536   216 calls 16085 ms  189.2 GFLOPS
+  M=512 N=1536 K=8960   108 calls  8002 ms  190.2 GFLOPS
+  total 28.07 s in sgemm (185 GFLOPS), process wall 31.12 s
+gen9blas (sgemm_timer + KCL_PHASES=1 + KCL_PROFILE_KERNELS=1):   pp512 84.25 t/s
+  M=512 N=1536 K=1536   224 calls  2125 ms  254.7 GFLOPS
+  M=512 N=256  K=1536   224 calls   528 ms  170.7 GFLOPS
+  M=512 N=8960 K=1536   216 calls 10787 ms  282.2 GFLOPS
+  M=512 N=1536 K=8960   108 calls  7466 ms  203.9 GFLOPS
+  total 20.91 s in sgemm (249 GFLOPS), process wall 24.92 s
+  GPU kernels: sgemm_v 14241 ms, pkf_b_t (packing the transposed weights) 5034 ms, pkf_a 565 ms
+  kcl: execbuf 1041 us CPU per call (pinning), GEM_WAIT 26.0 ms wall / 64 us CPU per call, 10 objects per execbuf
+Per pass (/4), gen9blas at 84 t/s = 6.08 s:
+  weight GEMM kernel 3.56 s (365 GFLOPS) | weight packing 1.26 s | A packing 0.14 s | execbuf/pinning 0.20 s |
+  rest of sgemm ~0.07 s | ggml-cpu ops outside sgemm ~0.85 s
+-> prediction (5.5-6.5 s in sgemm, 1.2-2 s CPU ops, GEMM ~4 s, packing 0.5-1 s, pinning 0.15 s): sgemm 5.2 s and CPU ops
+   0.85 s below the range; GEMM 3.56 s close; packing 1.26 s ABOVE the range (largest avoidable cost); pinning 0.20 s close.
+OpenBLAS: 7.0 s of 7.8 s per pass inside sgemm (prediction ~6 of 7.6: close).
+
+Profiling does not change the speed (r = 3 each, in this order): plain 80.99, sgemm_timer 79.69, KCL_PROFILE_KERNELS 81.91,
+KCL_PHASES 81.07, plain again 82.11 t/s.
+Alternating, same conditions: openblas 66.28 / gen9blas 81.45 / openblas 66.05 / gen9blas 81.23 t/s.
+CONDITIONS DRIFT: gen9blas was 66-67 t/s at 22:57-23:02 (4-10 min after boot, load 3.6-5.5) and 81-82 from ~23:10 under
+the same command; OpenBLAS 81 +- 16 before the reboot, 66-67 after it. Cause unknown [HYP: post-boot background work and
+CPU/GPU power sharing]. Only back-to-back alternating runs compare configurations; absolute t/s across sessions do not.
+
+KCL_USERPTR_MB (alternating, r = 3, KCL_PHASES=1):
+  1024 (default): 81.48 / 81.35 t/s, execbuf 1200 / 1286 us CPU
+  8192:           85.26 / 84.53 t/s, execbuf  348 /  398 us CPU
+-> +4-5 %, inside the predicted 2-6 %: weights stay pinned between passes.
+
+What a ggml backend with weights packed once would remove [HYP from the breakdown]: weight packing 1.26 s + pinning
+0.2 s of 6.08 s -> ~4.6 s per pass -> ~110 t/s (+30 %), before any change to GEMM or the CPU ops; tg would also move to
+the GPU (Vulkan shows 3.87 vs 2.28 t/s for F32).
