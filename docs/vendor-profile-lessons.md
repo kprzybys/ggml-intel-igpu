@@ -17,9 +17,10 @@ End to end OpenVINO GenAI still wins (240-253 s vs 258-263 s for 645.6 s of audi
 as fast and our decoder token twice as fast. Correction (profile of a whole whisper-cli run,
 results/whisper-profile-gp-2026-11-13.txt): nothing is unaccounted; whisper.cpp ran the encoder **33 times, not 22**
 (its seek moves to the last segment end, so windows overlap): encode 177 s = 69 %, decode 68 s (2870 tokens) = 26 %,
-prompt 3 %, sampling 1 %, mel 0.3 %. [HYP] GenAI wins by running fewer encoder windows: 22 x 5.6 s + ~2600 tokens x
-44 ms = ~237 s matches its 240 s; to be checked by counting GenAI's encoder calls. If it holds, the largest lever is
-in the application (how many windows are encoded), not in a kernel.
+prompt 3 %, sampling 1 %, mel 0.3 %. Checked [MEAS, bpftrace on ov::InferRequest]: GenAI encodes **28** windows of the
+same file (its seek overlaps less), 2621 tokens at ~31 ms per decoder step. GenAI's whole edge is ~5 fewer encoder
+windows (~27 s); our CPU decoder wins back ~10 s. The largest lever is in the application (how many windows are
+encoded), not in a kernel.
 The OpenVINO profile is one run with PERF_COUNT on and random features: per-op figures are +-10-15 %.
 
 ## 2. Rules that carry over
@@ -60,9 +61,8 @@ ran as intended (backend counters, one process per run: Python 3.14 `forkserver`
 
 ## 3. Next steps, in order
 
-1. Done (separately, 493e500): the whole run is accounted for (see section 1). Next: count GenAI's encoder calls on the
-   same file to test the "fewer windows" hypothesis, and check whether whisper.cpp's window overlap (33 vs 21.5
-   nominal) can be reduced without losing WER (seek / timestamp settings), since the encoder is 69 % of the run.
+1. Done (separately, 493e500, and the window count above). Next: can whisper.cpp encode fewer windows (33 now, GenAI 28,
+   21.5 nominal) without losing WER (seek / timestamp / max-len settings)? The encoder is 69 % of the run.
 2. Done: our GEMM is ~2.8 s per window (+0.57 s packing/epilogue) vs OpenVINO's fused FullyConnected ~4.5 s.
    Decoder on the GPU [EST]: F16 weights, ~1.3x on the decoder = ~6 % of the run; measure before building.
 3. Parametric GEMM epilogue (bias, GELU, residual): one kernel for whisper, embeddings and image encoders; measure with
