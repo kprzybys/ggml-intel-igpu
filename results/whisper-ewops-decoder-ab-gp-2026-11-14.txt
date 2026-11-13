@@ -1,0 +1,23 @@
+whisper.cpp: GEN9 elementwise ops (350d801) on the decoder prompt: A/B on the UHD 620 laptop, 2026-11-14 ~22:30
+=============================================================================================================
+Backend: ggml-backend 350d801 (whisper ops NORM+MUL+ADD, GELU, F16 conv; rule "split with elementwise ops but no
+MUL_MAT / attention -> ggml-cpu inside GEN9"), built against whisper.cpp 5922450's ggml with
+GEN9_DEFS=-DGEN9_GGML_NO_ROPE_TRUNCATE (no local patch); lib = the hybrid libgen9blas.so used for 1b0e2be (no lib
+change between 1b0e2be and 350d801). jfk.wav text identical. -ngl: n/a (whisper.cpp).
+whisper-bench -t 4 (warm-up encode, then encode / 256 x decode M=1 / prompt M=256 x16), GEN9_INFO=1 KCL_PHASES=1,
+2 rounds alternating. GEN9_EW_LONE_GPU is tested for presence only: "default" runs with it unset (env -u).
+
+config            encode ms        decode ms       prompt ms        execbuf            GEM_WAIT     graph_compute
+default           5153.9 5163.9    5902.1 5903.9   3331.5 3334.4    1862 x 522-525 us  1862         465
+EW_LONE_GPU=1     5154.5 5156.8    5893.2 5913.4   3357.3 3384.2    1868 x 508-535 us  1868         465
+EWOPS=0           5315.2 5304.4    5886.3 5890.6   3182.5 3148.6    1595 x 390-408 us  1595         1194
+"splits with elementwise ops but no MUL_MAT / attention": 6 (default), 0 otherwise.
+
+Reading
+- Encoder: -2.9 % with the ops on the GPU (both rounds); decode (M=1, CPU) unchanged.
+- Prompt (M=256): still +5-6 % slower with the ops; the lone-split rule touched only 6 splits and changed nothing
+  (hypothesis refuted). What changes: fewer graph splits (465 vs 1194) but MORE GPU submissions (1862 vs 1595) and a
+  dearer execbuf ioctl per submission (~520 vs ~400 us CPU, ~8 userptr objects per execbuf): ~+0.3 s CPU per run of
+  the bench, about the prompt's loss. [HYP] the cost is submission count x per-execbuf object pinning, not waits.
+- Whole pl60 run with the ops (1b0e2be build, earlier tonight): 256 vs 261 s, energy 4.31 vs 4.73 kJ, WER unchanged
+  (results/ggml-backend-gpu-ops-2026-11-13.txt by the backend session).
