@@ -1,0 +1,132 @@
+# Real-model comparison: GEN9 backend vs OpenVINO GPU, llama.cpp 2cbe0ec, UHD 620, 2026-11-13
+# Backend as of 6449002 (GPU dequantization Q8_0/Q4_K/Q6_K, cache budget 40 % RAM). OpenVINO 2026.4.1 (build-ov,
+# GGML_OPENVINO_DEVICE=GPU, -ngl 99). ggml-cpu = build-cpu without GGML_BACKEND_PATH (4 threads, REPACK on).
+# GEN9+FFN = GEN9 with GEN9_FFN=1 (fused FFN block; -10.7 % energy, -1-3 % speed on F16).
+# Models: Qwen2.5-1.5B-Instruct F16 / Q8_0 / Q4_K_M, Llama-3.2-1B-Instruct Q4_K_M, gemma-2-2b-it Q4_K_M,
+# Qwen2.5-7B-Instruct Q4_K_M (all GGUF from Hugging Face; Q4_K_M = bartowski).
+#
+# Scope (2026-11-13): GEN9 vs OpenVINO only; ggml-cpu is not measured here (earlier files have it).
+# Plan
+# 1. Speed (llama-bench -r 2, configs alternating, order reversed in round 2, 2 rounds; 7B: 1 round, no pp2048):
+#    pp512 (prompt, one ubatch), pp2048 (4 ubatches: attention over a growing KV cache), tg128 (generation),
+#    pg512,128 (one chat turn: 512-token prompt + 128-token answer, end-to-end t/s).
+# 2. Cold start: one fresh process, --no-warmup -r 1 -p 512 -n 0, wall time from exec to exit (model load + first-use
+#    dequantization / OpenVINO graph compilation + one 512-token prompt), page cache warm.
+# 3. Accuracy: llama-perplexity -c 512 --chunks 10 on the same text for every model and backend.
+# 4. Energy (RAPL package, mJ per prompt token, differenced -r 4 vs -r 24 as in results/ggml-backend-energy-*):
+#    Qwen2.5-1.5B Q4_K_M, GEN9 / GEN9+FFN / OpenVINO.
+# Load average is logged with every line (other sessions may run on the machine).
+
+## Prediction (written before running; numbers from today's earlier files)
+[HYP] pp512 (t/s): GEN9 Qwen F16 175-180, Q8_0 175-186, Q4_K_M 175-183, Llama 245-255, Gemma 108-114, 7B 28-30.
+      OpenVINO: F16 182-187 (fastest on F16), Q8_0 138-142, Q4_K_M 44-46, Llama 87-90, Gemma 41-43, 7B 5-12 or fails
+      (Q4_K_M is slow on OpenVINO here; 7B may not fit its FP16 conversion in memory).
+      ggml-cpu: F16 47-52, Q8_0 50-53, Q4_K_M 77-82, Llama 100-105, Gemma 48-50, 7B 12-14.
+[HYP] pp2048 vs pp512: GEN9 -10 to -25 % (attention stays on the CPU and grows with the KV length); OpenVINO -5 to
+      -15 % (attention on the GPU); ggml-cpu -10 to -20 %. GEN9 still >= 2x ggml-cpu on every Q4_K_M model.
+[HYP] tg128: GEN9 = ggml-cpu within 5 % (generation runs on the CPU), except Qwen Q4_K_M where GEN9 was 15 % faster
+      (26.4 vs 22.5, unexplained). OpenVINO: F16 ~7.3 (ahead of CPU 6.9), Q4_K_M / Q8_0 behind the CPU (7.5 / 10 vs 22 / 15).
+[HYP] pg512,128 (chat turn): generation dominates, so GEN9's lead shrinks: GEN9 1.2-1.6x ggml-cpu on Q4_K_M;
+      OpenVINO below ggml-cpu on every quantized model, ahead only on F16.
+[HYP] Cold start: GEN9 = ggml-cpu + 2-4 s (dequantization); OpenVINO slowest (graph compilation, 10-40 s).
+[HYP] Perplexity: GEN9 within 0.5 % of ggml-cpu everywhere (seen: -0.01 to -0.46 %); OpenVINO within 1 %.
+[HYP] Energy (Qwen Q4_K_M): GEN9 ~110-120, GEN9+FFN 5-12 % lower, OpenVINO ~3x GEN9 per token (4x slower at similar
+      power), ggml-cpu ~250-300 mJ/token (Q4_K_M CPU is faster than F16 CPU, measured earlier at 330-390).
+Falsified if any number lands outside its range; each miss gets a line below.
+
+## Measured, phase 1 (speed), t/s, mean of 2 rounds (7B: 1 round, tg64 / pg512,64)
+# Load average 3-4 during GEN9 runs, 1-3.5 during OpenVINO runs (other sessions on the machine); GEN9 r2 pp512 on
+# F16 had sd 19.6 -> the GEN9 pp512 numbers below are probably 3-5 % low.
+model          config    pp512  pp2048  tg128  pg512,128
+Qwen F16       GEN9      168.7  139.5    6.9   29.0
+               GEN9+FFN  174.1  135.3    6.9   28.3
+               OpenVINO  179.0  159.3    7.0   28.4
+Qwen Q8_0      GEN9      176.3  142.2   14.7   50.9
+               GEN9+FFN  173.0  136.3   14.7   50.9
+               OpenVINO  132.8  124.6    9.9   35.1
+Qwen Q4_K_M    GEN9      171.2  135.0   22.3   66.5
+               GEN9+FFN  166.7  135.5   17.8   63.7   (tg128 17.8: one noisy round, not re-checked)
+               OpenVINO   52.0   56.0    9.3   26.0
+Llama 1B Q4_K_M GEN9     234.5  188.5   27.3   81.4
+               GEN9+FFN  245.6  175.1   27.3   82.2
+               OpenVINO   88.0   82.7   13.5   39.9
+Gemma 2B Q4_K_M GEN9     110.7   84.3   12.1   39.0
+               GEN9+FFN  106.6   79.4   12.1   38.7
+               OpenVINO   41.9   39.7    6.5   16.6
+Qwen 7B Q4_K_M GEN9       23.3     -     5.5   18.5
+               GEN9+FFN   27.3     -     5.1   18.9
+               OpenVINO   13.7     -     3.1    9.8   (separate run, see below)
+GEN9 / OpenVINO: pp512 3.3x (Qwen Q4_K_M), 2.7x (Llama), 2.6x (Gemma), 1.33x (Q8_0), 0.94x (F16);
+                 chat turn pg512,128: 2.6x, 2.0x, 2.3x, 1.45x, 1.02x.
+Phases 2-4 (cold start, perplexity, energy) did not run (stopped together with phase 1).
+
+## Against the prediction (phase 1 only)
+- GEN9 pp512 F16 168.7, Q4_K_M 171.2, Llama 234.5, 7B 23.3: below the predicted ranges (175-180, 175-183, 245-255,
+  28-30). Likely cause: load 3-4 from other sessions (GEN9+FFN on the same models reached 174 / 246 / 27.3).
+  Not proven; a quiet-machine re-run would settle it. Q8_0 176.3 and Gemma 110.7 are in range.
+- OpenVINO pp512 7B 13.7: above 5-12 (falsified: it does not fail and is faster than predicted, still 1.7-2.0x
+  below GEN9 / GEN9+FFN).
+- OpenVINO pp512 Q4_K_M 52.0: above 44-46 (falsified; still 3.3x below GEN9). F16 179.0 and Q8_0 132.8: slightly
+  below 182-187 and 138-142 (falsified). Llama 88.0 and Gemma 41.9 in range. 7B: no number ("or fails" side, not
+  verified as an OpenVINO failure, the guard stopped it; re-run separately below).
+- pp2048 drop: GEN9 -17 to -24 % (in range). OpenVINO -5 to -11 % (in range) except Q4_K_M, which rose +8 %
+  (falsified: OpenVINO's Q4_K_M path is not limited by attention).
+- tg128: OpenVINO behind GEN9 on every quantized model (9.3 vs 22.3, 9.9 vs 14.7), equal on F16 (7.0 vs 6.9),
+  as predicted; OpenVINO Q4_K_M 9.3 vs predicted ~7.5.
+
+## OpenVINO on Qwen2.5-7B Q4_K_M, separate run (12:25, after the guard stopped the first attempt)
+# Same command (-p 512 -n 64 -pg 512,64 -r 1), stdout to a file, /usr/bin/time -v, free/RSS sampled every 5 s.
+pp512 13.73, tg64 3.14, pp512+tg64 9.79 t/s; exit 0. Wall 8 min 01 s (one round).
+Peak RSS 12.27 GB of 15.8 GB; available memory down to 0.4 GB, swap in use up to 5.3 GB, 315 698 major page faults.
+=> OpenVINO runs the 7B model on this 16 GB laptop, but only by swapping; the first attempt was stopped by the
+   Claude Code low-memory guard (not by the kernel OOM killer) at this stage. GEN9 on the same model: peak 9.7 GB.
+GEN9 / OpenVINO on 7B: pp512 1.7x (GEN9+FFN 2.0x), tg64 1.8x, chat turn pg512,64 1.9x.
+With GGML_OPENVINO_RELEASE_WEIGHTS=1 (drop the host copy of the weights after compile_model, 12:38):
+pp512 13.56 t/s (same as without it), peak RSS 9.82 GB (-2.45 GB), still down to 0.7 GB available / 5.1 GB swap;
+then "ggml-openvino: cannot compile a new graph after releasing host weights" -> the generation graph (a different
+shape) cannot be compiled, llama-bench fails (rc 1). The option only works when one graph shape is ever used, so
+it does not help a normal prompt + generation run. The swap traffic does not explain OpenVINO's speed: pp512 is
+13.6-13.7 t/s with and without it.
+
+## Measured, phase 2 (cold start: exec to exit, --no-warmup -r 1 -p 512 -n 0, page cache warm), seconds
+model            GEN9    OpenVINO   OV / GEN9
+Qwen Q4_K_M       5.1     20.6      4.0x
+Llama 1B Q4_K_M   4.4     16.0      3.6x
+Gemma 2B Q4_K_M   9.0     33.0      3.7x
+Qwen Q8_0         5.2     13.5      2.6x
+Qwen F16          5.4     70.5     13x
+Qwen 7B Q4_K_M   24.4    139.8      5.7x   (OV peak RSS 12.2 GB; GEN9 includes 11.7 s GPU dequantization)
+The first GEN9 7B attempt failed after 0.7 s: "kcl: execbuffer2: Resource temporarily unavailable". i915 returns
+EAGAIN when userptr pages are being invalidated (2.5 GB in swap after the OpenVINO runs) and kcl retried only EINTR;
+it now retries EAGAIN as libdrm's drmIoctl does (lib/kcl.c). Reproduced twice before the change, passed after it.
+7B OpenVINO cold start and perplexity were run in the foreground, not from the script (memory guard, see above).
+
+## Measured, phase 3 (llama-perplexity -c 512 --chunks 10, same text)
+model            GEN9      OpenVINO        OV vs GEN9
+Qwen Q4_K_M      15.2592   15.6326         +2.4 %
+Llama 1B Q4_K_M  42.7190   44.8502         +5.0 %
+Gemma 2B Q4_K_M  25.1515   12974.53        broken (see below)
+Qwen Q8_0        14.8877   14.8737         -0.1 %
+Qwen F16         14.8950   14.8711         -0.2 %
+Qwen 7B Q4_K_M   11.9242   12.0089         +0.7 %
+Gemma on OpenVINO: with the default batch (4 sequences of 512 per batch) it stops with "Check
+'TRShape::broadcast_merge_into(output_shape, input_shapes[1], autob)' failed" and llama-perplexity exits 0 without a
+result; with -b 512 it runs and gives PPL 12974.5 -> OpenVINO computes Gemma 2 wrongly, so its Gemma speed numbers
+measure a wrong computation. Not investigated further (sliding-window attention / logit soft-capping are suspects).
+Seconds per pass (4 x 512 tokens): GEN9 16.3 / OV 34.5 on Qwen Q4_K_M; 7B 99.3 / 157.3.
+
+## Measured, phase 4 (energy, Qwen Q4_K_M, RAPL package, mJ per prompt token, (E[-r 24] - E[-r 4]) / (20 x 512))
+config      round1  round2  round3  mean    package W   uncore mJ/token
+GEN9        127.2   122.0   117.8   122.3   20-24       77.6
+GEN9+FFN    130.2   130.2   127.0   129.1   22-23       78.6
+OpenVINO    314.8   302.6   311.0   309.5   19-20       222.1
+OpenVINO uses 2.53x the energy of GEN9 per prompt token (slightly lower power, 2.8x lower throughput).
+On Q4_K_M the fused FFN costs +5.6 % energy (the -10.7 % in ggml-backend-energy-* was measured on F16).
+
+## Against the prediction (phases 2-4)
+- Cold start, OpenVINO 10-40 s: F16 70.5 s and 7B 139.8 s are outside (falsified); the four smaller quantized models
+  are inside (13.5-33.0 s). GEN9 = ggml-cpu + 2-4 s: not checked (ggml-cpu out of scope).
+- Perplexity, OpenVINO within 1 % of GEN9: falsified on Q4_K_M (Qwen +2.4 %, Llama +5.0 %, Gemma broken); holds on
+  Q8_0, F16 and 7B (+0.7 %).
+- Energy: GEN9 122.3 vs predicted 110-120 (slightly above, falsified); GEN9+FFN 5-12 % lower: falsified, it is 5.6 %
+  higher on Q4_K_M; OpenVINO ~3x GEN9: 2.53x (lower than predicted).
