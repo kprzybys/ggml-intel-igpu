@@ -1,0 +1,49 @@
+# llama.cpp OpenVINO backend vs GEN9 backend, Qwen2.5-1.5B-Instruct F16, UHD 620, 2026-11-13
+# llama.cpp 2cbe0ec, build ~/src/llama.cpp/build-ov: GGML_OPENVINO=ON, shared libs, no BLAS/Vulkan, against OpenVINO 2026.4.1
+# (pip, separate venv ~/opt/venv-ov2026.4; the user-wide 2026.1.0 of earlier comparisons stays). With 2026.1.0 the
+# backend does not compile: ggml-openvino/utils.cpp:348 uses ov::ProfilingInfo::start_time (newer API).
+# docs/backend/OPENVINO.md validated Core Ultra / Lunar Lake only; Gen9 is not listed. NEO 24.35 (legacy1) underneath.
+# OpenVINO supports FP16 and quantized models, not F32 -> F16 model only.
+
+## Prediction (written before the first run)
+Facts: OpenVINO 2026.1 FP16 GEMM n = 4096 on this GPU: 305 GFLOPS with B as an input, 547 with B constant
+(results/compare-openvino-2026-11-11.txt); gen9blas FP16 699. The backend compiles the whole ggml graph into one
+OpenVINO model on the GPU (weights constant, attention and the other ops fused on the GPU, no CPU ops in between).
+[HYP] pp512: weight GEMM 1299 GFLOP at ~550 GFLOPS = 2.4 s + other ops on the GPU 0.2-0.5 s -> 2.6-2.9 s ->
+      175-195 t/s, i.e. close to GEN9 (176-178), maybe faster because nothing runs on the CPU.
+[HYP] tg128: 3.1 GB of weights per token at ~20 GB/s + per-token graph overhead -> 4-6 t/s (ggml-cpu F16: to measure).
+[HYP] Risks: the pip 2026.1 package may not build or run with this backend (2026.4.1 required); Gen9 untested upstream;
+      first-run graph compilation takes seconds (excluded by llama-bench's warm-up only if the graph is reused).
+
+## Measurements
+Device check: GGML_OPENVINO_DEVICE=GPU -> "OpenVINO: using device GPU", OPENVINO1 Intel UHD Graphics 620 (selected).
+First single run: pp512 184.53 t/s (r = 1, wall 19.6 s).
+
+llama-bench -p 512 -n 128 -r 3, alternating (OpenVINO with -ngl 99; GEN9 = build-cpu + GGML_BACKEND_PATH):
+                     pp512            tg128          /usr/bin/time wall, user, sys (s)
+round1 OpenVINO GPU  184.43 +- 3.30   7.28 +- 0.16   118.32  36.76  52.01   (first run: graph compilation)
+round1 GEN9          177.42 +- 1.39   6.90 +- 0.09    70.14 253.43   1.69
+round1 cpu-only       47.35 +- 2.87   6.97 +- 0.09
+round2 OpenVINO GPU  184.36 +- 0.57   7.37 +- 0.03    80.08  33.26  41.93
+round2 GEN9          177.34 +- 1.20   6.86 +- 0.02    70.95 254.98   1.88
+round2 cpu-only       51.78 +- 0.48   6.93 +- 0.05
+
+llama-perplexity -c 512 --chunks 10 (same text as the other files), F16:
+cpu-only   14.8924 +/- 0.87183   (42.6 s per pass)
+GEN9       14.8950 +/- 0.87199   (15.3 s per pass)   +0.017 %
+OpenVINO   14.8731 +/- 0.86949   (17.2 s per pass)   -0.130 %
+journalctl -k: no GPU reset in any run (OpenVINO runs through NEO, which has mid-thread preemption).
+
+## Against the prediction
+- pp512 175-195 t/s: confirmed (184.4). OpenVINO is 4 % faster than GEN9 although its FP16 GEMM is slower
+  (547 vs 699 GFLOPS): it runs the whole graph on the GPU, while GEN9 leaves every op except MUL_MAT on the CPU.
+- tg128 4-6 t/s: wrong, 7.3 t/s. But ggml-cpu F16 already does 6.9 t/s: token generation is memory-bound on both
+  sides of the shared memory bus; the GPU gains only 5 %.
+- Perplexity: both GPU paths within 0.5 % of the CPU; OpenVINO differs more (-0.13 %, different numerics end to end).
+
+## Consequences for the GEN9 design (docs/ggml-backend-design.md)
+- Step 2 (token generation on the GPU) has little speed to win for F16: CPU 6.9, OpenVINO 7.3 t/s; the design's own
+  model predicted 2.8-5.3 t/s for GEN9 with per-split submission, i.e. slower than the CPU. The case for step 2 is CPU
+  time (OpenVINO: ~75-89 s CPU per run vs GEN9 ~255 s, mostly the CPU doing token generation), not t/s.
+- For prompt processing the remaining gap to OpenVINO (4 %) is the CPU ops between MUL_MATs; with the faster GEMM,
+  moving the elementwise ops / attention to the GPU would be the way past OpenVINO, not GEMV.
