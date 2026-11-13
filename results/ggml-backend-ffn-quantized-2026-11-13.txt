@@ -18,3 +18,10 @@ llama-bench -p 512 -n 0 -r 5 -d 0,2048, alternating (GPU attention on by default
   d 2048  unfused 153.8 / 163.6 / 166.8   fused 176.6 / 174.6 / 176.6   -> +6-15 %, every round
 (An earlier round with both configurations low, 158 / 167 and 129.5 / 133.7, was also in favour of fusion.)
 Energy not measured yet; on F16 the fusion saved 10.7 % (results/ggml-backend-energy-*).
+## Energy (RAPL package, (E[-r 24] - E[-r 4]) / (20 x 512) mJ per prompt token, alternating, 30 s pauses)
+round 1: unfused (1523.0 - 337.6) -> 115.8, fused (1308.4 - 283.8) -> 100.1   (-13.6 %)
+round 2: unfused (1430.8 - 307.2) -> 109.7, fused (1439.2 - 267.8) -> 114.4   (+4.3 %; the fused r=24 run had sd 10.5)
+mean 112.8 vs 107.3 (-5 %), inside the round-to-round spread (~5-10 %): not worse, maybe better.
+Speed in the same runs: unfused 210.0 / 216.8 / 215.2 / 218.7, fused 227.2 / 229.7 / 230.1 / 224.0 t/s (+3-8 %, every pair).
+Conclusion: on Q4_K_M the fused FFN is faster in every pair and costs no more energy. Making it the default is
+The author's decision (opt-in today, GEN9_FFN=1).
