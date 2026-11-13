@@ -76,3 +76,18 @@ Qwen2.5-7B Q4_K_M (spare buffers on; 5.3-5.5 GB in swap from earlier runs, so no
 - 7B "+10-13 %": from 2 of 4 v2b runs (one 4.79 outlier, one +-12.8); not a clean comparison. Re-measure on a quiet
   machine. The spare-buffer prediction "dequantization roughly halves" got -25 % (pair 2) and -43 % (pair 3): partly.
 - The v2 header describes the first design (vstore_half16); the committed v2b kernel stores half2 (8 lanes per k).
+
+## Review follow-ups (evening): EAGAIN bound, alignment check, two risk checks
+- lib/kcl.c: execbuffer2 EAGAIN retried at most 20000 times, sched_yield after 16 tries, then an error so that
+  pack_b_q's copy fallback runs (KCL_EAGAIN=1 prints the retry count). lib/gen9blas.c: v2 dequant only when every row
+  start is 16 B aligned (Q6_K: 2 B), else v1. Check: 64 B-aligned vs +4 B weights give identical GEMM output; the
+  profile shows v2 for the first, v1 for the second. GEMM bit test (h/hd/s, 12 edge shapes, f16w, ffn) identical;
+  test_dequant, test_packed, test_basic, test_userptr pass.
+- asm/check_simd16_carry.sh on UHD 620: OK (SIMD16 carry bit-identical to two SIMD8 adds, incl. FP16 subnormals,
+  values near 65504, inf/NaN). The PRM question stays open; run the check on any other GPU (HD 530, Gen8).
+- bench/check_spare_budget.sh (system-wide used memory above the pre-run level; process RSS does not see i915 GEM
+  buffers: it was 1202 MB with and without the pool):
+    Qwen2.5-1.5B Q4_K_M, GEN9_CACHE_MB=1500: pool off +1974 MB, on +1639 MB (-335 MB), 204 per-use packs -> OK
+    Qwen2.5-7B Q4_K_M,  GEN9_CACHE_MB=4000: pool off +3978 MB, on +4523 MB (+545 MB, limit 576), 357 per-use -> OK
+  The pool fills its 512 MB cap on 7B but does not grow beyond it in these runs; the review's "gigabytes over the
+  budget" did not occur. (pp512 numbers in these runs include other changes and are not a comparison.)
