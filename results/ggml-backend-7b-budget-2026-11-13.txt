@@ -1,0 +1,14 @@
+# ggml backend GEN9 on a model whose FP16 weights do not fit: Qwen2.5-7B-Instruct Q4_K_M (bartowski GGUF, 4.47 GB), 2026-11-13
+# Packed FP16 weights ~14 GB (7.07 B params in MUL_MATs incl. the 152064 x 3584 output head) on a 15.5 GB laptop.
+# Cache budget GEN9_CACHE_MB (default 40 % of physical memory, ~6.2 GB): weights cached in first-use order; the rest
+# are dequantized on the GPU into a temporary packed buffer on every use and freed (gen9blas_pack_b_q, ~1.1 GB/s of FP16).
+# Check on Qwen2.5-1.5B Q4_K_M with a forced small budget (llama-bench pp512 -r 3): no budget 174.0 t/s; 1300 MB (328 of
+# 772 MUL_MATs packed per use) 118.1; 300 MB (636 per use) 93.1 (ggml-cpu 77-82). Perplexity at 1300 MB: 15.2592,
+# identical to the cached run.
+
+## Prediction (written before the first 7B run)
+[HYP] ~7.9 GB of FP16 packed per pass beyond the budget -> ~7 s per 512-token pass; GEMMs ~12 s; CPU attention ~1 s:
+      pp512 20-30 t/s with the default budget. ggml-cpu pp512 14-20 t/s. GEN9 / CPU 1.2-1.8x.
+[HYP] No swap traffic (swap already holds 2 GB from earlier; measured as the change of pswpin+pswpout), no OOM (mmap 4.5 GB + cache 6.2 GB + one temporary weight <= 1.1 GB + llama buffers < 14 GB).
+[HYP] Perplexity (-c 512 --chunks 10) within 0.5 % of ggml-cpu on the same file (GEN9 has FP32 activations, CPU Q8_K).
+Falsified if: GEN9 not faster than ggml-cpu, swap traffic > 100 MB, OOM, GPU reset, perplexity off by > 0.5 %.
