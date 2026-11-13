@@ -130,3 +130,27 @@ On Q4_K_M the fused FFN costs +5.6 % energy (the -10.7 % in ggml-backend-energy-
   Q8_0, F16 and 7B (+0.7 %).
 - Energy: GEN9 122.3 vs predicted 110-120 (slightly above, falsified); GEN9+FFN 5-12 % lower: falsified, it is 5.6 %
   higher on Q4_K_M; OpenVINO ~3x GEN9: 2.53x (lower than predicted).
+
+## Diagnosis: OpenVINO computes Gemma 2 wrongly (2026-11-13 afternoon)
+Clean repro (gemma-2-2b-it Q4_K_M, llama-perplexity --chunks 4, one sequence per batch with -b = -c unless noted):
+context  ggml-cpu   OpenVINO GPU   OV, GGML_OPENVINO_DISABLE_CACHE=1   OV + fix patch
+256      45.03      45.16          -                                   -
+300      46.50      18514.57       -                                   47.21
+512      19.25      19932.16       19.80                               19.80 (also with 4 sequences per batch)
+512, default batch (4 sequences): OV "failed to decode" (broadcast_merge_into), exit code 0; with the fix: 19.80.
+The remaining +1.5-2.9 % vs ggml-cpu matches OpenVINO's Q4_K_M accuracy on the other models (phase 3).
+Cause (ggml-openvino at llama.cpp 2cbe0ec; both files unchanged on master ae93877, 2026-11-13):
+1. ggml-openvino.cpp: FLASH_ATTN_EXT with logit_softcap != 0 is declined, so Gemma 2 alone runs the non-FA attention
+   on a KV cache laid out for FA (V not transposed): v = CONT(TRANSPOSE(PERMUTE(VIEW(cache_v)))).
+2. openvino/op/cont.cpp translates CONT to a Reshape to the shape captured at conversion time; the dynamic axis is
+   tracked wrongly for this chain, so n_kv of the first compiled graph (warmup: n_kv 256) is baked in. When the
+   cached model is reused at n_kv 512, V is silently reinterpreted -> correct up to 256 tokens of context, garbage
+   beyond. --no-warmup or GGML_OPENVINO_DISABLE_CACHE=1 hide it at a fixed n_kv.
+3. ggml-decoder.cpp attention pattern matching expects MUL_MAT -> SOFT_MAX; soft-capping puts SCALE -> TANH -> SCALE
+   between them, so no attention layer is recognised (attn_layers=0 instead of 26), n_seq_active stays 1 and the
+   mask shape breaks the Add with several sequences per batch.
+Fix (not applied to the llama.cpp checkout): a same-shape CONT passes its input through; the pattern matcher skips
+a SCALE/TANH chain. Diagnosed by a subagent (first diverging node kqv-0, v_cont-0 shape [1,8,256,256] instead of
+[1,4,256,512]); numbers above re-measured cleanly. Consequence for this file: the OpenVINO Gemma speed numbers
+(phases 1-2) time a wrong computation. Open: Llama 3.2 1B on OpenVINO at c=300 was 76.6 vs 69.0 on ggml-cpu (one
+chunk, subagent run), not investigated.
