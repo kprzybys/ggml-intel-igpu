@@ -1,0 +1,27 @@
+# ggml backend GEN9 on other architectures, Q4_K_M, 2026-11-13 (backend as of c8cfca9: Q1 + GEN9_Host)
+# Models (bartowski GGUF, Q4_K_M): Llama-3.2-1B-Instruct (808 MB), gemma-2-2b-it (1.71 GB); Qwen2.5-1.5B for reference
+# (results/ggml-backend-q1-dequant-2026-11-13.txt). llama.cpp 2cbe0ec build-cpu + GGML_BACKEND_PATH; OpenVINO 2026.4.1
+# build-ov, GGML_OPENVINO_DEVICE=GPU -ngl 99. llama-bench -p 512 -n 128 -r 3, alternating, 2 rounds.
+# Question: does the speed-up depend on the model? MUL_MAT is generic; other ops (RoPE variants, GELU, softcap)
+# stay on the CPU.
+
+                                 pp512 r1 / r2        tg128 r1 / r2
+Llama-3.2-1B  GEN9               248.44 / 253.04      30.26 / 30.92
+Llama-3.2-1B  ggml-cpu           102.01 / 104.45      30.77 / 28.14
+Llama-3.2-1B  OpenVINO GPU        88.50 /  88.57      14.19 / 14.36
+gemma-2-2b    GEN9               109.56 / 112.68      13.07 / 12.56
+gemma-2-2b    ggml-cpu            49.06 /  49.40      12.61 / 12.59
+gemma-2-2b    OpenVINO GPU        42.11 /  42.23       6.56 /  6.54
+Qwen2.5-1.5B  GEN9 / cpu / OV    183 / 77-82 / 45     26.4 / 22.5 / 7.5   (other file)
+
+Routing (GEN9_INFO=1): Llama 109 weights packed, 327 from the cache, 0 per call, declined only batch < 32;
+Gemma 179 packed, 537 from the cache, declined only batch < 32. No type or shape declines: every weight MUL_MAT of both
+architectures runs on GEN9. Dequantization at first use: Llama 3.1-3.5 s (109 weights), Gemma 7.6 s (179 weights).
+-> pp512 speed-up over ggml-cpu: Llama 2.4x, Gemma 2.3x, Qwen 2.3x; over OpenVINO 2.6-2.8x (Q4_K_M on OpenVINO is slow
+   on this GPU). Token generation equal to the CPU (it runs on the CPU).
+
+Perplexity (-c 512 --chunks 10, docs/history.md + docs/pitfalls.md; GEN9 with -ot to load the backend):
+Llama-3.2-1B  ggml-cpu 42.7485 +/- 2.77812   GEN9 42.7190 +/- 2.77763   (-0.07 %)
+gemma-2-2b    ggml-cpu 25.2681 +/- 1.74710   GEN9 25.1515 +/- 1.74048   (-0.46 %)
+GEN9 is slightly lower in both, as on Qwen (-0.47 % vs ggml-cpu on Q4_K_M): ggml-cpu quantizes the activations to Q8_K
+for quantized weights, GEN9 keeps them in FP16. 0 weights to F32, 0 FP16-overflow recomputations; no GPU reset.
