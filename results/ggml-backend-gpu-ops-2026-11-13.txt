@@ -81,4 +81,6 @@ Candidates to check (not done; no new tasks after 2026-11-13 22:35):
 - kbo_release of an object listed in the batch being built now submits first (6caf81c): per-call packed weights of the
   decoder (non-weight src0, packed and freed per MUL_MAT) can force extra submissions while elementwise ops are queued;
 - batches reach the 64-IDD limit sooner with many small kernels.
-Workaround available today: GEN9_EWOPS=0 for the decoder-heavy whisper path costs the encoder its -2.9 %.
+Recommendation for whisper: keep GEN9_EWOPS=1 (default). Even with the decoder at 26 % of a real run, whole pl60 is
+faster with the ops (256 vs 261 s, -8.9 % energy): the prompt loss (~0.15-0.2 s over 16 prompts of 256 rows in the bench;
+prompts are ~3 % of a real run) is smaller than the encoder gain. GEN9_EWOPS=0 is not a useful workaround.
