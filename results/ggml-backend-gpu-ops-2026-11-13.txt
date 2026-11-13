@@ -1,0 +1,40 @@
+# RMS_NORM(+MUL), ROPE, ADD on the GPU in the GEN9 ggml backend -- prediction written before measuring, 2026-11-13 night
+Goal: the per-layer elementwise ops of llama.cpp (attn/ffn RMS norm with its weight MUL, Q/K RoPE, bias ADDs, residual ADDs)
+run on the GPU, so that (a) their CPU time (~53 ms wall per pp512 pass on Qwen2.5-1.5B Q4_K_M: rms_norm_mul ~25, rope ~16,
+add ~12, of ~2310 ms) leaves the critical path and (b) Q, K, V and their RoPEs fall into one GEN9 split (precondition of
+the Q/K/V block, results/ggml-backend-qkv-attempt-2026-11-13.txt).
+
+Design: the new ops only enqueue (no wait of their own); they execute in the batch of the next GEMM / attention call and
+the split ends with one wait. Waits stay at today's count. Hazard: one batch then holds several operations, each with
+its own userptr objects; two objects on the same pages are two GPU addresses of one line (docs/no-neo.md 6g.5: lost
+writes). Fix: the backend registers every ggml buffer a split touches as a kcl "span" (one userptr object for the whole
+buffer); kcl_userptr resolves any region inside a span to the span's object, so within a batch each byte has one address.
+
+Prediction (Qwen2.5-1.5B Q4_K_M, kp, pp512, defaults otherwise):
+- GPU time of the new kernels: memory-bound, ~3 MB in + 3 MB out per rms/add at 512 tokens; ~15-25 ms per pass in total.
+- pp512: +1 to +3 % (53 ms CPU removed, 15-25 ms GPU added, CPU<->GPU handoffs at the removed split edges saved).
+- Splits per layer: from ~6-8 to ~2 (SET_ROWS of the KV cache stays on the CPU and still cuts).
+- perplexity (10 chunks of 512): within 0.01 % of 15.2591; Llama-3.2-1B (NORM RoPE + freq factors) within 0.01 % of 42.7157.
+- tg (M = 1): unchanged (the new ops decline below GEN9_MIN_BATCH like MUL_MAT).
+Then the Q/K/V block on top: +1.5-3 % more (estimate from the withdrawn attempt).
+
+## Measured (kp, 2026-11-13/14 night)
+Correctness:
+- test-backend-ops (GEN9_MIN_BATCH=1 so that the small test shapes are taken): RMS_NORM 37/37, ADD 22/22, MUL 21/21,
+  ROPE 138/138 OK (57 of them with YaRN ext_factor != 0, with and without freq factors); 0 FAIL.
+- perplexity, 10 chunks of 512, -ngl 0: Qwen2.5-1.5B Q4_K_M 15.2610 (GEN9_EWOPS=0: 15.2591, +0.012 %);
+  Llama-3.2-1B Q4_K_M 42.7108 (42.7157, -0.011 %). Leaving out one op type at a time (Qwen) gives 15.2612-15.2631 with
+  no pattern, i.e. last-bit differences (summation order, cos/sin) amplified by the FP16 activations of the GEMMs, not a
+  wrong op. Prediction "within 0.01 %": missed narrowly on both (0.012 % and 0.011 %); both are of the size of the
+  last-bit perturbations above, in opposite directions.
+- Counters (Qwen, perplexity): RMS_NORM 560 (all fused with their weight MUL), ADD 1390, ROPE 560; 0 splits in wait-per-op
+  mode (all GEN9 compute buffers registered as spans).
+Finding: with the default -ngl (-1, "full offload") llama.cpp pins every layer's "norm" tensor to the layer device, i.e.
+the CPU (src/llama-context.cpp:3257-3265, graph_get_cb), so RMS_NORM never reaches GEN9 (5 of 565 ran on the GPU, MUL
+then runs alone). GEN9 is an ACCEL device, not a layer device, so -ngl changes nothing else for it: use -ngl 0.
+Speed (Qwen2.5-1.5B Q4_K_M, kp, llama-bench -p 512 -n 0 -r 3 -ngl 0, 6 alternating pairs on a quiet kp, 21:35-21:37;
+an earlier set of 6 overlapped other attn_gen.py and is discarded):
+  GEN9_EWOPS=1 / =0 t/s: 219.9/213.9, 217.1/233.7, 238.8/224.1, 232.7/232.5, 238.1/232.0, 238.1/229.1
+  -> per pair +2.8, -7.1, +6.5, +0.1, +2.6, +3.9 %: median +2.7 %, mean +1.5 %; prediction +1-3 % not contradicted, but
+  the laptop's pair-to-pair noise is of the same size (one pair -7 %). Default -ngl -1 (norms pinned to the CPU) was
+  3-9 % below -ngl 0 in a 3-round set, but that set may overlap the disturbed window (not repeated).

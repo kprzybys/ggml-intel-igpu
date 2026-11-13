@@ -23,6 +23,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <set>
 #include <tuple>
 #include <vector>
 #include <unistd.h>
@@ -39,6 +40,7 @@ static std::atomic<long> n_mm_asked{0}, n_mm_declined_shape{0}, n_mm_declined_ty
                          n_mm_declined_hint{0}, n_mm_declined_gpu{0};
 
 static std::atomic<long> n_mm_streamed{0};
+static std::atomic<long> n_ew_rms{0}, n_ew_rms_mul{0}, n_ew_add{0}, n_ew_mul{0}, n_ew_rope{0}, n_ew_sync_graphs{0}, n_ew_asked{0}, n_ew_declined{0};
 static std::atomic<long> n_dequant{0}, n_dequant_f32{0}, n_dequant_gpu{0};
 static std::atomic<double> t_dequant_s{0}, t_deq_alloc_s{0}, t_deq_cpu_s{0}, t_deq_pack_s{0}, t_deq_gpu_s{0};
 // FLASH_ATTN_EXT (opt-in GEN9_ATTN=1, docs/attention-gpu.md section 11)
@@ -49,6 +51,10 @@ static std::atomic<long> n_fa_tail{0}, n_fa_cpu_tail{0};   // n_k not a multiple
 static std::atomic<double> t_fa_gpu_s{0}, t_fa_mask_s{0}, t_fa_cpu_s{0}, fa_flop{0};
 
 static void gen9_report(void) {
+    fprintf(stderr, "gen9: elementwise ops on the GPU: RMS_NORM %ld (with MUL fused %ld), ADD %ld, MUL %ld, ROPE %ld; splits run with a "
+            "wait per op (span not registered or GEN9_EW_SYNC) %ld; supports_op asked %ld, declined %ld\n", n_ew_rms.load(),
+            n_ew_rms_mul.load(), n_ew_add.load(), n_ew_mul.load(), n_ew_rope.load(), n_ew_sync_graphs.load(), n_ew_asked.load(),
+            n_ew_declined.load());
     fprintf(stderr, "gen9: graph_compute %ld; no-op nodes %ld; MUL_MAT run: cached weight %ld, packed now %ld, per call %ld; "
             "F16 weights %ld (recomputed in F32 after FP16 overflow: %ld); weights over the cache budget, packed per use %ld\n",
             n_graphs.load(), n_noop.load(), n_mm_cached.load(), n_mm_packed.load(), n_mm_percall.load(), n_mm_f16.load(), n_mm_f16_fallback.load(), n_mm_streamed.load());
@@ -101,6 +107,7 @@ struct packed_t { gen9blas_packed * P; int t; bool temp = false; };   // temp: n
 struct gen9_context {
     std::map<wkey, packed_t> cache;
     size_t cached_bytes = 0;
+    bool ew_sync = false, ew_pending = false;   // per graph_compute: wait after each elementwise op / ops queued, not waited for
     ggml_backend_t cpu = nullptr;   // ggml-cpu for FLASH_ATTN_EXT nodes whose mask turns out not to be supported (created on first use)
     ~gen9_context() {
         if (cpu) ggml_backend_free(cpu);
@@ -428,7 +435,9 @@ static bool fa_mask_prefix(const struct ggml_tensor * m, int64_t nq, int & vis0,
     return true;
 }
 
+static void ew_flush(gen9_context * ctx);
 static void fa_on_cpu(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
+    ew_flush(ctx);   // inputs may come from queued elementwise ops
     auto t0 = std::chrono::steady_clock::now();
     if (!ctx->cpu) {
         ctx->cpu = ggml_backend_cpu_init();
@@ -493,9 +502,114 @@ static void gen9_flash_attn(gen9_context * ctx, struct ggml_cgraph * cg, int i) 
     t_fa_gpu_s = t_fa_gpu_s + std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
 }
 
+// ---------------- per-layer elementwise ops: RMS_NORM (+ its weight MUL), ADD, MUL, ROPE ----------------
+// They only enqueue: the kernels run in the batch of the next GEMM / attention call, which waits anyway, or at the end
+// of the split (gen9_graph_compute). The ggml buffers written in the split are registered as kcl spans first, so a tensor
+// written by one queued op and read by the next has one GPU address (docs/no-neo.md 6g.5); if a buffer cannot be
+// registered, every op of the split waits (counted). Anything in this backend that reads results on the CPU flushes first.
+// GEN9_EWOPS=0 turns them off (supports_op declines), GEN9_EW_SYNC=1 forces the wait after each op (diagnostics).
+static bool ew_off(void) { static const bool v = [] { const char * e = getenv("GEN9_EWOPS"); return e && !strcmp(e, "0"); }(); return v; }
+static bool ew_force_sync(void) { static const bool v = getenv("GEN9_EW_SYNC") != nullptr; return v; }
+static bool is_ew_op(enum ggml_op o) { return o == GGML_OP_RMS_NORM || o == GGML_OP_ADD || o == GGML_OP_MUL || o == GGML_OP_ROPE; }
+
+static void ew_flush(gen9_context * ctx) {
+    if (!ctx->ew_pending) return;
+    std::lock_guard<std::mutex> lk(gpu_mu);
+    if (gen9blas_flush()) fprintf(stderr, "gen9: flush failed: %s\n", gen9blas_error());
+    ctx->ew_pending = false;
+}
+static bool ew_after(gen9_context * ctx, int rc, const char * what) {
+    if (rc) { fprintf(stderr, "gen9: %s failed: %s\n", what, gen9blas_error()); return false; }
+    ctx->ew_pending = !ctx->ew_sync;
+    return true;
+}
+
+// RMS_NORM at node i, fused with the next node when that is MUL(norm, weight row) and the norm has no other use.
+// Returns the number of nodes consumed (1 or 2), 0 on failure.
+static int gen9_rms_norm(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
+    struct ggml_tensor * node = cg->nodes[i];
+    const struct ggml_tensor * x = node->src[0];
+    float eps; memcpy(&eps, node->op_params, sizeof eps);
+    const int K = (int) x->ne[0], M = (int) ggml_nrows(x);
+    struct ggml_tensor * out = node; const float * w = nullptr;
+    if (i + 1 < cg->n_nodes) {
+        struct ggml_tensor * mul = cg->nodes[i + 1];
+        const struct ggml_tensor * wt = mul->src[0] == node ? mul->src[1] : mul->src[0];
+        if (mul->op == GGML_OP_MUL && (mul->flags & GGML_TENSOR_FLAG_COMPUTE) && (mul->src[0] == node) != (mul->src[1] == node) &&
+            wt->type == GGML_TYPE_F32 && ggml_is_contiguous(wt) && ggml_nrows(wt) == 1 && wt->ne[0] == K &&
+            ggml_are_same_shape(mul, node) && ggml_is_contiguous(mul) && ggml_node_has_n_uses(cg, i, 1)) {
+            out = mul; w = (const float *) wt->data;
+        }
+    }
+    int rc;
+    { std::lock_guard<std::mutex> lk(gpu_mu);
+      rc = gen9blas_rms_norm(M, K, (const float *) x->data, K, w, eps, (float *) out->data, K, ctx->ew_sync); }
+    if (!ew_after(ctx, rc, "RMS_NORM")) return 0;
+    n_ew_rms++;
+    if (w) { n_ew_rms_mul++; return 2; }
+    return 1;
+}
+
+static bool gen9_binop(gen9_context * ctx, struct ggml_tensor * node) {
+    const struct ggml_tensor * a = node->src[0], * b = node->src[1];
+    const int K = (int) a->ne[0], M = (int) ggml_nrows(a), ldb = ggml_nrows(b) == 1 ? 0 : K;
+    const int op = node->op == GGML_OP_MUL;
+    int rc;
+    { std::lock_guard<std::mutex> lk(gpu_mu);
+      rc = gen9blas_binop_rows(op, M, K, (const float *) a->data, K, (const float *) b->data, ldb, (float *) node->data, K, ctx->ew_sync); }
+    if (!ew_after(ctx, rc, op ? "MUL" : "ADD")) return false;
+    (op ? n_ew_mul : n_ew_add)++;
+    return true;
+}
+
+static bool gen9_rope(gen9_context * ctx, struct ggml_tensor * node) {
+    const struct ggml_tensor * x = node->src[0], * pos = node->src[1], * ff = node->src[2];
+    const int32_t * pp = (const int32_t *) node->op_params;
+    const int n_dims = pp[1], mode = pp[2], n_ctx_orig = pp[4];
+    float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, corr[2];
+    memcpy(&freq_base, pp + 5, 4); memcpy(&freq_scale, pp + 6, 4); memcpy(&ext_factor, pp + 7, 4);
+    memcpy(&attn_factor, pp + 8, 4); memcpy(&beta_fast, pp + 9, 4); memcpy(&beta_slow, pp + 10, 4);
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, ggml_rope_get_truncate(node), corr);
+    int rc;
+    { std::lock_guard<std::mutex> lk(gpu_mu);
+      rc = gen9blas_rope(n_dims, (int) x->ne[1], (int) x->ne[2], (const float *) x->data, (long) (x->nb[1] / 4), (long) (x->nb[2] / 4),
+                         (float *) node->data, (long) (node->nb[1] / 4), (long) (node->nb[2] / 4), (const int *) pos->data,
+                         ff ? (const float *) ff->data : nullptr, mode == GGML_ROPE_TYPE_NEOX, freq_base, freq_scale, ext_factor,
+                         attn_factor, corr, ctx->ew_sync); }
+    if (!ew_after(ctx, rc, "ROPE")) return false;
+    n_ew_rope++;
+    return true;
+}
+
+// Start of a split: when it holds elementwise ops, register the buffers its nodes write as spans (else: wait per op).
+static void ew_begin(gen9_context * ctx, struct ggml_cgraph * cg) {
+    ctx->ew_sync = ew_force_sync(); ctx->ew_pending = false;
+    bool any = false;
+    std::set<ggml_backend_buffer_t> bufs;
+    for (int i = 0; i < cg->n_nodes; i++) {
+        const struct ggml_tensor * n = cg->nodes[i];
+        if (!(n->flags & GGML_TENSOR_FLAG_COMPUTE)) continue;
+        any |= is_ew_op(n->op);
+        ggml_backend_buffer_t b = n->view_src ? n->view_src->buffer : n->buffer;
+        if (b && b->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) bufs.insert(b);
+    }
+    if (!any || ctx->ew_sync) return;
+    std::lock_guard<std::mutex> lk(gpu_mu);
+    for (ggml_backend_buffer_t b : bufs)
+        if (gen9blas_span(ggml_backend_buffer_get_base(b), ggml_backend_buffer_get_size(b), 1)) { ctx->ew_sync = true; break; }
+    if (ctx->ew_sync) { gen9blas_span_clear(); n_ew_sync_graphs++; }
+}
+static void ew_end(gen9_context * ctx) {
+    ew_flush(ctx);
+    std::lock_guard<std::mutex> lk(gpu_mu);
+    gen9blas_span_clear();
+}
+
 static enum ggml_status gen9_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     gen9_context * ctx = (gen9_context *) backend->context;
     n_graphs++;
+    ew_begin(ctx, cgraph);
+    struct ew_guard { gen9_context * c; ~ew_guard() { ew_end(c); } } guard{ ctx };
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) { n_noop++; continue; }
@@ -508,7 +622,20 @@ static enum ggml_status gen9_graph_compute(ggml_backend_t backend, struct ggml_c
                 if (!gen9_mul_mat(ctx, node)) return GGML_STATUS_FAILED;
                 break;
             case GGML_OP_GLU:
+                ew_flush(ctx);
                 gen9_glu_alone(node);
+                break;
+            case GGML_OP_RMS_NORM: {
+                const int used = gen9_rms_norm(ctx, cgraph, i);
+                if (!used) return GGML_STATUS_FAILED;
+                i += used - 1;
+                break;
+            }
+            case GGML_OP_ADD: case GGML_OP_MUL:
+                if (!gen9_binop(ctx, node)) return GGML_STATUS_FAILED;
+                break;
+            case GGML_OP_ROPE:
+                if (!gen9_rope(ctx, node)) return GGML_STATUS_FAILED;
                 break;
             case GGML_OP_FLASH_ATTN_EXT:
                 gen9_flash_attn(ctx, cgraph, i);
@@ -651,6 +778,53 @@ static bool gen9_supports_mul_mat(const struct ggml_tensor * op) {
     return true;
 }
 
+// Elementwise ops (see gen9_rms_norm): F32 rows, at least GEN9_MIN_BATCH rows (tokens), like MUL_MAT -- token generation
+// (one row) stays on the CPU.
+static bool gen9_supports_ew(const struct ggml_tensor * op) {
+    n_ew_asked++;
+    auto f32_rows = [](const struct ggml_tensor * t) {
+        return t && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && fits_int(t->ne[0]) && fits_int(ggml_nrows(t));
+    };
+    bool ok = false;
+    static const char * skip = getenv("GEN9_EW_SKIP");   // diagnostics: comma list of rms,add,mul,rope left to the CPU
+    const char * nm = op->op == GGML_OP_RMS_NORM ? "rms" : op->op == GGML_OP_ADD ? "add" : op->op == GGML_OP_MUL ? "mul" : "rope";
+    if (!ew_off() && !(skip && strstr(skip, nm))) switch (op->op) {
+        case GGML_OP_RMS_NORM: {
+            float eps; memcpy(&eps, op->op_params, sizeof eps);
+            ok = f32_rows(op->src[0]) && f32_rows(op) && ggml_are_same_shape(op->src[0], op) && eps >= 0.0f && ggml_nrows(op) >= min_batch();
+            break;
+        }
+        case GGML_OP_ADD: case GGML_OP_MUL: {
+            const struct ggml_tensor * a = op->src[0], * b = op->src[1];
+            ok = f32_rows(a) && f32_rows(b) && f32_rows(op) && ggml_are_same_shape(a, op) && b->ne[0] == a->ne[0] &&
+                 (ggml_nrows(b) == 1 || ggml_are_same_shape(a, b)) && ggml_nrows(op) >= min_batch();
+            break;
+        }
+        case GGML_OP_ROPE: {
+            const struct ggml_tensor * x = op->src[0], * pos = op->src[1], * ff = op->src[2];
+            const int32_t * pp = (const int32_t *) op->op_params;
+            const int n_dims = pp[1], mode = pp[2], n_offs = pp[15];
+            ok = x->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && ggml_is_contiguous(op) && ggml_are_same_shape(x, op) &&
+                 (mode == GGML_ROPE_TYPE_NORMAL || mode == GGML_ROPE_TYPE_NEOX) && n_dims == x->ne[0] && n_offs == 0 &&
+                 x->ne[3] == 1 && x->nb[0] == 4 && x->nb[1] % 4 == 0 && x->nb[2] % 4 == 0 &&
+                 x->nb[1] >= (size_t) n_dims * 4 && x->nb[2] >= (x->ne[1] - 1) * x->nb[1] + (size_t) n_dims * 4 &&
+                 fits_int(x->ne[1]) && fits_int(x->ne[2]) && n_dims % 2 == 0 &&
+                 pos && pos->type == GGML_TYPE_I32 && ggml_is_contiguous(pos) && pos->ne[0] == x->ne[2] &&
+                 (!ff || (ff->type == GGML_TYPE_F32 && ggml_is_contiguous(ff) && ff->ne[0] >= n_dims / 2)) &&
+                 x->ne[2] >= min_batch();
+            break;
+        }
+        default: break;
+    }
+    if (ok && !gpu_ok()) ok = false;
+    if (!ok) n_ew_declined++;
+    static const bool dbg = getenv("GEN9_EW_DEBUG") != nullptr;
+    if (dbg) fprintf(stderr, "gen9 ew: %s %s %s [%lld %lld %lld %lld] src0 %s %s contig %d\n", ok ? "take" : "decline", ggml_op_desc(op), op->name,
+                     (long long) op->ne[0], (long long) op->ne[1], (long long) op->ne[2], (long long) op->ne[3], op->src[0]->name,
+                     ggml_type_name(op->src[0]->type), (int) ggml_is_contiguous(op->src[0]));
+    return ok;
+}
+
 static bool gen9_dev_supports_op(ggml_backend_dev_t, const struct ggml_tensor * op) {
     switch (op->op) {
         case GGML_OP_NONE: case GGML_OP_RESHAPE: case GGML_OP_VIEW: case GGML_OP_PERMUTE: case GGML_OP_TRANSPOSE:
@@ -659,6 +833,8 @@ static bool gen9_dev_supports_op(ggml_backend_dev_t, const struct ggml_tensor * 
             return gen9_supports_mul_mat(op);
         case GGML_OP_FLASH_ATTN_EXT:
             return gen9_supports_fa(op);
+        case GGML_OP_RMS_NORM: case GGML_OP_ADD: case GGML_OP_MUL: case GGML_OP_ROPE:
+            return gen9_supports_ew(op);
         case GGML_OP_GLU: {   // SWIGLU of two MUL_MAT results: computed inside a fused FFN block (gen9_try_ffn)
             n_glu_asked++;
             const struct ggml_tensor * a = op->src[0], * b = op->src[1];
