@@ -1,0 +1,54 @@
+# ggml backend GEN9, stage A: FFN fusion (gate, up, SWIGLU, down in one GEN9 split), F16 weights, 2026-11-13
+# Analysis and prediction: Review report (profile in scratchpad fable/, summarized in the session); design D0.
+# Today (F16, measured by the reviewer): pass 2878 ms, 178 t/s, 333 splits per pass; per layer gate/up epilogues 2.76 ms +
+# CPU SWIGLU 3.05-3.25 ms + packing of down's A 2.7 ms = 8.5-8.7 ms.
+# Fused path: x packed once for gate and up (pk_a3_f32); gate and up stay FP16 in GPU work buffers; new kernel
+# gen9blas_swiglu_pack_a3 computes silu(g)*u in F32 and writes FP16 straight into down's packed A (A3 layout), with a
+# non-finite flag; down's result goes through the FP16 -> F32 epilogue. Rounding points are the same as today
+# (g, u FP16 from the kernel; h rounded to FP16 when packed). On a flag the four nodes are recomputed unfused.
+
+## Prediction (written before building)
+[HYP] pp512 Qwen2.5-1.5B F16: pass 2668-2733 ms -> 187-192 t/s (+5-8 %); splits per pass 333 -> 279.
+[HYP] Perplexity within 0.05 % of today's GEN9 (14.8950); 0 fused-block fallbacks on the perplexity text.
+[HYP] tg128 unchanged within 3 % (batch 1 never reaches GEN9).
+Falsified if: gain < 4 % or > 9 %, perplexity moves > 0.05 %, split count not 279, any GPU reset.
+
+## Measurements (GEN9_NO_FFN=1 was the A/B switch during the runs; the committed default is fusion OFF, GEN9_FFN=1 on)
+lib/test_packed.py: FFN 512x1536->8960->1536 rel err 1.38e-04, |fused - unfused| / max|Y| 3.01e-04; 37x300->1000->77
+2.67e-04 / 1.30e-04; overflow case flags 1. test-backend-ops MUL_MAT: 11/11.
+First benchmark attempt invalid: a background agent ran llama-bench / llama-perplexity on the CPU at the same time
+(load 5-7): fused 134, unfused 80-98, OpenVINO 147-162 t/s. Repeated with nothing else running:
+
+llama-bench -p 512 -n 0 -r 3, F16, alternating (three rounds):
+                 fused            unfused          OpenVINO GPU
+round1          169.23 +- 8.25    178.08 +- 2.18    182.36 +- 0.60
+round2          169.34 +- 2.69    178.19 +- 0.72    182.83 +- 0.58
+round3          170.25 +- 1.67    178.92 +- 1.00    187.35 +- 1.47
+Routing: 108 FFN blocks fused per run (27 per pass x 4), 0 recomputations, 0 SWIGLU alone.
+-> prediction (+5-8 %, 187-192 t/s): FALSIFIED, the sign is wrong: -5 %.
+
+Why (the reviewer's split timer, scratchpad fable/optime, 3 passes each, F16):
+                                 unfused                 fused
+pass                             2810-2853 ms            2822-2915 ms
+splits per pass                  333                     279                (as predicted)
+FFN block (gate, up, SWIGLU, down)  ~76 ms per block      ~70 ms per block   (saves ~170 ms per pass, as predicted)
+CPU FLASH_ATTN splits            1060 ms / 3 passes      1570 ms / 3 passes (+48 %), all 4 threads busy in both
+KCL_PROFILE_KERNELS (warm-up + 1 pass): pk_a3_f32 279 -> 118 ms, epilog_hf 200 -> 41 ms, swiglu_pack_a3 137 ms (new);
+hgemm_kc_v unchanged (4000 ms): the GPU does less work when fused.
+Clocks sampled every 50 ms during llama-bench -r 4 (mean over the run):
+  unfused  177.8 / 176.8 t/s   CPU 2450 / 2593 MHz   GPU 1002 / 999 MHz   max thermal zone 67 / 76 C
+  fused    175.3 / 177.0 t/s   CPU 1735 / 1772 MHz   GPU  948 / 926 MHz   max thermal zone 70 / 78 C
+Power limits: intel-rapl-mmio PL1 25 W, PL2 51 W. [HYP] the longer GPU bursts (70 ms) draw the shared package budget
+to the GPU; the CPU runs attention at lower clocks and loses what the fusion saved. Energy not measured (RAPL energy_uj
+needs root).
+OpenMP wait policy (alternating, two rounds):
+  fused default 176.46 / 173.85 t/s (CPU 31.9 / 31.3 s)   fused passive 156.19 / 160.32 (CPU 15.7 / 14.8 s)
+  unfused default 180.42 / 182.07 (CPU 31.3 / 30.6 s)     unfused passive 141.52 / 145.25 (CPU 18.6 / 17.8 s)
+  -> sleeping threads halve CPU time but cost 10-22 % speed (wake-ups); default stays.
+Perplexity (-c 512 --chunks 10, with -ot to load GEN9): fused 14.8943 vs unfused GEN9 14.8950 (-0.005 %; criterion
+0.05 %): 275 blocks fused, 0 recomputations. CPU 14.8924.
+
+## Conclusion
+The fusion is correct and removes GPU and CPU work, but on this power-limited laptop prompt processing is bounded by
+the shared CPU+GPU budget, not by the work we removed. Kept in the code, off by default (GEN9_FFN=1 to enable).
+Stage B (QKV fusion) would hit the same limit [HYP]; the remaining CPU work is mostly flash attention (~350 ms/pass).

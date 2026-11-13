@@ -14,6 +14,7 @@
 
 #include <atomic>
 #include <climits>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -28,7 +29,8 @@
 
 // ---------------- routing counter (printed at exit with GEN9_INFO=1) ----------------
 
-static std::atomic<long> n_graphs{0}, n_noop{0}, n_mm_cached{0}, n_mm_packed{0}, n_mm_percall{0}, n_mm_f16{0}, n_mm_f16_fallback{0};
+static std::atomic<long> n_graphs{0}, n_noop{0}, n_mm_cached{0}, n_mm_packed{0}, n_mm_percall{0}, n_mm_f16{0}, n_mm_f16_fallback{0},
+                         n_ffn_fused{0}, n_ffn_fallback{0}, n_glu_alone{0}, n_glu_asked{0}, n_glu_declined{0};
 static std::atomic<long> n_mm_asked{0}, n_mm_declined_shape{0}, n_mm_declined_type{0}, n_mm_declined_batch{0},
                          n_mm_declined_hint{0}, n_mm_declined_gpu{0};
 
@@ -36,6 +38,9 @@ static void gen9_report(void) {
     fprintf(stderr, "gen9: graph_compute %ld; no-op nodes %ld; MUL_MAT run: cached weight %ld, packed now %ld, per call %ld; "
             "F16 weights %ld (recomputed in F32 after FP16 overflow: %ld)\n", n_graphs.load(), n_noop.load(), n_mm_cached.load(),
             n_mm_packed.load(), n_mm_percall.load(), n_mm_f16.load(), n_mm_f16_fallback.load());
+    fprintf(stderr, "gen9: FFN blocks fused %ld (recomputed unfused after FP16 overflow: %ld); SWIGLU alone %ld; "
+            "supports_op GLU asked %ld, declined %ld\n", n_ffn_fused.load(), n_ffn_fallback.load(), n_glu_alone.load(),
+            n_glu_asked.load(), n_glu_declined.load());
     fprintf(stderr, "gen9: supports_op MUL_MAT asked %ld, declined: shape/layout %ld, type %ld, batch<32 %ld, hint %ld, no GPU %ld\n",
             n_mm_asked.load(), n_mm_declined_shape.load(), n_mm_declined_type.load(), n_mm_declined_batch.load(),
             n_mm_declined_hint.load(), n_mm_declined_gpu.load());
@@ -81,6 +86,18 @@ static void gen9_backend_free(ggml_backend_t backend) {
     delete backend;
 }
 
+// Packed weight from the cache (packed on first use). Caller holds gpu_mu.
+static gen9blas_packed * get_packed(gen9_context * ctx, const struct ggml_tensor * w) {
+    const int t = w->type == GGML_TYPE_F16 ? GEN9BLAS_HS : GEN9BLAS_S;
+    wkey k = { w->data, ggml_nbytes(w), (int) w->type, w->ne[0], w->ne[1] };
+    auto it = ctx->cache.find(k);
+    if (it != ctx->cache.end()) { n_mm_cached++; return it->second; }
+    gen9blas_packed * P = gen9blas_pack_b(t, 1, (int) w->ne[0], (int) w->ne[1], w->data, (int) (w->nb[1] / ggml_type_size(w->type)));
+    if (!P) { fprintf(stderr, "gen9: pack_b %s failed: %s\n", w->name, gen9blas_error()); return nullptr; }
+    ctx->cache[k] = P; n_mm_packed++;
+    return P;
+}
+
 // dst[M x N] = src1[M x K] . src0^T with src0 stored N x K row-major: gemm(A = src1, B = src0 transposed).
 // F32 weights: SGEMM. F16 weights: accurate FP16 GEMM (gemm_pb_f16w); a call whose result overflows FP16 is recomputed
 // with the weights converted to F32 (rare: largest chunk sum seen on Qwen2.5-1.5B is 25x below the FP16 limit).
@@ -95,13 +112,7 @@ static bool gen9_mul_mat(gen9_context * ctx, struct ggml_tensor * dst) {
     gen9blas_packed * P = nullptr;
     bool temp = false;
     if (is_weight(w)) {
-        wkey k = { w->data, ggml_nbytes(w), (int) w->type, w->ne[0], w->ne[1] };
-        auto it = ctx->cache.find(k);
-        if (it == ctx->cache.end()) {
-            P = gen9blas_pack_b(t, 1, K, N, w->data, ldb);
-            if (!P) { fprintf(stderr, "gen9: pack_b %s failed: %s\n", w->name, gen9blas_error()); return false; }
-            ctx->cache[k] = P; n_mm_packed++;
-        } else { P = it->second; n_mm_cached++; }
+        if (!(P = get_packed(ctx, w))) return false;
     } else {
         n_mm_percall++;
         if (!f16) {
@@ -133,6 +144,57 @@ static bool gen9_mul_mat(gen9_context * ctx, struct ggml_tensor * dst) {
     return true;
 }
 
+// SWIGLU (split form: dst = silu(src0) * src1) on the CPU, for the rare node that is not fused (e.g. eval callbacks
+// that hand over single nodes). Single-threaded: correct, not fast; the counter shows if it happens in normal runs.
+static void gen9_glu_alone(struct ggml_tensor * dst) {
+    const struct ggml_tensor * a = dst->src[0], * b = dst->src[1];
+    const int64_t nc = dst->ne[0], nr = ggml_nrows(dst);
+    for (int64_t r = 0; r < nr; r++) {
+        const float * x = (const float *) ((const char *) a->data + r * a->nb[1]);
+        const float * g = (const float *) ((const char *) b->data + r * b->nb[1]);
+        float * y = (float *) ((char *) dst->data + r * dst->nb[1]);
+        for (int64_t i = 0; i < nc; i++) y[i] = x[i] / (1.0f + expf(-x[i])) * g[i];
+    }
+    n_glu_alone++;
+}
+
+// FFN fusion is opt-in (GEN9_FFN=1): it is correct and saves GPU and CPU work, but on this 25 W machine the shared
+// power budget moves to the GPU and the CPU attention slows down by as much (results/ggml-backend-ffn-fusion-2026-11-13.txt).
+static bool ffn_off(void) { static const bool v = getenv("GEN9_FFN") == nullptr; return v; }
+
+static bool is_f16_weight_mm(const struct ggml_tensor * n) {
+    return n->op == GGML_OP_MUL_MAT && n->src[0]->type == GGML_TYPE_F16 && is_weight(n->src[0]);
+}
+
+// Gated FFN block at nodes i..i+3: two MUL_MATs on the same input (gate, up; either order), SWIGLU of the two, MUL_MAT
+// (down) of the SWIGLU; F16 weights; the three intermediates used only inside the block (ggml_node_has_n_uses counts
+// over the whole graph, also when this split is a view of it). Returns true if computed fused.
+static bool gen9_try_ffn(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
+    if (ffn_off() || i + 3 >= cg->n_nodes) return false;
+    struct ggml_tensor * m0 = cg->nodes[i], * m1 = cg->nodes[i + 1], * glu = cg->nodes[i + 2], * down = cg->nodes[i + 3];
+    if (!is_f16_weight_mm(m0) || !is_f16_weight_mm(m1) || !is_f16_weight_mm(down)) return false;
+    if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || !glu->src[1]) return false;
+    if (m0->src[1] != m1->src[1] || down->src[1] != glu) return false;
+    struct ggml_tensor * gate = glu->src[0], * up = glu->src[1];
+    if (!((gate == m0 && up == m1) || (gate == m1 && up == m0))) return false;
+    if (!ggml_node_has_n_uses(cg, i, 1) || !ggml_node_has_n_uses(cg, i + 1, 1) || !ggml_node_has_n_uses(cg, i + 2, 1)) return false;
+    const struct ggml_tensor * x = m0->src[1];
+    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[2] != 1 || x->ne[3] != 1) return false;
+    if (gate->src[0]->ne[1] != down->src[0]->ne[0] || up->src[0]->ne[1] != gate->src[0]->ne[1]) return false;
+    std::lock_guard<std::mutex> lk(gpu_mu);
+    gen9blas_packed * Pg = get_packed(ctx, gate->src[0]), * Pu = get_packed(ctx, up->src[0]), * Pd = get_packed(ctx, down->src[0]);
+    if (!Pg || !Pu || !Pd) return false;
+    int nonfinite = 0;
+    const int M = (int) x->ne[1];
+    if (gen9blas_ffn_f16w(M, (const float *) x->data, (int) (x->nb[1] / sizeof(float)), Pg, Pu, Pd, (float *) down->data,
+                          (int) (down->nb[1] / sizeof(float)), &nonfinite)) {
+        fprintf(stderr, "gen9: ffn_f16w failed: %s\n", gen9blas_error()); return false;
+    }
+    if (nonfinite) { n_ffn_fallback++; return false; }   // the caller recomputes the four nodes one by one
+    n_ffn_fused++;
+    return true;
+}
+
 static enum ggml_status gen9_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     gen9_context * ctx = (gen9_context *) backend->context;
     n_graphs++;
@@ -144,7 +206,11 @@ static enum ggml_status gen9_graph_compute(ggml_backend_t backend, struct ggml_c
                 n_noop++;
                 break;
             case GGML_OP_MUL_MAT:
+                if (gen9_try_ffn(ctx, cgraph, i)) { i += 3; break; }
                 if (!gen9_mul_mat(ctx, node)) return GGML_STATUS_FAILED;
+                break;
+            case GGML_OP_GLU:
+                gen9_glu_alone(node);
                 break;
             default:
                 GGML_ABORT("gen9: unsupported op %s reached graph_compute", ggml_op_desc(node));
@@ -244,6 +310,17 @@ static bool gen9_dev_supports_op(ggml_backend_dev_t, const struct ggml_tensor * 
             return true;   // no-op nodes: test-backend-ops asks for every tensor of a test graph
         case GGML_OP_MUL_MAT:
             return gen9_supports_mul_mat(op);
+        case GGML_OP_GLU: {   // SWIGLU of two MUL_MAT results: computed inside a fused FFN block (gen9_try_ffn)
+            n_glu_asked++;
+            const struct ggml_tensor * a = op->src[0], * b = op->src[1];
+            const bool ok = ggml_get_glu_op(op) == GGML_GLU_OP_SWIGLU && b && a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 &&
+                            op->type == GGML_TYPE_F32 && ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(op) &&
+                            ggml_are_same_shape(a, b) && a->ne[2] == 1 && a->ne[3] == 1 && op->ne[1] >= 32 &&
+                            a->op == GGML_OP_MUL_MAT && b->op == GGML_OP_MUL_MAT && a->src[0]->type == GGML_TYPE_F16 &&
+                            b->src[0]->type == GGML_TYPE_F16 && !ffn_off() && gpu_ok();   // only what gen9_try_ffn can fuse
+            if (!ok) n_glu_declined++;
+            return ok;
+        }
         default:
             return false;
     }
