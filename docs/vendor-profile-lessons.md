@@ -8,20 +8,26 @@ Source: whisper large-v3-turbo on the UHD 620 laptop, 2026-11-13, `results/whisp
 | Piece | OpenVINO GPU plugin | GEN9 (ggml backend) | Reading |
 |---|---|---|---|
 | Encoder attention | `ocl::sdpa::opt` ~230 GFLOPS [MEAS] | asm kernel 334 GFLOPS [MEAS] | ours ~45 % faster |
-| Encoder FullyConnected | `fully_connected_gpu_bf_tiled` ~420 GFLOPS, bias / GELU / residual fused [MEAS] | GEMM without epilogue; bias, GELU, adds on the CPU | the vendor's edge |
+| Encoder FullyConnected | `fully_connected_gpu_bf_tiled` ~4.5 s per window (~420 GFLOPS), bias / GELU / residual fused [MEAS] | GEMM ~2.8 s + packing/epilogue ~0.57 s per window; bias, GELU, adds on the CPU (~0.9 s/window with conv and waits) [EST from kernel sums, results/whisper-profile-gp-2026-11-13.txt] | ours faster per GEMM; the vendor saves the CPU ops by fusion |
 | Input convolution | `convolution_gpu_ref` (reference kernel), 10 % of the encoder [MEAS] | on the CPU | not tuned for Gen9 by the vendor |
 | Encoder per 30 s window | ~5.6 s [MEAS, PERF_COUNT on] | 5.39 s [MEAS] | a draw |
 | Decoder per token | GPU ~44 ms [MEAS, PERF_COUNT on] | CPU 23 ms [MEAS] | keep the decoder on the CPU |
 
-End to end OpenVINO GenAI still wins (240-253 s vs 263 s for 645.6 s of audio): the kernels are even, so the gap is in
-whisper.cpp's pipeline around them (log-mel and sampling over 51866 logits on the CPU, prompt processing, split
-synchronisation). Encoder ~119 s + decoder ~57 s = ~176 s leaves ~85 s unaccounted [EST]: measure that first.
+End to end OpenVINO GenAI still wins (240-253 s vs 258-263 s for 645.6 s of audio) although our encoder window is
+as fast and our decoder token twice as fast. Correction (profile of a whole whisper-cli run,
+results/whisper-profile-gp-2026-11-13.txt): nothing is unaccounted; whisper.cpp ran the encoder **33 times, not 22**
+(its seek moves to the last segment end, so windows overlap): encode 177 s = 69 %, decode 68 s (2870 tokens) = 26 %,
+prompt 3 %, sampling 1 %, mel 0.3 %. [HYP] GenAI wins by running fewer encoder windows: 22 x 5.6 s + ~2600 tokens x
+44 ms = ~237 s matches its 240 s; to be checked by counting GenAI's encoder calls. If it holds, the largest lever is
+in the application (how many windows are encoded), not in a kernel.
 The OpenVINO profile is one run with PERF_COUNT on and random features: per-op figures are +-10-15 %.
 
 ## 2. Rules that carry over
 
 **a) The vendor profile is a free per-op target on the same chip.** `PERF_COUNT` gives time and kernel name per
-primitive. A faster vendor op (FullyConnected 420 GFLOPS) tells that and by how much ours can improve; `*_ref` kernels
+primitive. A faster vendor op tells that and by how much ours can improve (here it showed the opposite: our GEMM and
+attention are faster; the vendor's edge is fusion and the pipeline). Compare whole runs too: a per-op comparison
+missed that the two applications encode a different number of windows. `*_ref` kernels
 near the top of the list mark where the vendor has dropped Gen9 (cheap wins for us). Other signs of that on Gen9: the
 INT8 (NNCF) encoder hangs the GPU, INT4 does not build (earlier project), long kernels are not preemptible.
 Usable for any model OpenVINO runs.
@@ -54,9 +60,11 @@ ran as intended (backend counters, one process per run: Python 3.14 `forkserver`
 
 ## 3. Next steps, in order
 
-1. Split the 263 s of whisper.cpp + GEN9 (encoder, decoder, prompt, log-mel, sampling, GPU idle) with the pass profile
-   tool (commit 1eaba4a). Cheap; decides where the ~85 s go.
-2. Our GEMM rate on whisper shapes (K 1280, N 1280 / 5120) vs OpenVINO's 420 GFLOPS (`GEN9BLAS_PROFILE`): unknown.
+1. Done (separately, 493e500): the whole run is accounted for (see section 1). Next: count GenAI's encoder calls on the
+   same file to test the "fewer windows" hypothesis, and check whether whisper.cpp's window overlap (33 vs 21.5
+   nominal) can be reduced without losing WER (seek / timestamp settings), since the encoder is 69 % of the run.
+2. Done: our GEMM is ~2.8 s per window (+0.57 s packing/epilogue) vs OpenVINO's fused FullyConnected ~4.5 s.
+   Decoder on the GPU [EST]: F16 weights, ~1.3x on the decoder = ~6 % of the run; measure before building.
 3. Parametric GEMM epilogue (bias, GELU, residual): one kernel for whisper, embeddings and image encoders; measure with
    clocks and energy.
 4. Input convolution on the GPU through the existing GEMM with F16 activations (small change; the vendor uses a
