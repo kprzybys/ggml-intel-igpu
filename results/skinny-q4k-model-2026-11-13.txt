@@ -1,0 +1,41 @@
+# Model (before writing): small-batch GEMM (k = 1-16 tokens) that reads Q4_K weights directly, for speculative
+# verification. 2026-11-13. Inputs: results/spec-verify-batch-2026-11-13.txt (today's GPU path: ~145 ms per batch up to
+# k = 16 on Qwen2.5-1.5B Q4_K_M = FP16 weight read ~115 ms + ~30 ms waits; CPU 42 ms at k = 1, 124 / 268 ms at k = 4 / 8),
+# results/skinny-gemm-rework-2026-11-12.txt (skinny FP16: 20-24 GB/s of weights, time ~ t_mem + t_comp, poor overlap),
+# results/qgemm-model-2026-11-13.txt (Q4_K decode tricks), experiments/solver/gen9.json. All [EST] unless tagged.
+
+## Budget per verification pass, Qwen2.5-1.5B (~1.54e9 weights in MUL_MATs; Q4_K_M ~0.98 GB read per pass)
+memory   : 0.98 GB at 20 GB/s (skinny reads reached 20-24) = ~49 ms   (today FP16: 3.1 GB = ~115 ms)
+compute  : k x 1.54e9 MAC. FP32 SIMD8 mad = 8 MAC per issue slot, ~26 G slots/s (24 EU x 1 per clock x 1.1 GHz):
+           k = 4: 29 ms, k = 8: 58 ms, k = 16: 117 ms. FP16 (16 MAC per slot at the same issue cost): half of that.
+decode   : nibble -> number, scale/min, once per weight, shared by the k tokens: ~3 instructions per 8 weights
+           (SIMD8) = ~22 ms; ~11 ms in SIMD16 / packed half.
+waits    : ~30 ms per pass (the GPU path's per-op submit/wait, measured floor minus weight read).
+## Predicted time per pass (poor overlap as in skinny: closer to the sum than to the max for k >= 8)
+               v1: FP32 math (mixed hf/f mad)        v2: FP16 products, FP32 carry per 32-value sub-block
+k = 1          ~50-60 + 30 = 80-90 ms (CPU 42: lose)  same (memory-bound)
+k = 4          max(49, 29+22) ~55-70 + 30 = 85-100    ~50-60 + 30 = 80-90 ms   (today 142, CPU 124)
+k = 8          58+22 = 80 + 30 = ~110                 ~50-65 + 30 = 80-95      (today 144, CPU 268)
+k = 16         117+22 + 30 = ~170 (worse than today)  58+11 ~70-80 + 30 = 100-110 (today 149, CPU 352)
+-> v1 helps only for k <= 8 (1.3-1.6x over today's GPU path); v2 is needed for k >= 8 and gives ~1.4-1.8x.
+   The waits (~30 ms) become a third of the time: the next lever after the kernel.
+## Where it matters most: models whose FP16 copy does not fit (Qwen2.5-7B)
+Today a 7B verification batch has no FP16 cache to read (14 GB FP16 > budget): per-use dequantization, seconds.
+With Q4_K read directly: 4.4 GB at 20 GB/s = ~220 ms, k = 8 FP16 compute ~130 ms (overlapped) -> ~250-280 ms per
+batch vs ~180 ms per CPU token (7B tg 5.5 t/s, results/compare-real-models-2026-11-13.txt): verifying 8 drafted tokens
+costs ~1.5 CPU tokens. With a 0.5B draft model at per-token acceptance ~0.7 (~2.6-3 accepted per step at k = 4-8)
+speculation could give ~1.5x tokens/s on 7B [HYP: acceptance not measured, draft cost ~30-50 ms per step not included].
+## Design v1 (correctness first, OpenCL C, bench/skinny_q4k.cl, new files only)
+- One SIMD8 subgroup owns RW weight rows; a 128 B block read of a Q4_K block's qs gives lane l the 16 bytes
+  32(l/2)+16(l%2)..+15: low nibbles = sub-block 2(l/2) positions 16(l%2)+0..15, high nibbles = sub-block 2(l/2)+1 same
+  positions (ggml's dequantize_row_q4_K order). The activation positions of a lane are the same for every row, so
+  activations (F16, converted once per batch) are loaded once per block and token and reused across the RW rows.
+- Per lane: weights decoded to float per 16-value half, mixed mad with the token's activation, FP32 accumulators
+  acc[r][t]; at the end sub_group_reduce_add per (row, token).
+- Registers bound the shape: activations k x 16 + weights RW x 16 + accumulators RW x k (one GRF per value per lane in
+  SIMD8) <= ~110 -> e.g. k = 4: RW 4 (64 + 64 + 16 too many) -> RW 2..4 with 16-value halves; the kernel takes k and
+  RW as build-time constants and the generator-free OpenCL C is checked for scratch (isa.check_generated rules).
+- Check: FP64 reference of y = W x on the host from ggml's Q4_K formula, random blocks; error bound vs today's FP16 path.
+## Falsified if
+v1 at k = 4 is not below ~100 ms-equivalent per pass (per-matrix time x matrix count), or the weight read stays under
+15 GB/s, or the error exceeds today's FP16 path.
