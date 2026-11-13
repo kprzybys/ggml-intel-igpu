@@ -1,0 +1,193 @@
+GPU flash attention for Qwen2.5-7B (D 128, H 28, H_kv 4, G 7, 28 layers), 2026-11-13
+=====================================================================================
+
+Code: ggml-backend branch at 3b3e68c + this change. (attention).
+
+## 1. Model of the two designs (written 2026-11-13 20:52 CET, before building anything)
+
+Problem: at D 128 a subgroup holds RQ 2 query rows (FP32 Q and O, 64 GRF). Rows are token-major (row = t*G + hh), so
+with G 7 the pair (row0, row0+1) spans tokens t and t+1 whenever row0 % 7 == 6: one subgroup in 7. asm/attn.cl takes
+one visible-key count per subgroup from row0's token, which is one key short for row 1 under a causal mask (dvis 1).
+Also n_q*7 is odd for odd n_q (last ubatch of a prompt), which the host now refuses (n_q*G % RQ).
+
+(a) pad G to 8: a virtual 8th query head per KV head (Q of head 6 reloaded or zero, O not stored).
+    Work: 8/7 of the useful rows, every block, all depths: +14.3 % kernel time. The hot loop is the stock Qwen loop
+    (sched4 RQ 2 NK 2), so its rate is the Qwen 1.5B kernel's: ~306 GFLOPS executed (HD 530, section 12) / ~315
+    (UHD 620, kcl) -> useful 268 / 276 GFLOPS. Needs a template change (row -> (t, hh) with G' 8, store skipped or
+    redirected for hh 7) but no generator change. Odd n_q: no problem (n_q*8 even).
+(b) per-row visibility: each row r gets its own limit lim_r = min(nk, vis0 + dvis*t_r); the loop runs to the larger
+    (row 1's) limit; only the last key block masks, per row (lim_0 >= lim_1 - 1 lies in the same last block, or at its
+    first key = row 0 fully masked there: max -1e30 < m, p = 0). Extra cost: RQ*NK = 4 instead of 2 compare
+    instructions in the one masked block per row pair, 2 scalar movs before the loop; 1/7 of the subgroups (the
+    spanning ones) run one extra block when lim_0 is a multiple of 16 (1/16 of those): ~0.06 % more blocks.
+    Full blocks: unchanged. Predicted rate = the Qwen 1.5B kernel's on visible keys: ~305 (HD 530) / ~312 (UHD 620)
+    GFLOPS, i.e. (b) ~13-14 % faster than (a). Odd n_q: clamp row indices to n_q*G - 1 in the template (the last
+    subgroup computes the same row twice and stores identical values to the same address).
+    Generator change: per-row limits must reach the generated mask. The generator only knows its internal row
+    numbering (S chains); to tie a limit to an internal row by data flow, the template initialises IGC's l##r to
+    (float) lim_r (the generator zeroes its l registers before the loop anyway), and attn_gen.py reads lim_r from the
+    l register whose accumulating add takes that row's exp'd scores.
+Decision rule: (b) if its measured kernel rate is >= 5 % above (a)'s (proxy for (a): the stock template built for
+G 8, H 32, H_kv 4, whose hot loop is the same as (a)'s; only prologue/epilogue differ) and every correctness test
+passes; otherwise (a).
+
+## 2. End-to-end prediction, laptop UHD 620 (written 2026-11-13 20:52 CET)
+
+Inputs: 7B GEN9 pp512 d0 = 29.2-29.8 t/s (results/ggml-backend-7b-budget-2026-11-13.txt) = 17.4 s per ubatch;
+laptop CPU attention ~66 GFLOPS (Qwen 1.5B d3584: 7.49 - 2.68 s for 3.38e11 FLOP + in-ubatch part,
+results/attn-integration-uhd620-2026-11-13.txt); GPU attention ~300 GFLOPS incl. pinning/submit/wait.
+7B attention FLOP per ubatch: F = 4 * 512 * (d + 256) * 100352:
+  d0 5.3e10, d2048 4.7e11, d3584 7.9e11.
+                  CPU attn   GPU attn   ATTN=0 ubatch   ATTN=1 ubatch   pp512 t/s 0 -> 1        time change
+  d0              0.8 s      0.18 s     17.4 s          16.8 s          29.4 -> 30.5            -3.5 %  (1.5B showed 2x the predicted d0 gain)
+  d2048           7.2 s      1.6 s      23.8 s          18.2 s          21.5 -> 28.1            -24 %
+  d3584           12.0 s     2.6 s      28.6 s          19.2 s          17.9 -> 26.6            -33 %
+Range: CPU attention 60-100 GFLOPS -> d3584 -22 to -35 %. Launch split: d3584 layer = 2.8e10 FLOP -> 2 launches per
+layer (2e10 rule); d0/d2048 1 launch. Memory: n_ctx 4096 KV cache 235 MB (pinned once, < 1 GB KCL_USERPTR_MB),
+Kt buffer 4 MB; peak ~10 GB of 15.5 GB (9.7 GB at d0 measured).
+Perplexity (-c 2048 --chunks 4): GEN9_ATTN=0 vs default within +-0.05 % (1.5B: -0.007 %).
+Userptr limit: 57344 B of K+V per token over 28 layers -> 1 GB holds ~18.7k tokens of cache (kv_size); beyond that
+kcl's LRU re-pins per layer (works, slower); a single K or V region > KCL_USERPTR_MB -> kcl_userptr NULL -> the
+library returns "not handled" and the backend computes the node on ggml-cpu.
+
+## 3. Generator and binaries (2026-11-13, kp, ocloc 24.35.30872.36)
+
+asm/attn.cl -DROWVIS=1, asm/attn_gen.py (igc_maps ties IGC's l registers to rows; sched copies lim_r to T2.6/T2.7; per-row
+mask in the last block), Makefile target attn_qwen7b_tokc (sched4, D 128, G 7, H_kv 4, RQ 2, NK 2, QTOK, CAUSAL, ROWVIS).
+  attn_qwen7b_tokc: loopcheck "256 O elements: same (V, p) products as IGC's loop ...", mad 1024, bank conflicts 0,
+    check_generated OK (no scratch), 52 free registers for the loop, 2 left; Kt over-read 2560 B (pad 4096 B, unchanged).
+    whl sha256 30c0495721b3e2a0749e3259593f50fe63e1b9de00c551d1f4674f8c43121d9d
+    skl sha256 810b24ab2ed176f1ce945e93bec1e50b8cf00f2d4c389634f2271fc628dc1721
+  make -C asm attn-check: the 14 existing binaries (skl + whl) OK = byte-identical; only attn_qwen7b_tokc new
+    (both hashes appended to asm/attn_sha256.txt; nothing else changed there).
+  Test binaries (not tracked): attn_qwen7b_poison (ATTN_POISON=1 ATTN_LOOPCHECK=0), attn_qwen_g8_tokc (stock template,
+    -DG=8 -DHKV=4, the (a) proxy: loopcheck OK, 0 conflicts).
+
+## 4. bench/attn_kcl on tc (HD 530, ~1000 MHz), kcl + userptr, whl binaries built on kp; raw log
+LAYERS=2 PASSES=1 STEP=1 (whole output vs FP64) unless stated; H 28 H_kv 4 D 128 RQ 2 NK 2 = 7B binary (ROWVIS=1).
+== VIS0=3585 nice -n 19 ionice -c3 timeout 300 ./attn_kcl 28 4 128 512 4096 2 2
+# attn_qwen7b_tokc.bin H=28 HKV=4 D=128 nq=512 nk=4096 RQ=2 NK=2 | KV_SIZE=4096 LAYERS=2 REG=tensor local=64 kt_local=256 | KV buffer 16.8 MB at page offset 64, Q/O page offset 64 | VIS0=3585 DVIS=1 ROWVIS=1
+steady (median of 1 passes x 2 layers): attn 90.41 ms/layer, kt 0.568 ms/layer, wall 92.47 ms/layer, pass CPU (main thread) 2.2 ms | attn 311.8 GFLOPS, incl. kt 309.8, incl. kt + submit/wait 304.9 | best layer attn 90.366 ms = 311.9 GFLOPS (kt 0.559) | GPU~1001 MHz
+layer 0: err 3.77e-06 (tokens 512/512, STEP 1)
+layer 1: err 3.37e-06 (tokens 512/512, STEP 1)
+== VIS0=1 nice -n 19 ionice -c3 timeout 300 ./attn_kcl 28 4 128 512 512 2 2
+# attn_qwen7b_tokc.bin H=28 HKV=4 D=128 nq=512 nk=512 RQ=2 NK=2 | KV_SIZE=512 LAYERS=2 REG=tensor local=64 kt_local=256 | KV buffer 2.1 MB at page offset 64, Q/O page offset 64 | VIS0=1 DVIS=1 ROWVIS=1
+steady (median of 1 passes x 2 layers): attn 6.53 ms/layer, kt 0.074 ms/layer, wall 7.44 ms/layer, pass CPU (main thread) 1.1 ms | attn 288.5 GFLOPS, incl. kt 285.3, incl. kt + submit/wait 253.0 | best layer attn 6.476 ms = 290.7 GFLOPS (kt 0.071) | GPU~1000 MHz
+layer 0: err 2.65e-06 (tokens 512/512, STEP 1)
+layer 1: err 2.77e-06 (tokens 512/512, STEP 1)
+== VIS0=3 nice -n 19 ionice -c3 timeout 300 ./attn_kcl 28 4 128 75 80 2 2
+# attn_qwen7b_tokc.bin H=28 HKV=4 D=128 nq=75 nk=80 RQ=2 NK=2 | KV_SIZE=80 LAYERS=2 REG=tensor local=32 kt_local=256 | KV buffer 0.3 MB at page offset 64, Q/O page offset 64 | VIS0=3 DVIS=1 ROWVIS=1
+steady (median of 1 passes x 2 layers): attn 0.26 ms/layer, kt 0.012 ms/layer, wall 0.80 ms/layer, pass CPU (main thread) 0.8 ms | attn 165.1 GFLOPS, incl. kt 158.0, incl. kt + submit/wait 53.7 | best layer attn 0.250 ms = 172.0 GFLOPS (kt 0.012) | GPU~1000 MHz
+layer 0: err 1.70e-06 (tokens 75/75, STEP 1)
+layer 1: err 1.75e-06 (tokens 75/75, STEP 1)
+== VIS0=17 nice -n 19 ionice -c3 timeout 300 ./attn_kcl 28 4 128 33 64 2 2
+# attn_qwen7b_tokc.bin H=28 HKV=4 D=128 nq=33 nk=64 RQ=2 NK=2 | KV_SIZE=64 LAYERS=2 REG=tensor local=64 kt_local=256 | KV buffer 0.3 MB at page offset 64, Q/O page offset 64 | VIS0=17 DVIS=1 ROWVIS=1
+steady (median of 1 passes x 2 layers): attn 0.16 ms/layer, kt 0.009 ms/layer, wall 0.64 ms/layer, pass CPU (main thread) 0.7 ms | attn 99.2 GFLOPS, incl. kt 93.6, incl. kt + submit/wait 24.4 | best layer attn 0.135 ms = 115.5 GFLOPS (kt 0.009) | GPU~1000 MHz
+layer 0: err 1.89e-06 (tokens 33/33, STEP 1)
+layer 1: err 2.15e-06 (tokens 33/33, STEP 1)
+== VIS0=100 nice -n 19 ionice -c3 timeout 300 ./attn_kcl 28 4 128 200 304 2 2
+# attn_qwen7b_tokc.bin H=28 HKV=4 D=128 nq=200 nk=304 RQ=2 NK=2 | KV_SIZE=304 LAYERS=2 REG=tensor local=64 kt_local=256 | KV buffer 1.2 MB at page offset 64, Q/O page offset 64 | VIS0=100 DVIS=1 ROWVIS=1
+steady (median of 1 passes x 2 layers): attn 2.44 ms/layer, kt 0.064 ms/layer, wall 3.01 ms/layer, pass CPU (main thread) 0.7 ms | attn 234.6 GFLOPS, incl. kt 228.6, incl. kt + submit/wait 190.2 | best layer attn 2.292 ms = 249.6 GFLOPS (kt 0.044) | GPU~1000 MHz
+layer 0: err 2.77e-06 (tokens 200/200, STEP 1)
+layer 1: err 2.76e-06 (tokens 200/200, STEP 1)
+== VIS0=16 nice -n 19 ionice -c3 timeout 300 ./attn_kcl 28 4 128 201 224 2 2
+# attn_qwen7b_tokc.bin H=28 HKV=4 D=128 nq=201 nk=224 RQ=2 NK=2 | KV_SIZE=224 LAYERS=2 REG=tensor local=64 kt_local=256 | KV buffer 0.9 MB at page offset 64, Q/O page offset 64 | VIS0=16 DVIS=1 ROWVIS=1
+steady (median of 1 passes x 2 layers): attn 1.57 ms/layer, kt 0.045 ms/layer, wall 2.17 ms/layer, pass CPU (main thread) 0.8 ms | attn 213.3 GFLOPS, incl. kt 207.3, incl. kt + submit/wait 153.9 | best layer attn 1.458 ms = 229.2 GFLOPS (kt 0.045) | GPU~1000 MHz
+layer 0: err 2.67e-06 (tokens 201/201, STEP 1)
+layer 1: err 2.32e-06 (tokens 201/201, STEP 1)
+== VIS0=1 nice -n 19 ionice -c3 timeout 300 ./attn_kcl 28 4 128 1 16 2 2
+# attn_qwen7b_tokc.bin H=28 HKV=4 D=128 nq=1 nk=16 RQ=2 NK=2 | KV_SIZE=16 LAYERS=2 REG=tensor local=64 kt_local=256 | KV buffer 0.1 MB at page offset 64, Q/O page offset 128 | VIS0=1 DVIS=1 ROWVIS=1
+steady (median of 1 passes x 2 layers): attn 0.06 ms/layer, kt 0.005 ms/layer, wall 0.49 ms/layer, pass CPU (main thread) 0.6 ms | attn 0.2 GFLOPS, incl. kt 0.2, incl. kt + submit/wait 0.0 | best layer attn 0.062 ms = 0.2 GFLOPS (kt 0.005) | GPU~1000 MHz
+layer 0: err 0.00e+00 (tokens 1/1, STEP 1)
+layer 1: err 0.00e+00 (tokens 1/1, STEP 1)
+== VIS0=1000 DVIS=0 nice -n 19 ionice -c3 timeout 300 ./attn_kcl 28 4 128 75 1008 2 2
+# attn_qwen7b_tokc.bin H=28 HKV=4 D=128 nq=75 nk=1008 RQ=2 NK=2 | KV_SIZE=1008 LAYERS=2 REG=tensor local=32 kt_local=256 | KV buffer 4.1 MB at page offset 64, Q/O page offset 64 | VIS0=1000 DVIS=0 ROWVIS=1
+steady (median of 1 passes x 2 layers): attn 4.29 ms/layer, kt 0.139 ms/layer, wall 4.89 ms/layer, pass CPU (main thread) 0.7 ms | attn 250.9 GFLOPS, incl. kt 243.0, incl. kt + submit/wait 220.0 | best layer attn 4.203 ms = 255.8 GFLOPS (kt 0.138) | GPU~1000 MHz
+layer 0: err 2.91e-06 (tokens 75/75, STEP 1)
+layer 1: err 2.48e-06 (tokens 75/75, STEP 1)
+== VIS0=513 RAMP=1 QSIGMA=0.1 nice -n 19 ionice -c3 timeout 300 ./attn_kcl 28 4 128 512 1024 2 2
+# attn_qwen7b_tokc.bin H=28 HKV=4 D=128 nq=512 nk=1024 RQ=2 NK=2 | KV_SIZE=1024 LAYERS=2 REG=tensor local=64 kt_local=256 | KV buffer 4.2 MB at page offset 64, Q/O page offset 64 | VIS0=513 DVIS=1 ROWVIS=1
+steady (median of 1 passes x 2 layers): attn 18.89 ms/layer, kt 0.146 ms/layer, wall 20.00 ms/layer, pass CPU (main thread) 1.4 ms | attn 298.6 GFLOPS, incl. kt 296.4, incl. kt + submit/wait 282.0 | best layer attn 18.872 ms = 298.9 GFLOPS (kt 0.142) | GPU~1000 MHz
+layer 0: err 3.64e-05 (tokens 512/512, STEP 1)
+layer 1: err 3.69e-05 (tokens 512/512, STEP 1)
+== VIS0=513 RAMP=-1 QSIGMA=0.1 nice -n 19 ionice -c3 timeout 300 ./attn_kcl 28 4 128 512 1024 2 2
+# attn_qwen7b_tokc.bin H=28 HKV=4 D=128 nq=512 nk=1024 RQ=2 NK=2 | KV_SIZE=1024 LAYERS=2 REG=tensor local=64 kt_local=256 | KV buffer 4.2 MB at page offset 64, Q/O page offset 64 | VIS0=513 DVIS=1 ROWVIS=1
+steady (median of 1 passes x 2 layers): attn 18.47 ms/layer, kt 0.149 ms/layer, wall 19.55 ms/layer, pass CPU (main thread) 1.4 ms | attn 305.4 GFLOPS, incl. kt 303.0, incl. kt + submit/wait 288.6 | best layer attn 18.440 ms = 305.9 GFLOPS (kt 0.141) | GPU~1000 MHz
+layer 0: err 7.92e-05 (tokens 512/512, STEP 1)
+layer 1: err 7.07e-05 (tokens 512/512, STEP 1)
+== VIS0=3585 BIN=attn_qwen7b_poison.bin nice -n 19 ionice -c3 timeout 300 ./attn_kcl 28 4 128 512 4096 2 2
+# attn_qwen7b_poison.bin H=28 HKV=4 D=128 nq=512 nk=4096 RQ=2 NK=2 | KV_SIZE=4096 LAYERS=2 REG=tensor local=64 kt_local=256 | KV buffer 16.8 MB at page offset 64, Q/O page offset 64 | VIS0=3585 DVIS=1 ROWVIS=1
+steady (median of 1 passes x 2 layers): attn 90.57 ms/layer, kt 0.578 ms/layer, wall 92.47 ms/layer, pass CPU (main thread) 2.1 ms | attn 311.2 GFLOPS, incl. kt 309.3, incl. kt + submit/wait 304.8 | best layer attn 90.426 ms = 311.7 GFLOPS (kt 0.577) | GPU~1000 MHz
+layer 0: err 8.87e-01 (tokens 512/512, STEP 1)
+layer 1: err 8.01e-01 (tokens 512/512, STEP 1)
+== VIS0=3585 BIN=attn_qwen_g8_tokc.bin nice -n 19 ionice -c3 timeout 300 ./attn_kcl 32 4 128 512 4096 2 2
+# attn_qwen_g8_tokc.bin H=32 HKV=4 D=128 nq=512 nk=4096 RQ=2 NK=2 | KV_SIZE=4096 LAYERS=2 REG=tensor local=64 kt_local=256 | KV buffer 16.8 MB at page offset 64, Q/O page offset 64 | VIS0=3585 DVIS=1 ROWVIS=0
+steady (median of 1 passes x 2 layers): attn 104.39 ms/layer, kt 0.571 ms/layer, wall 106.27 ms/layer, pass CPU (main thread) 1.9 ms | attn 308.6 GFLOPS, incl. kt 306.9, incl. kt + submit/wait 303.2 | best layer attn 104.141 ms = 309.4 GFLOPS (kt 0.560) | GPU~1000 MHz
+layer 0: err 3.28e-06 (tokens 512/512, STEP 1)
+layer 1: err 3.79e-06 (tokens 512/512, STEP 1)
+== VIS0=3585 nice -n 19 ionice -c3 timeout 300 ./attn_kcl 12 2 128 512 4096 2 2
+# attn_qwen_tokc.bin H=12 HKV=2 D=128 nq=512 nk=4096 RQ=2 NK=2 | KV_SIZE=4096 LAYERS=2 REG=tensor local=64 kt_local=256 | KV buffer 8.4 MB at page offset 64, Q/O page offset 64 | VIS0=3585 DVIS=1 ROWVIS=0
+steady (median of 1 passes x 2 layers): attn 39.20 ms/layer, kt 0.289 ms/layer, wall 40.66 ms/layer, pass CPU (main thread) 1.8 ms | attn 308.2 GFLOPS, incl. kt 305.9, incl. kt + submit/wait 297.1 | best layer attn 39.052 ms = 309.4 GFLOPS (kt 0.289) | GPU~1001 MHz
+layer 0: err 2.76e-06 (tokens 512/512, STEP 1)
+layer 1: err 2.86e-06 (tokens 512/512, STEP 1)
+== VIS0=3585 nice -n 19 ionice -c3 timeout 300 ./attn_kcl 32 8 64 512 4096 4 2
+# attn_llama_tokc.bin H=32 HKV=8 D=64 nq=512 nk=4096 RQ=4 NK=2 | KV_SIZE=4096 LAYERS=2 REG=tensor local=64 kt_local=256 | KV buffer 16.8 MB at page offset 64, Q/O page offset 64 | VIS0=3585 DVIS=1 ROWVIS=0
+steady (median of 1 passes x 2 layers): attn 50.24 ms/layer, kt 0.588 ms/layer, wall 52.27 ms/layer, pass CPU (main thread) 2.3 ms | attn 320.6 GFLOPS, incl. kt 316.9, incl. kt + submit/wait 308.1 | best layer attn 50.056 ms = 321.8 GFLOPS (kt 0.579) | GPU~1001 MHz
+layer 0: err 2.85e-06 (tokens 512/512, STEP 1)
+layer 1: err 2.71e-06 (tokens 512/512, STEP 1)
+== VIS0=1500 DVIS=0 BIN=attn_whisper_tokc.bin nice -n 19 ionice -c3 timeout 300 ./attn_kcl 20 20 64 1500 1504 4 2
+# attn_whisper_tokc.bin H=20 HKV=20 D=64 nq=1500 nk=1504 RQ=4 NK=2 | KV_SIZE=1504 LAYERS=2 REG=tensor local=32 kt_local=256 | KV buffer 15.4 MB at page offset 64, Q/O page offset 64 | VIS0=1500 DVIS=0 ROWVIS=0
+steady (median of 1 passes x 2 layers): attn 35.96 ms/layer, kt 0.559 ms/layer, wall 37.66 ms/layer, pass CPU (main thread) 1.7 ms | attn 320.4 GFLOPS, incl. kt 315.5, incl. kt + submit/wait 305.9 | best layer attn 35.954 ms = 320.4 GFLOPS (kt 0.543) | GPU~1001 MHz
+layer 0: err 2.00e-06 (tokens 1500/1500, STEP 1)
+layer 1: err 2.16e-06 (tokens 1500/1500, STEP 1)
+
+Summary of the FP64 checks (max |O - O_ref| / max |O_ref| over all tokens and heads):
+  case                                               err (layer 0 / 1)     note
+  n_q 512 n_k 4096 VIS0 3585 (causal d3584)          3.77e-6 / 3.37e-6    rows spanning two tokens in 1 of 7 subgroups
+  n_q 512 n_k 512 VIS0 1 (d0)                         2.65e-6 / 2.77e-6
+  n_q 75 (odd, n_q*G odd) n_k 80 VIS0 3               1.70e-6 / 1.75e-6    partial blocks in every row, clamped last row
+  n_q 33 (odd) n_k 64 VIS0 17                         1.89e-6 / 2.15e-6
+  n_q 200 n_k 304 VIS0 100                            2.77e-6 / 2.76e-6
+  n_q 201 (odd) n_k 224 VIS0 16                       2.67e-6 / 2.32e-6    row 0 limit a multiple of 16 for some pairs
+  n_q 1 n_k 16 VIS0 1                                 0 / 0                one key: O = V row 0
+  n_q 75 n_k 1008 VIS0 1000 DVIS 0                    2.91e-6 / 2.48e-6
+  RAMP=1 QSIGMA=0.1 n_q 512 n_k 1024 VIS0 513         3.64e-5 / 3.69e-5    rescale every block (old binaries: 2.8-8.5e-5)
+  RAMP=-1 QSIGMA=0.1 same                             7.92e-5 / 7.07e-5    rescale never after block 0
+  poison binary, d3584                                0.89 / 0.80          the GPU runs the generated ISA
+  (a) proxy G 8 (H 32), d3584                         3.28e-6 / 3.79e-6
+  Qwen 1.5B / Llama 1B / whisper (existing binaries)  2.8e-6 / 2.9e-6 / 2.2e-6   unchanged
+
+## 5. Kernel rate (a) vs (b), tc HD 530, LAYERS=28 PASSES=5 STEP=0, causal d3584 (n_q 512, n_k 4096), 3 alternating rounds; raw log
+== round 1 b
+steady (median of 5 passes x 28 layers): attn 90.51 ms/layer, kt 0.559 ms/layer, wall 91.30 ms/layer, pass CPU (main thread) 3.1 ms | attn 311.4 GFLOPS, incl. kt 309.5, incl. kt + submit/wait 308.7 | best layer attn 90.096 ms = 312.9 GFLOPS (kt 0.541) | GPU~999 MHz
+== round 1 a
+steady (median of 5 passes x 28 layers): attn 103.72 ms/layer, kt 0.559 ms/layer, wall 104.49 ms/layer, pass CPU (main thread) 3.1 ms | attn 310.6 GFLOPS, incl. kt 309.0, incl. kt + submit/wait 308.3 | best layer attn 103.271 ms = 312.0 GFLOPS (kt 0.542) | GPU~1000 MHz
+== round 1 q15
+steady (median of 5 passes x 28 layers): attn 39.30 ms/layer, kt 0.278 ms/layer, wall 39.80 ms/layer, pass CPU (main thread) 3.1 ms | attn 307.4 GFLOPS, incl. kt 305.2, incl. kt + submit/wait 303.6 | best layer attn 39.023 ms = 309.6 GFLOPS (kt 0.272) | GPU~1000 MHz
+== round 2 b
+steady (median of 5 passes x 28 layers): attn 90.53 ms/layer, kt 0.561 ms/layer, wall 91.29 ms/layer, pass CPU (main thread) 2.9 ms | attn 311.4 GFLOPS, incl. kt 309.5, incl. kt + submit/wait 308.8 | best layer attn 90.037 ms = 313.1 GFLOPS (kt 0.543) | GPU~1000 MHz
+== round 2 a
+steady (median of 5 passes x 28 layers): attn 103.67 ms/layer, kt 0.557 ms/layer, wall 104.42 ms/layer, pass CPU (main thread) 3.2 ms | attn 310.8 GFLOPS, incl. kt 309.1, incl. kt + submit/wait 308.5 | best layer attn 103.168 ms = 312.3 GFLOPS (kt 0.542) | GPU~1000 MHz
+== round 2 q15
+steady (median of 5 passes x 28 layers): attn 39.27 ms/layer, kt 0.278 ms/layer, wall 39.78 ms/layer, pass CPU (main thread) 3.3 ms | attn 307.6 GFLOPS, incl. kt 305.4, incl. kt + submit/wait 303.7 | best layer attn 38.978 ms = 310.0 GFLOPS (kt 0.272) | GPU~999 MHz
+== round 3 b
+steady (median of 5 passes x 28 layers): attn 90.47 ms/layer, kt 0.561 ms/layer, wall 91.24 ms/layer, pass CPU (main thread) 2.9 ms | attn 311.6 GFLOPS, incl. kt 309.7, incl. kt + submit/wait 309.0 | best layer attn 89.871 ms = 313.7 GFLOPS (kt 0.542) | GPU~1000 MHz
+== round 3 a
+steady (median of 5 passes x 28 layers): attn 103.71 ms/layer, kt 0.556 ms/layer, wall 104.48 ms/layer, pass CPU (main thread) 2.9 ms | attn 310.6 GFLOPS, incl. kt 309.0, incl. kt + submit/wait 308.3 | best layer attn 103.186 ms = 312.2 GFLOPS (kt 0.540) | GPU~1000 MHz
+== round 3 q15
+steady (median of 5 passes x 28 layers): attn 39.34 ms/layer, kt 0.278 ms/layer, wall 39.82 ms/layer, pass CPU (main thread) 2.9 ms | attn 307.1 GFLOPS, incl. kt 305.0, incl. kt + submit/wait 303.4 | best layer attn 38.996 ms = 309.8 GFLOPS (kt 0.273) | GPU~999 MHz
+== b d0 (VIS0 1, n_k 512)
+steady (median of 5 passes x 28 layers): attn 6.49 ms/layer, kt 0.070 ms/layer, wall 6.78 ms/layer, pass CPU (main thread) 2.9 ms | attn 289.9 GFLOPS, incl. kt 286.8, incl. kt + submit/wait 277.5 | best layer attn 6.442 ms = 292.3 GFLOPS (kt 0.068) | GPU~1000 MHz
+== a d0
+steady (median of 5 passes x 28 layers): attn 7.48 ms/layer, kt 0.071 ms/layer, wall 7.76 ms/layer, pass CPU (main thread) 2.9 ms | attn 287.5 GFLOPS, incl. kt 284.8, incl. kt + submit/wait 277.2 | best layer attn 7.415 ms = 290.2 GFLOPS (kt 0.070) | GPU~1000 MHz
+done
+
+                     attn ms/layer (3 rounds)   GFLOPS executed   useful GFLOPS (7B FLOP)   time vs (b)
+(b) 7B ROWVIS        90.51 / 90.53 / 90.47       311.4-311.6       311.5                     -
+(a) proxy G 8        103.72 / 103.67 / 103.71    310.6-310.8       271.8 (x 7/8)             +14.6 %
+Qwen 1.5B (control)  39.30 / 39.27 / 39.34          307.1-307.4       -
+d0 (n_k 512): (b) 6.49 ms 289.9 GFLOPS, (a) 7.48 ms (+15.3 %).
+Against the model: (b) predicted ~305 GFLOPS (= the Qwen 1.5B kernel) -> 311.5 (+2 %, larger grid: 28 heads); (a)
+predicted +14.3 % time -> +14.6 %. Decision by measurement: (b) (rule: >= 5 % faster and all tests pass).
+Per 7B layer at d3584: 90.5 ms of attention + 0.56 ms k_kt in ONE launch here (bench/attn_kcl does not split); the
+library splits at 2e10 FLOP (2 launches per layer at d3584, ~45 ms each).

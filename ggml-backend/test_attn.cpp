@@ -12,7 +12,10 @@
 //         encoder, e.g. 64 20 20 1500 0 1536; the rows behind n_kv are zero as in its kv_pad buffer),
 //         whispernan (as whisper, V rows n_kv.. set to NaN: the GPU must not be used, the result must stay finite);
 //         the whisper shape with mode causal (64 20 20 512 0 1536) must be computed by ggml-cpu ("library declined"):
-//         with G 1 < RQ 4 a subgroup holds 4 tokens and the kernel takes the visible key count of the first one
+//         with G 1 < RQ 4 a subgroup holds 4 tokens and the kernel takes the visible key count of the first one;
+//         Qwen2.5-7B (128 28 4, G 7, ROWVIS binary): causal at any n_q incl. odd ones; KCL_USERPTR_MB=1 forces the
+//         ggml-cpu fallback ("library declined": the K/V region cannot be pinned); depth 16000 / kv_size 16896 splits
+//         each node into several launches (GEN9_INFO)
 //   qrange: Q uniform in [-qrange, qrange] (default 1; 20 = large logits as test_flash_attn_ext_large_logits)
 // Output: supports_op, NMSE (test-backend-ops metric, its FLASH_ATTN_EXT bound is 5e-4), max |gpu - cpu| / max |cpu|,
 // wall times. GEN9_INFO=1 prints the backend's counters at exit.
