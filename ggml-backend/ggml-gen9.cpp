@@ -41,6 +41,11 @@ static std::atomic<long> n_mm_asked{0}, n_mm_declined_shape{0}, n_mm_declined_ty
 static std::atomic<long> n_mm_streamed{0};
 static std::atomic<long> n_dequant{0}, n_dequant_f32{0}, n_dequant_gpu{0};
 static std::atomic<double> t_dequant_s{0}, t_deq_alloc_s{0}, t_deq_cpu_s{0}, t_deq_pack_s{0}, t_deq_gpu_s{0};
+// FLASH_ATTN_EXT (opt-in GEN9_ATTN=1, docs/attention-gpu.md section 11)
+static std::atomic<long> n_fa_asked{0}, n_fa_off{0}, n_fa_decl_type{0}, n_fa_decl_param{0}, n_fa_decl_shape{0}, n_fa_decl_layout{0},
+                         n_fa_decl_nq{0}, n_fa_decl_mask{0}, n_fa_decl_gpu{0};
+static std::atomic<long> n_fa_gpu{0}, n_fa_launch{0}, n_fa_rows{0}, n_fa_cpu_mask{0}, n_fa_cpu_rows{0}, n_fa_cpu_lib{0}, n_fa_cpu_err{0};
+static std::atomic<double> t_fa_gpu_s{0}, t_fa_mask_s{0}, t_fa_cpu_s{0}, fa_flop{0};
 
 static void gen9_report(void) {
     fprintf(stderr, "gen9: graph_compute %ld; no-op nodes %ld; MUL_MAT run: cached weight %ld, packed now %ld, per call %ld; "
@@ -55,6 +60,15 @@ static void gen9_report(void) {
     fprintf(stderr, "gen9: supports_op MUL_MAT asked %ld, declined: shape/layout %ld, type %ld, batch<32 %ld, hint %ld, no GPU %ld\n",
             n_mm_asked.load(), n_mm_declined_shape.load(), n_mm_declined_type.load(), n_mm_declined_batch.load(),
             n_mm_declined_hint.load(), n_mm_declined_gpu.load());
+    fprintf(stderr, "gen9: supports_op FLASH_ATTN_EXT asked %ld, declined: GEN9_ATTN off %ld, type %ld, ALiBi/softcap/sinks %ld, "
+            "shape/no binary %ld, layout %ld, n_q<32 %ld, mask/kv_rows shape %ld, no GPU %ld\n", n_fa_asked.load(), n_fa_off.load(),
+            n_fa_decl_type.load(), n_fa_decl_param.load(), n_fa_decl_shape.load(), n_fa_decl_layout.load(), n_fa_decl_nq.load(),
+            n_fa_decl_mask.load(), n_fa_decl_gpu.load());
+    fprintf(stderr, "gen9: FLASH_ATTN_EXT run on the GPU %ld (%ld launches, %ld with kv_rows), %.3f s, %.1f GFLOP (%.1f GFLOPS incl. "
+            "pinning/submit/wait); mask analysis %.3f s; computed by ggml-cpu inside GEN9: mask not causal/full %ld, kv_rows not "
+            "identity %ld, library declined %ld, GPU error %ld (%.3f s)\n", n_fa_gpu.load(), n_fa_launch.load(), n_fa_rows.load(),
+            t_fa_gpu_s.load(), fa_flop.load() * 1e-9, t_fa_gpu_s.load() > 0 ? fa_flop.load() * 1e-9 / t_fa_gpu_s.load() : 0.0,
+            t_fa_mask_s.load(), n_fa_cpu_mask.load(), n_fa_cpu_rows.load(), n_fa_cpu_lib.load(), n_fa_cpu_err.load(), t_fa_cpu_s.load());
 }
 
 // ---------------- GPU (lazy: first use) ----------------
@@ -84,7 +98,11 @@ struct packed_t { gen9blas_packed * P; int t; bool temp = false; };   // temp: n
 struct gen9_context {
     std::map<wkey, packed_t> cache;
     size_t cached_bytes = 0;
-    ~gen9_context() { std::lock_guard<std::mutex> lk(gpu_mu); for (auto & kv : cache) gen9blas_packed_free(kv.second.P); }
+    ggml_backend_t cpu = nullptr;   // ggml-cpu for FLASH_ATTN_EXT nodes whose mask turns out not to be supported (created on first use)
+    ~gen9_context() {
+        if (cpu) ggml_backend_free(cpu);
+        std::lock_guard<std::mutex> lk(gpu_mu); for (auto & kv : cache) gen9blas_packed_free(kv.second.P);
+    }
 };
 
 static bool is_weight(const struct ggml_tensor * w) {
@@ -318,6 +336,124 @@ static bool gen9_try_ffn(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
     return true;
 }
 
+// ---------------- FLASH_ATTN_EXT (docs/attention-gpu.md section 11) ----------------
+// Opt-in (GEN9_ATTN=1). supports_op accepts what the library's kernels take: F16 K/V, F32 Q/O in llama.cpp's layouts,
+// no ALiBi / soft-capping / sinks, a (D, G, H_kv) with a built-in binary, n_q >= 32. The mask contents are only known at
+// compute time: the kernel masks by index (token t sees the first vis0 + dvis*t keys), so the mask must be exactly that
+// pattern (0 then -inf in every row; llama.cpp's single-sequence causal mask, or no mask); with kv_rows the listed rows
+// must be the identity over the visible columns. Anything else (several sequences, holes after a context shift, SWA,
+// a mask with other values) is computed by ggml-cpu inside this backend (counted).
+static bool attn_on(void) { static const bool v = getenv("GEN9_ATTN") && atoi(getenv("GEN9_ATTN")) != 0; return v; }
+
+static float fa_param(const struct ggml_tensor * op, int i) { float v; memcpy(&v, (const float *) op->op_params + i, sizeof v); return v; }
+
+static bool gen9_supports_fa(const struct ggml_tensor * op) {
+    n_fa_asked++;
+    if (!attn_on()) { n_fa_off++; return false; }
+    const struct ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2], * m = op->src[3], * rows = op->src[5];
+    if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 || op->type != GGML_TYPE_F32) { n_fa_decl_type++; return false; }
+    if (op->src[4] || fa_param(op, 1) != 0.0f || fa_param(op, 2) != 0.0f) { n_fa_decl_param++; return false; }
+    const int64_t D = q->ne[0], nq = q->ne[1], H = q->ne[2], nk = k->ne[1], HKV = k->ne[2];
+    if (k->ne[0] != D || v->ne[0] != D || v->ne[1] != nk || v->ne[2] != HKV || q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 ||
+        HKV <= 0 || H % HKV || nk % 16 || nk > INT_MAX || !gpu_ok() || !gen9blas_attn_supported((int) D, (int) H, (int) HKV)) {
+        if (!gpu_ok()) n_fa_decl_gpu++; else n_fa_decl_shape++;
+        return false;
+    }
+    const size_t row = (size_t) (HKV * D * 2);
+    if (q->nb[0] != 4 || q->nb[1] != (size_t) (H * D * 4) || q->nb[2] != (size_t) (D * 4) || k->nb[0] != 2 || k->nb[1] != row ||
+        k->nb[2] != (size_t) (D * 2) || v->nb[0] != 2 || v->nb[1] != row || v->nb[2] != (size_t) (D * 2) || !ggml_is_contiguous(op) ||
+        op->ne[0] != D || op->ne[1] != H || op->ne[2] != nq || op->ne[3] != 1) { n_fa_decl_layout++; return false; }
+    if (nq < 32) { n_fa_decl_nq++; return false; }
+    const int64_t ncols = rows ? rows->ne[0] : nk;
+    if ((m && (m->type != GGML_TYPE_F16 || !ggml_is_contiguous(m) || m->ne[0] != ncols || m->ne[1] < nq || m->ne[2] != 1 || m->ne[3] != 1 || ncols % 16)) ||
+        (rows && (!m || rows->type != GGML_TYPE_I32 || !ggml_is_contiguous(rows) || rows->ne[1] != 1 || ncols > nk))) {
+        n_fa_decl_mask++; return false;
+    }
+    return true;
+}
+
+// Mask rows 0..nq-1: row t must be ncols values, the first n_t equal to +0 and the rest -inf, with n_t = n_0 + dvis*t,
+// dvis 0 or 1, n_0 >= 1. Word-wise compare (+0 = 0x0000, -inf = 0xFC00 in F16).
+static bool fa_mask_prefix(const struct ggml_tensor * m, int64_t nq, int & vis0, int & dvis) {
+    const int64_t nc = m->ne[0];
+    auto ok_row = [&](const uint16_t * r, int64_t n) {
+        int64_t j = 0;
+        for (; j + 4 <= n; j += 4) { uint64_t w; memcpy(&w, r + j, 8); if (w) return false; }
+        for (; j < n; j++) if (r[j]) return false;
+        for (; j < nc && (j & 3); j++) if (r[j] != 0xFC00) return false;
+        for (; j + 4 <= nc; j += 4) { uint64_t w; memcpy(&w, r + j, 8); if (w != 0xFC00FC00FC00FC00ull) return false; }
+        for (; j < nc; j++) if (r[j] != 0xFC00) return false;
+        return true;
+    };
+    auto row = [&](int64_t t) { return (const uint16_t *) ((const char *) m->data + t * m->nb[1]); };
+    int64_t n0 = 0;
+    while (n0 < nc && row(0)[n0] == 0) n0++;
+    if (n0 < 1 || !ok_row(row(0), n0)) return false;
+    int d = 0;
+    if (nq > 1) {
+        if (n0 < nc && ok_row(row(1), n0 + 1)) d = 1;
+        else if (!ok_row(row(1), n0)) return false;
+    }
+    for (int64_t t = 2; t < nq; t++) if (!ok_row(row(t), std::min(n0 + d * t, nc))) return false;
+    vis0 = (int) n0; dvis = d;
+    return true;
+}
+
+static void fa_on_cpu(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
+    auto t0 = std::chrono::steady_clock::now();
+    if (!ctx->cpu) {
+        ctx->cpu = ggml_backend_cpu_init();
+        const char * e = getenv("GEN9_CPU_THREADS");
+        ggml_backend_cpu_set_n_threads(ctx->cpu, e && atoi(e) > 0 ? atoi(e) : (int) std::max(1u, std::thread::hardware_concurrency()));
+    }
+    struct ggml_cgraph one = *cg;   // = ggml_graph_view(cg, i, i + 1), which libggml-base does not export
+    one.size = 0; one.n_nodes = 1; one.n_leafs = 0; one.nodes = cg->nodes + i;
+    one.grads = nullptr; one.grad_accs = nullptr; one.leafs = nullptr; one.uid = 0;
+    GGML_ASSERT(ggml_backend_graph_compute(ctx->cpu, &one) == GGML_STATUS_SUCCESS);
+    t_fa_cpu_s = t_fa_cpu_s + std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
+static void gen9_flash_attn(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
+    struct ggml_tensor * dst = cg->nodes[i];
+    const struct ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * m = dst->src[3], * rows = dst->src[5];
+    const int D = (int) q->ne[0], nq = (int) q->ne[1], H = (int) q->ne[2], HKV = (int) k->ne[2];
+    int vis0 = (int) k->ne[1], dvis = 0;
+    auto t0 = std::chrono::steady_clock::now();
+    if (m && !fa_mask_prefix(m, nq, vis0, dvis)) {
+        t_fa_mask_s = t_fa_mask_s + std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        n_fa_cpu_mask++; fa_on_cpu(ctx, cg, i); return;
+    }
+    const int64_t vmax = std::min<int64_t>(vis0 + (int64_t) dvis * (nq - 1), rows ? rows->ne[0] : k->ne[1]);
+    if (rows) {   // kv_rows: column c reads cache row rows[c]; identity over the visible columns = a plain view
+        const int32_t * r = (const int32_t *) rows->data;
+        for (int64_t c = 0; c < vmax; c++) if (r[c] != c) { n_fa_cpu_rows++; fa_on_cpu(ctx, cg, i); return; }
+        n_fa_rows++;
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    t_fa_mask_s = t_fa_mask_s + std::chrono::duration<double>(t1 - t0).count();
+    const int nk = (int) std::min<int64_t>((vmax + 15) / 16 * 16, k->ne[1]);   // key rows the kernel reads (multiple of 16)
+    // pin the whole KV tensor behind the view (its first row is the view's first row in llama.cpp)
+    auto reg_bytes = [](const struct ggml_tensor * t) {
+        const struct ggml_tensor * b = t->view_src ? t->view_src : t;
+        return (size_t) ((const char *) b->data + ggml_nbytes(b) - (const char *) t->data);
+    };
+    int launches = 0, rc;
+    {
+        std::lock_guard<std::mutex> lk(gpu_mu);
+        rc = gen9blas_attn_f16kv(D, H, HKV, nq, nk, (const float *) q->data, (const uint16_t *) k->data, reg_bytes(k),
+                                 (const uint16_t *) v->data, reg_bytes(v), (float *) dst->data, fa_param(dst, 0), vis0, dvis, &launches);
+    }
+    if (rc) {
+        if (rc < 0) { n_fa_cpu_err++; fprintf(stderr, "gen9: attention on the GPU failed (%s); ggml-cpu\n", gen9blas_attn_error()); }
+        else n_fa_cpu_lib++;
+        fa_on_cpu(ctx, cg, i); return;
+    }
+    double fl = 0;
+    for (int t = 0; t < nq; t++) fl += 4.0 * H * D * std::min<int64_t>(vis0 + (int64_t) dvis * t, nk);
+    n_fa_gpu++; n_fa_launch += launches; fa_flop = fa_flop + fl;
+    t_fa_gpu_s = t_fa_gpu_s + std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
+}
+
 static enum ggml_status gen9_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     gen9_context * ctx = (gen9_context *) backend->context;
     n_graphs++;
@@ -334,6 +470,9 @@ static enum ggml_status gen9_graph_compute(ggml_backend_t backend, struct ggml_c
                 break;
             case GGML_OP_GLU:
                 gen9_glu_alone(node);
+                break;
+            case GGML_OP_FLASH_ATTN_EXT:
+                gen9_flash_attn(ctx, cgraph, i);
                 break;
             default:
                 GGML_ABORT("gen9: unsupported op %s reached graph_compute", ggml_op_desc(node));
@@ -471,6 +610,8 @@ static bool gen9_dev_supports_op(ggml_backend_dev_t, const struct ggml_tensor * 
             return true;   // no-op nodes: test-backend-ops asks for every tensor of a test graph
         case GGML_OP_MUL_MAT:
             return gen9_supports_mul_mat(op);
+        case GGML_OP_FLASH_ATTN_EXT:
+            return gen9_supports_fa(op);
         case GGML_OP_GLU: {   // SWIGLU of two MUL_MAT results: computed inside a fused FFN block (gen9_try_ffn)
             n_glu_asked++;
             const struct ggml_tensor * a = op->src[0], * b = op->src[1];
