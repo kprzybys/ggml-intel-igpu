@@ -1,0 +1,72 @@
+# Speculative-decoding verification cost: a batch of k tokens through the model, CPU vs GEN9 (kp-laptop UHD 620,
+# 2026-11-13 20:38, other sessions idle). llama.cpp build-cpu, backend at e93bdb3 (GEN9_MIN_BATCH; fused FFN and GPU
+# attention default), llama-bench -p k -n 0 -r 5 -t 4 -fa on; "cpu" = GEN9_MIN_BATCH=32 (every k < 32 on the CPU),
+# "gpu" = GEN9_MIN_BATCH=1; the GEN9_INFO count of MUL_MATs run on the GPU is printed per point (check 4 of
+# docs/kernel-guide.md). Qwen2.5-1.5B-Instruct, Q4_K_M and F16. Configurations alternate per point. Script in the
+# session scratchpad (loop over k and the two configurations).
+## Prediction (written before the run, 2026-11-13 ~20:40)
+[HYP] Q4_K_M: GPU (F16 weights from the packed cache) beats the CPU from k ~ 4-8 (after a separate run's spot check pp8 60.9 vs
+      28.7); at k = 1-2 the CPU wins (it reads 0.56 B/weight against 2 B, and the GPU pays per-op waits).
+[HYP] F16: GPU wins from k = 2 (both read 2 B/weight; GPU has more bandwidth and FLOPS).
+[HYP] the reviewer's estimate (k ~ 9-35 for GPU to be compute-bound) is about when the GPU stops gaining per token, not
+      about the crossover with the CPU.
+## Measured (t/s = k / time of one k-token batch)
+## qwen2.5-1.5b-instruct-q4_k_m.gguf
+k 1   cpu  23.65 ± 4.59    t/s   MUL_MAT on GPU (cached) 0
+k 1   gpu  6.94 ± 0.37     t/s   MUL_MAT on GPU (cached) 985
+k 2   cpu  38.60 ± 7.60    t/s   MUL_MAT on GPU (cached) 0
+k 2   gpu  14.33 ± 0.34    t/s   MUL_MAT on GPU (cached) 985
+k 4   cpu  32.26 ± 2.87    t/s   MUL_MAT on GPU (cached) 0
+k 4   gpu  28.14 ± 0.63    t/s   MUL_MAT on GPU (cached) 985
+k 8   cpu  29.82 ± 3.25    t/s   MUL_MAT on GPU (cached) 0
+k 8   gpu  55.61 ± 0.74    t/s   MUL_MAT on GPU (cached) 985
+k 12  cpu  36.67 ± 1.85    t/s   MUL_MAT on GPU (cached) 0
+k 12  gpu  80.88 ± 1.97    t/s   MUL_MAT on GPU (cached) 985
+k 16  cpu  45.44 ± 3.35    t/s   MUL_MAT on GPU (cached) 0
+k 16  gpu  107.20 ± 4.64   t/s   MUL_MAT on GPU (cached) 985
+k 24  cpu  44.01 ± 1.03    t/s   MUL_MAT on GPU (cached) 0
+k 24  gpu  112.70 ± 3.17   t/s   MUL_MAT on GPU (cached) 985
+k 32  cpu  158.95 ± 5.60   t/s   MUL_MAT on GPU (cached) 965
+k 32  gpu  146.15 ± 8.29   t/s   MUL_MAT on GPU (cached) 985
+## qwen2.5-1.5b-instruct-fp16.gguf
+k 1   cpu  6.25 ± 0.34     t/s   MUL_MAT on GPU (cached) 0
+k 1   gpu  5.73 ± 0.93     t/s   MUL_MAT on GPU (cached) 985
+k 2   cpu  17.19 ± 0.31    t/s   MUL_MAT on GPU (cached) 0
+k 2   gpu  12.82 ± 1.30    t/s   MUL_MAT on GPU (cached) 985
+k 4   cpu  32.17 ± 0.41    t/s   MUL_MAT on GPU (cached) 0
+k 4   gpu  28.43 ± 0.47    t/s   MUL_MAT on GPU (cached) 985
+k 8   cpu  48.40 ± 9.28    t/s   MUL_MAT on GPU (cached) 0
+k 8   gpu  53.67 ± 1.37    t/s   MUL_MAT on GPU (cached) 985
+k 12  cpu  42.61 ± 3.80    t/s   MUL_MAT on GPU (cached) 0
+k 12  gpu  70.24 ± 6.23    t/s   MUL_MAT on GPU (cached) 985
+k 16  cpu  44.15 ± 2.99    t/s   MUL_MAT on GPU (cached) 0
+k 16  gpu  92.68 ± 10.11   t/s   MUL_MAT on GPU (cached) 985
+k 24  cpu  49.08 ± 1.61    t/s   MUL_MAT on GPU (cached) 0
+k 24  gpu  107.31 ± 2.92   t/s   MUL_MAT on GPU (cached) 985
+k 32  cpu  146.16 ± 7.86   t/s   MUL_MAT on GPU (cached) 965
+k 32  gpu  132.55 ± 2.65   t/s   MUL_MAT on GPU (cached) 985
+NOTE: the k = 32 "cpu" rows ran on the GPU (default gate 32; the counter shows 965 MUL_MATs on the GPU): not a CPU point.
+## Time of one verification batch (ms = 1000 k / t/s)
+Q4_K_M  k:     1    2    4    8   12   16   24
+  CPU        42   52  124  268  327  352  545
+  GPU       144  140  142  144  148  149  213
+F16
+  CPU       160  116  124  165  282  362  489
+  GPU       175  156  141  149  171  173  224
+## Reading
+- The GPU cost of a batch is flat at ~140-150 ms up to k = 16 (Q4_K_M) and rises from k = 24: below that it reads the
+  packed FP16 weights (~3.1 GB, ~115 ms at ~27 GB/s) plus waits; the compute-bound knee is k ~ 16-24 (the the reviewer /
+  estimate k ~ 9-13 for skinny kernels was close; the packed GEMM runs here).
+- The CPU batch path for k < 32 is not bandwidth-bound: Q4_K_M rises from 42 ms (k = 1) to 268 ms (k = 8), ~30-45 t/s
+  flat. So for verification the GPU wins 1.9x at k = 8, 2.4x at k = 16, 2.6x at k = 24 (Q4_K_M); F16 from k = 8
+  (1.1x), 2.1x at k = 16. The prediction "CPU wins verification up to 10-16 columns" (review_top5_fable.md) is
+  falsified; mine (GPU from k ~ 4-8 on Q4_K_M) holds; "F16 from k = 2" is falsified (from k = 8).
+- What it means for speculative decoding on Q4_K_M: plain decode on the CPU costs ~42 ms per token. One GPU
+  verification of up to 16 drafted tokens costs ~145 ms = ~3.4 CPU tokens. It pays only if a step accepts more than
+  ~3.4 tokens on average plus the draft cost. A draft model with per-token acceptance 0.7 gives ~3.3 tokens at k = 16
+  (break-even, before the draft's own cost); cheap drafts (prompt lookup / n-gram) on repetitive output (code edits,
+  quoting, summaries) can exceed it. [EST, acceptance rates not measured here]
+- The real lever is the ~145 ms floor: it is the FP16 weight read, 3.2x the CPU's Q4 read. Verification on the GPU
+  from Q4 weights directly (a skinny kernel reading Q4_K, k <= 16, where the decode cost does not matter because the
+  kernel is memory-bound) would lower the floor toward ~40-50 ms and make speculation a clear win: this reverses the
+  verdict of results/qgemm-model-2026-11-13.txt for the small-k case. [HYP, next to model]
