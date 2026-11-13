@@ -343,3 +343,37 @@ K = 2051, broadcast 4-D, views [SRC: test-backend-ops case list]).
    KV rotation matrices excluded by MUL_MAT_ID / the Hadamard hint; two contexts duplicate the packed copies.
 7. Step 1 packs ~5.2 GB F32 in llama-bench (head at M = 1 declined).
 8. Banded epilogue for the perplexity head; `int` range check on ne; section reference fixed.
+
+## 12. Status after implementation (2026-11-13)
+
+Results files: `results/ggml-backend-step0-2026-11-12.txt`, `-step1-f32-`, `-step1-f16-`, `-ffn-fusion-`,
+`-q1-dequant-2026-11-13.txt`, `results/llama-cpp-openvino-2026-11-13.txt`. Qwen2.5-1.5B-Instruct, UHD 620, pp512 t/s,
+alternating runs in one session:
+
+| Weights | GEN9 | ggml-cpu | OpenVINO GPU | GEN9 perplexity vs reference |
+|---|---|---|---|---|
+| F32 | 107-109 | 46-49 | (not supported) | +0.001 % |
+| F16 | 177-184 | 47-52 | 182-187 | +0.017 % |
+| Q8_0 | 183-186 | 51-53 | 139-140 | -0.18 % vs CPU Q8_0 |
+| Q4_K_M | 183 | 77-82 | 45 | -0.012 % vs CPU on the dequantized weights |
+
+What was built: design D0 (section 3), weights packed once into a per-backend cache; F16 and every quantized type with
+`to_float` go through the accurate FP16 GEMM (quantized types dequantized to FP16 at first use, step Q1); an overflow
+flag in the epilogue recomputes a call in F32; a device buffer type `GEN9_Host` (host memory, standard layout) keeps the
+weights out of ggml-cpu's REPACK buffer, which GEN9 cannot read. Token generation stays on the CPU (batch < 32).
+
+What was learned:
+- Loading: common/ tools ignore `GGML_BACKEND_PATH` in a shared non-DL build; `-ot '^gen9_load_backends_only$=CPU'`
+  forces `ggml_backend_load_all()`. Always check the routing counter (`GEN9_INFO=1`) before trusting a number.
+- Power: this laptop (PL1 25 W, 85-95 C under load) shares one budget between CPU and GPU. The fused FFN block (stage A,
+  `GEN9_FFN=1`) removes GPU and CPU work but is not faster: the CPU clock falls from ~2500 to ~1750 MHz and CPU flash
+  attention slows by 48 %. Moving more work to the GPU pays only where it cuts energy, not just time; energy (RAPL) has
+  not been measured yet (needs root).
+- Token generation: the GPU GEMV is at the RAM ceiling like the CPU (separate work: 197 F16 GEMVs = 117 ms; waits per
+  token decide); OpenVINO, which runs everything on the GPU, reaches 7.3 t/s on F16 vs 6.9 on the CPU and 7.5 vs 23.5 on
+  Q4_K_M. A quantized GPU GEMV was dropped (an external review); token generation stays on the CPU.
+- Q1 first-use cost: 5.1-5.4 s for the 1.5B model (scalar `to_float` 3.2 s, packing 1.7 s); a GPU dequant kernel is the
+  next lever, and with an LRU budget the way to models above ~4 B parameters (memory: packed FP16 = 2 B per weight).
+
+Open: GPU dequant kernel; energy per token (RAPL); other architectures (Llama, Gemma: RoPE / GELU variants stay on the
+CPU, MUL_MAT is generic); stage B (QKV) only if energy says so; separate repository and name.
