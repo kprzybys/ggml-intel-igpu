@@ -1,0 +1,23 @@
+# Small-batch crossover CPU vs GEN9 (GEN9_MIN_BATCH), UHD 620, 2026-11-13 evening, HEAD 3b3e68c + this change
+# Why: results/spec-verify-batch-2026-11-13.txt: GPU 1.9-2.6x faster than CPU for k = 8-24 tokens on Qwen Q4_K_M;
+# the old gate (32) was a design choice. llama-bench -p k -n 0 -r 3; GEN9_MIN_BATCH=32 = CPU for k < 32, =1 = GEN9 for
+# every k (fused FFN default; attention stays on the CPU below n_q 32). t/s:
+qwen2.5-1.5b-instruct-q4_k_m.gguf MIN_BATCH=32: pp2=36.40 pp4=30.78 pp8=24.86 pp12=33.20 pp16=44.59 pp24=41.15 
+qwen2.5-1.5b-instruct-q4_k_m.gguf MIN_BATCH=1: pp2=14.09 pp4=23.35 pp8=48.87 pp12=76.27 pp16=98.64 pp24=116.74 
+Llama-3.2-1B-Instruct-Q4_K_M.gguf MIN_BATCH=32: pp2=31.91 pp4=38.79 pp8=37.57 pp12=48.55 pp16=66.74 pp24=55.41 
+Llama-3.2-1B-Instruct-Q4_K_M.gguf MIN_BATCH=1: pp2=17.46 pp4=30.89 pp8=73.04 pp12=88.35 pp16=139.45 pp24=130.59 
+gemma-2-2b-it-Q4_K_M.gguf MIN_BATCH=32: pp2=14.03 pp4=17.73 pp8=16.41 pp12=22.87 pp16=29.28 pp24=27.77 
+gemma-2-2b-it-Q4_K_M.gguf MIN_BATCH=1: pp2=7.07 pp4=14.72 pp8=29.26 pp12=44.40 pp16=55.38 pp24=60.05 
+qwen2.5-1.5b-instruct-fp16.gguf MIN_BATCH=32: pp2=15.83 pp4=29.92 pp8=43.98 pp12=40.93 pp16=43.18 pp24=49.01 
+qwen2.5-1.5b-instruct-fp16.gguf MIN_BATCH=1: pp2=11.20 pp4=28.42 pp8=53.82 pp12=80.83 pp16=103.44 pp24=111.98 
+qwen2.5-1.5b-instruct-q4_k_m.gguf MIN_BATCH=32: pp5=32.30 pp6=24.03 pp7=28.10 pp8=21.25 
+qwen2.5-1.5b-instruct-q4_k_m.gguf MIN_BATCH=1: pp5=34.78 pp6=39.29 pp7=45.53 pp8=51.98 
+qwen2.5-1.5b-instruct-fp16.gguf MIN_BATCH=32: pp5=36.54 pp6=41.71 pp7=47.21 pp8=43.37 
+qwen2.5-1.5b-instruct-fp16.gguf MIN_BATCH=1: pp5=35.26 pp6=41.28 pp7=46.27 pp8=54.29 
+Llama-3.2-1B-Instruct-Q4_K_M.gguf MIN_BATCH=32: pp5=41.32 pp6=41.29 pp7=43.64 pp8=32.98 
+Llama-3.2-1B-Instruct-Q4_K_M.gguf MIN_BATCH=1: pp5=45.19 pp6=53.62 pp7=58.26 pp8=65.06 
+Crossover: Q4_K_M models GPU from k = 5-6 (Qwen 5: 34.8 vs 32.3, Llama 5: 45.2 vs 41.3); F16 tie at 5-7, GPU from 8;
+k <= 4 CPU on all four (Gemma 4: 14.7 vs 17.7). At k = 8: Qwen Q4 49-52 vs 21-25, Llama 65-73 vs 33-38, Gemma 29.3 vs
+16.4, Qwen F16 54 vs 43-44.
+Default changed 32 -> 8 (GEN9_MIN_BATCH overrides). Check after the change: pp4 28.0 (CPU), pp8 56.7 (GEN9), pp512 215.7;
+token generation (k = 1, CPU in both): tg64 threshold 8: 21.6 / 17.9, threshold 32: 20.2 / 20.8 (noise).

@@ -622,11 +622,11 @@ static ggml_backend_buffer_t gen9_dev_buffer_from_host_ptr(ggml_backend_dev_t, v
 
 static bool fits_int(int64_t v) { return v > 0 && v <= INT_MAX; }
 
-// Smallest batch (tokens, op->ne[1]) taken by MUL_MAT and the fused FFN: GEN9_MIN_BATCH, default 32 (a design choice,
-// not a measured crossover: below ~26-30 rows the FP16 GEMM is bound by reading 2 B per weight, docs/ggml-backend-design
-// section 12). For measuring the crossover, e.g. speculative verification with k = 8-16.
+// Smallest batch (tokens, op->ne[1]) taken by MUL_MAT and the fused FFN: GEN9_MIN_BATCH, default 8. Measured crossover
+// (results/ggml-backend-min-batch-2026-11-13.txt): with Q4_K_M weights the GPU wins from 5-6 tokens, with F16 from 8
+// (tie at 5-7); at 4 tokens and below the CPU wins on all four models tried. Was 32 until 2026-11-13 (design choice).
 static int min_batch(void) {
-    static const int v = [] { const char * e = getenv("GEN9_MIN_BATCH"); const int b = e ? atoi(e) : 32; return b >= 1 ? b : 32; }();
+    static const int v = [] { const char * e = getenv("GEN9_MIN_BATCH"); const int b = e ? atoi(e) : 8; return b >= 1 ? b : 8; }();
     return v;
 }
 
