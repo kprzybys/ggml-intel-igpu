@@ -300,9 +300,11 @@ static void gen9_glu_alone(struct ggml_tensor * dst) {
     n_glu_alone++;
 }
 
-// FFN fusion is opt-in (GEN9_FFN=1): it is correct and saves GPU and CPU work, but on this 25 W machine the shared
-// power budget moves to the GPU and the CPU attention slows down by as much (results/ggml-backend-ffn-fusion-2026-11-13.txt).
-static bool ffn_off(void) { static const bool v = getenv("GEN9_FFN") == nullptr; return v; }
+// FFN fusion is on by default since 2026-11-13 evening (GEN9_FFN=0 turns it off). It was opt-in while attention ran on
+// the CPU and lost the shared 25 W budget to the GPU (results/ggml-backend-ffn-fusion-2026-11-13.txt); with GPU attention
+// and quantized weights accepted it is faster in every pair and not costlier in energy
+// (results/ggml-backend-ffn-quantized-2026-11-13.txt).
+static bool ffn_off(void) { static const bool v = [] { const char * e = getenv("GEN9_FFN"); return e && !strcmp(e, "0"); }(); return v; }
 
 // Weights the fused FFN takes: F16, or a quantized type with to_float (dequantized into the same HS packed layout; a
 // weight that falls back to F32 because of the FP16 range is rejected later by the g/u/d .t == HS check). Until

@@ -25,3 +25,8 @@ mean 112.8 vs 107.3 (-5 %), inside the round-to-round spread (~5-10 %): not wors
 Speed in the same runs: unfused 210.0 / 216.8 / 215.2 / 218.7, fused 227.2 / 229.7 / 230.1 / 224.0 t/s (+3-8 %, every pair).
 Conclusion: on Q4_K_M the fused FFN is faster in every pair and costs no more energy. Making it the default is
 The author's decision (opt-in today, GEN9_FFN=1).
+## Default on (2026-11-13 evening): GEN9_FFN=0 turns it off
+Check after the switch (llama-bench -r 2): Qwen 1.5B Q4_K_M default 230.0 t/s, 81 blocks fused; GEN9_FFN=0 216.0, 0
+fused; GEN9_FFN=1 226.8, 81 fused. Qwen 7B Q4_K_M (246 per-use packs): GEN9_FFN=0 40.11 +- 1.87, default 40.98 +- 2.93
+(fusion works with per-use weights; speed equal within noise). Perplexity 7B (-c 512 --chunks 4): fused 11.4946,
+unfused 11.4916 (+0.03 %; the fused path rounds the SWIGLU result to FP16 before the down GEMM).
