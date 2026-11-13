@@ -1,0 +1,44 @@
+# Whisper large-v3-turbo decoder on the GPU (M = 1): model BEFORE any measurement (2026-11-13 ~22:10)
+# Question (project decision): is it worth running the decoder on GEN9?
+
+## Inputs (all from results/ or the model card)
+- Decoder: 4 layers, d = 1280, FFN 5120, vocab 51866, F16 weights; cross-attention over 1500 encoder outputs.
+- Profile (results/whisper-profile-gp-2026-11-13.txt, gp, 645.6 s audio, -t 4 -bs 1): decode 67.77 s / 2870 runs
+  = 23.6 ms per token on the CPU = 26 % of the run.
+- gp-laptop: 8 GB SINGLE channel (results/whisper-large-v3-turbo-gp-2026-11-13.txt, header). Whisper runs there.
+- GPU FP16 GEMV M = 1 on gp: 13.0 GB/s (20 x 8960x1536, one call per launch, results/blt-contend-gp-2026-11-13.txt,
+  "gemv + none"). On kp (dual channel): 26.4 GB/s kernels-only (results/token-gemv-2026-11-13-quiet.txt).
+- Wait per GPU submission: ~0.17-0.19 ms (token-gemv: 169 us; pass profile).
+
+## Bytes per token (arithmetic)
+- Per layer: self-attn Q,K,V,O 4 x 1280^2 = 6.55 M; cross-attn Q,O 2 x 1280^2 = 3.28 M (cross K,V are computed once
+  per window in the encoder graph); FFN 2 x 1280 x 5120 = 13.11 M -> 22.9 M weights; x 4 layers = 91.8 M.
+- Output head 51866 x 1280 = 66.4 M.  Total 158.2 M F16 weights = 316 MB.
+- Cross-attention K,V cache read: 4 x 1500 x 1280 x 2 x 2 B = 30.7 MB.  Self KV: < 1 MB.
+- => ~347 MB per token. CPU today: 347 MB / 23.6 ms = 14.7 GB/s effective (incl. its non-matmul ops).
+
+## Prediction
+gp (where whisper runs):
+- GPU matmuls alone at the measured 13.0 GB/s: 347 MB -> 26.7 ms > 23.6 ms CPU, before any wait.
+- Waits: ~10 weight GEMVs + up to 4 attention matmuls per layer, CPU ops (layer norm x3, GELU, softmax, adds)
+  between them unless they also run on the GPU -> estimate 20-40 submissions/token x 0.18 ms = 3.6-7 ms.
+- => decoder on GPU 30-34 ms/token vs 23.6 ms CPU: 0.7-0.8x (SLOWER). The bus is the ceiling and the CPU already
+  reaches it (single channel ~14-15 GB/s effective for both engines).
+- Consistent with the earlier observation on gp: OpenVINO GPU decoder ~44 ms/token vs CPU 23 ms
+  (memory note gen9-gpu-blas-whisper, results/whisper-large-v3-turbo-gp-2026-11-13.txt).
+kp (dual channel, not where whisper runs): GPU 347 MB / 26.4 GB/s = 13.1 ms + 3.6-7 ms waits = 17-20 ms; the CPU on
+kp is not measured for whisper (estimate ~16-20 ms if it scales with the bus) -> 0.8-1.2x, i.e. ~0-5 % of the run.
+
+## Falsification criterion (written before measuring)
+The model is wrong if, on gp, either:
+ (1) a GEMV on the decoder shapes (1280x1280, 5120x1280, 1280x5120, 51866x1280, F16, M = 1) reaches >= 19 GB/s
+     kernels-only (i.e. >= 1.3x the CPU's effective 14.7 GB/s), or
+ (2) an end-to-end run with GEN9_MIN_BATCH=1 (no code change: the backend then takes M = 1 MUL_MAT) shows decode
+     <= 20 ms/token on the same audio.
+Otherwise: topic (a) closed — the decoder stays on the CPU on gp; revisit only for a dual-channel machine, where the
+ceiling is ~1.2x on 26 % of the run (<= ~5 % end-to-end).
+
+## Cheapest check (proposed, not run)
+One short A/B on gp (60 s clip, -t 4 -bs 1, same build): GEN9_MIN_BATCH=8 (today) vs 1, read whisper's own
+"decode time" per run, plus GEN9_INFO to confirm the M = 1 MUL_MATs really went to the GPU. ~3 min of gp,
+coordinated separately (whisper scripts, gp), no code change.
