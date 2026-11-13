@@ -1,0 +1,63 @@
+# ggml backend GEN9, step Q1: quantized weights dequantized to FP16 when packed (first use), then the F16 path
+# (GEN9BLAS_HS GEMM). 2026-11-13. Plan reviewed by the reviewer (quantization review, scratchpad fable-quant/).
+# Models: Qwen2.5-1.5B-Instruct Q4_K_M (made by llama-quantize from the F16 file; contains Q4_K, Q6_K) and Q8_0.
+
+## Prediction (written before building)
+[HYP] pp512 Q4_K_M and Q8_0: 170-180 t/s (the GEMM and the CPU ops are the same as F16; only the first pass pays the
+      dequantization), i.e. 3.5-3.9x ggml-cpu on the same file.
+[HYP] Perplexity of GEN9 on Q4_K_M: 15.261-15.265. Reference = ggml-cpu on the same weights dequantized to F16
+      (15.2610, float activations, which is what Q1 computes); ggml-cpu on Q4_K_M itself is 15.3316 because it
+      quantizes the activations to Q8_K (review, fable-quant/ppl-cpu.txt).
+[HYP] Dequantization at first use with 4 threads: <= 2.5 s for the whole model (2.62 GB FP16).
+[HYP] 0 weights with inf after FP16 conversion (max |w| 7.1-11.8 on this model, the reviewer).
+[HYP] tg128 unchanged (batch 1 stays on the CPU, which reads the quantized file).
+Falsified if: pp512 < 160 t/s; PPL off 15.2610 by > 0.05 %; first-use packing > 2.5 s; any GPU reset.
+
+## Measurements (all GEN9 runs with GEN9_INFO=1; same session; other session idle)
+Implementation: ggml-backend/ggml-gen9.cpp pack_weight(): any type with to_float is dequantized row by row (4-8 threads)
+to FP16 and packed for the HS GEMM; a weight with any value beyond FP16 would go to F32/SGEMM (never happened);
+supports_op accepts quantized src0 with to_float. test-backend-ops -o MUL_MAT: 16/16 accepted cases pass (5 quantized).
+
+### First run: Q4_K_M weights mostly stayed on the CPU (ggml-cpu REPACK buffer)
+q4_k_m GEN9      pp512 62.98 / 68.85   tg128 23.33 / 20.11   dequantized 27 weights only
+q4_k_m cpu-only  pp512 60.56 / 60.22   tg128 23.39 / 20.21
+q4_k_m OpenVINO  pp512 45.77 / 45.01   tg128  7.52 /  7.55
+Cause: ggml-cpu's extra buffer type (REPACK, AVX2 layout for Q4_K) takes the Q4_K weights at load; it is not host /
+standard layout, so GEN9 (supports_buft = host) cannot use them. Only the 27 Q6_K weights reached GEN9.
+With llama-bench --repack 0 (alternating, 2 rounds):
+q4_k_m GEN9 repack0   pp512 183.67 / 183.53   tg128 26.23 / 23.06   dequantized 193
+q4_k_m cpu repack1    pp512  75.48 /  75.49   tg128 22.76 / 22.71
+q4_k_m cpu repack0    pp512  80.85 /  82.21   tg128 22.55 / 22.42    (repack does not help the CPU here either)
+
+### Fix: GEN9 device buffer type "GEN9_Host" (host, standard layout, allocated by the CPU buffer type)
+llama.cpp puts an ACCEL device's own buffer type first in the weight list (llama-model.cpp:1234-1243), so the weights
+whose MUL_MAT GEN9 accepts are no longer repacked; mmap is kept (load_mode = mmap; 142 other tensors use CPU).
+GEN9_CPU_BUFT=1 restores the old behaviour for A/B.
+q4_k_m GEN9 (GEN9_Host)      pp512 183.14 / 182.57   tg128 26.44 / 26.37   dequantized 193   RSS 1.26 GB
+q4_k_m GEN9 (old CPU buft)   pp512  76.96 /  80.14   tg128 22.57 / 22.53   dequantized 27    RSS 1.86 GB
+f16 A/B (3 rounds): GEN9_Host 181.61 / 183.73 / 183.50, CPU buft 182.59 / 184.54 / 184.00 -> no regression.
+Max thermal zone during these runs 85-95 C.
+tg128 26.4 with GEN9_Host vs 22.5 for every CPU-only configuration: token generation runs on the CPU in all of them;
+not explained [HYP: no REPACK copy -> 0.6 GB less resident; memory/cache effect].
+
+### Q8_0 (alternating, 3 rounds)
+q8_0 GEN9      pp512 137.20 (round 1, first read of a freshly written file) / 186.19 / 182.72   tg128 12.40 / 14.66 / 14.78
+q8_0 cpu-only  pp512  50.71 / 52.85   tg128 14.89 / 14.90
+q8_0 OpenVINO  pp512 139.21 / 140.39  tg128  9.95 / 10.26
+
+### Perplexity (-c 512 --chunks 10, same text; GEN9 with -ot to load the backend)
+q4_k_m GEN9   15.2592 +/- 0.89599   reference ggml-cpu on the same weights dequantized to F16: 15.2610 -> -0.012 %
+              (ggml-cpu on Q4_K_M itself: 15.3316, Q8_K activations)
+q8_0   GEN9   14.8877 +/- 0.87110   ggml-cpu on Q8_0: 14.9144 (-0.18 %); F16 on the CPU: 14.8924
+197 weights dequantized, 0 to F32, 0 FP16-overflow recomputations; no GPU reset.
+
+### First-use dequantization time (llama-bench warm-up)
+5.06-5.35 s for 193 weights (2.6 GB FP16): alloc 0.23-0.25 s, to_float + FP16 conversion 3.18-3.30 s (~0.8 GB/s),
+pack_b 1.62-1.71 s. 8 threads instead of 4: no change (ggml's scalar dequantize_row_* is compute-bound per core).
+
+## Against the prediction
+- pp512 170-180 t/s: confirmed for Q8_0 (183-186) and Q4_K_M (183) once the REPACK problem was fixed; 2.3x
+  (Q4_K_M) and 3.5x (Q8_0) ggml-cpu, 4.0x / 1.3x OpenVINO on the same files.
+- Perplexity 15.261-15.265: confirmed (15.2592, -0.012 % vs the reference).
+- Dequantization <= 2.5 s: FALSIFIED (5.1-5.4 s; to_float alone 3.2 s). Next lever: a GPU dequant kernel.
+- 0 weights to F32: confirmed. tg128 unchanged: for Q8_0 yes; for Q4_K_M faster (26.4 vs 22.5), unexplained.

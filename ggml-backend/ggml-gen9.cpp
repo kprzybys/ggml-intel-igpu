@@ -13,7 +13,10 @@
 #include "gen9blas.h"
 
 #include <atomic>
+#include <cfloat>
+#include <chrono>
 #include <climits>
+#include <thread>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -34,6 +37,9 @@ static std::atomic<long> n_graphs{0}, n_noop{0}, n_mm_cached{0}, n_mm_packed{0},
 static std::atomic<long> n_mm_asked{0}, n_mm_declined_shape{0}, n_mm_declined_type{0}, n_mm_declined_batch{0},
                          n_mm_declined_hint{0}, n_mm_declined_gpu{0};
 
+static std::atomic<long> n_dequant{0}, n_dequant_f32{0};
+static std::atomic<double> t_dequant_s{0}, t_deq_alloc_s{0}, t_deq_cpu_s{0}, t_deq_pack_s{0};
+
 static void gen9_report(void) {
     fprintf(stderr, "gen9: graph_compute %ld; no-op nodes %ld; MUL_MAT run: cached weight %ld, packed now %ld, per call %ld; "
             "F16 weights %ld (recomputed in F32 after FP16 overflow: %ld)\n", n_graphs.load(), n_noop.load(), n_mm_cached.load(),
@@ -41,6 +47,9 @@ static void gen9_report(void) {
     fprintf(stderr, "gen9: FFN blocks fused %ld (recomputed unfused after FP16 overflow: %ld); SWIGLU alone %ld; "
             "supports_op GLU asked %ld, declined %ld\n", n_ffn_fused.load(), n_ffn_fallback.load(), n_glu_alone.load(),
             n_glu_asked.load(), n_glu_declined.load());
+    fprintf(stderr, "gen9: quantized weights dequantized %ld (to F32 because of FP16 range: %ld), %.2f s "
+            "(alloc %.2f, to_float+FP16 %.2f, pack_b %.2f)\n", n_dequant.load(), n_dequant_f32.load(), t_dequant_s.load(),
+            t_deq_alloc_s.load(), t_deq_cpu_s.load(), t_deq_pack_s.load());
     fprintf(stderr, "gen9: supports_op MUL_MAT asked %ld, declined: shape/layout %ld, type %ld, batch<32 %ld, hint %ld, no GPU %ld\n",
             n_mm_asked.load(), n_mm_declined_shape.load(), n_mm_declined_type.load(), n_mm_declined_batch.load(),
             n_mm_declined_hint.load(), n_mm_declined_gpu.load());
@@ -69,9 +78,10 @@ struct wkey {
 
 // The cache lives and dies with the backend, which llama.cpp frees with the context, before the model
 // (design section 3.1): a data pointer cannot be reused for another weight while an entry exists.
+struct packed_t { gen9blas_packed * P; int t; };   // t: GEN9BLAS_S (F32 GEMM) or GEN9BLAS_HS (accurate FP16 GEMM)
 struct gen9_context {
-    std::map<wkey, gen9blas_packed *> cache;
-    ~gen9_context() { std::lock_guard<std::mutex> lk(gpu_mu); for (auto & kv : cache) gen9blas_packed_free(kv.second); }
+    std::map<wkey, packed_t> cache;
+    ~gen9_context() { std::lock_guard<std::mutex> lk(gpu_mu); for (auto & kv : cache) gen9blas_packed_free(kv.second.P); }
 };
 
 static bool is_weight(const struct ggml_tensor * w) {
@@ -86,60 +96,109 @@ static void gen9_backend_free(ggml_backend_t backend) {
     delete backend;
 }
 
+// Rows of w (any type with to_float: F16, quantized) as F32 or FP16 in a dense N x K buffer, 4 threads.
+// Returns false if any value is not finite or (FP16 output) beyond the FP16 range.
+static bool dequant_rows(const struct ggml_tensor * w, void * out, bool to_f16) {
+    const int64_t K = w->ne[0], N = w->ne[1];
+    const ggml_to_float_t to_float = ggml_get_type_traits(w->type)->to_float;
+    std::atomic<bool> ok{true};
+    auto work = [&](int64_t n0, int64_t n1) {
+        std::vector<float> row(K);
+        for (int64_t n = n0; n < n1; n++) {
+            const void * src = (const char *) w->data + n * w->nb[1];
+            float * f = to_f16 ? row.data() : (float *) out + n * K;
+            to_float(src, f, K);
+            for (int64_t i = 0; i < K; i++) if (!(fabsf(f[i]) <= (to_f16 ? 65504.0f : FLT_MAX))) { ok = false; break; }
+            if (to_f16) ggml_fp32_to_fp16_row(f, (ggml_fp16_t *) out + n * K, K);
+        }
+    };
+    const int nt = N >= 64 ? (int) std::min(8u, std::max(1u, std::thread::hardware_concurrency())) : 1;
+    std::vector<std::thread> th;
+    for (int i = 0; i < nt; i++) th.emplace_back(work, N * i / nt, N * (i + 1) / nt);
+    for (auto & t : th) t.join();
+    return ok;
+}
+
+// Packs a weight for the GEMM: F32 -> SGEMM; F16 -> accurate FP16 GEMM; quantized -> dequantized to FP16 on the CPU
+// (step Q1), or to F32 if any value does not fit FP16. Caller holds gpu_mu.
+static packed_t pack_weight(const struct ggml_tensor * w) {
+    const int K = (int) w->ne[0], N = (int) w->ne[1];
+    if (w->type == GGML_TYPE_F32) return { gen9blas_pack_b(GEN9BLAS_S, 1, K, N, w->data, (int) (w->nb[1] / 4)), GEN9BLAS_S };
+    if (w->type == GGML_TYPE_F16) return { gen9blas_pack_b(GEN9BLAS_HS, 1, K, N, w->data, (int) (w->nb[1] / 2)), GEN9BLAS_HS };
+    auto now = [] { return std::chrono::steady_clock::now(); };
+    auto secs = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) { return std::chrono::duration<double>(b - a).count(); };
+    auto t0 = now();
+    std::vector<ggml_fp16_t> h((size_t) N * K);
+    packed_t r;
+    n_dequant++;
+    auto t1 = now();
+    const bool fits = dequant_rows(w, h.data(), true);
+    auto t2 = now();
+    t_deq_alloc_s = t_deq_alloc_s + secs(t0, t1); t_deq_cpu_s = t_deq_cpu_s + secs(t1, t2);
+    if (fits) {
+        r = { gen9blas_pack_b(GEN9BLAS_HS, 1, K, N, h.data(), K), GEN9BLAS_HS };
+        t_deq_pack_s = t_deq_pack_s + secs(t2, now());
+    } else {
+        h.clear(); h.shrink_to_fit();
+        std::vector<float> f((size_t) N * K);
+        dequant_rows(w, f.data(), false);
+        r = { gen9blas_pack_b(GEN9BLAS_S, 1, K, N, f.data(), K), GEN9BLAS_S };
+        n_dequant_f32++;
+    }
+    t_dequant_s = t_dequant_s + secs(t0, now());
+    return r;
+}
+
 // Packed weight from the cache (packed on first use). Caller holds gpu_mu.
-static gen9blas_packed * get_packed(gen9_context * ctx, const struct ggml_tensor * w) {
-    const int t = w->type == GGML_TYPE_F16 ? GEN9BLAS_HS : GEN9BLAS_S;
+static packed_t get_packed(gen9_context * ctx, const struct ggml_tensor * w) {
     wkey k = { w->data, ggml_nbytes(w), (int) w->type, w->ne[0], w->ne[1] };
     auto it = ctx->cache.find(k);
     if (it != ctx->cache.end()) { n_mm_cached++; return it->second; }
-    gen9blas_packed * P = gen9blas_pack_b(t, 1, (int) w->ne[0], (int) w->ne[1], w->data, (int) (w->nb[1] / ggml_type_size(w->type)));
-    if (!P) { fprintf(stderr, "gen9: pack_b %s failed: %s\n", w->name, gen9blas_error()); return nullptr; }
-    ctx->cache[k] = P; n_mm_packed++;
-    return P;
+    packed_t r = pack_weight(w);
+    if (!r.P) { fprintf(stderr, "gen9: pack_b %s failed: %s\n", w->name, gen9blas_error()); return r; }
+    ctx->cache[k] = r; n_mm_packed++;
+    return r;
 }
 
 // dst[M x N] = src1[M x K] . src0^T with src0 stored N x K row-major: gemm(A = src1, B = src0 transposed).
-// F32 weights: SGEMM. F16 weights: accurate FP16 GEMM (gemm_pb_f16w); a call whose result overflows FP16 is recomputed
-// with the weights converted to F32 (rare: largest chunk sum seen on Qwen2.5-1.5B is 25x below the FP16 limit).
+// F32 weights: SGEMM. F16 and quantized weights: accurate FP16 GEMM (gemm_pb_f16w); a call whose result overflows FP16 is
+// recomputed with the weights converted to F32 (rare: largest chunk sum seen on Qwen2.5-1.5B is 25x below the limit).
 static bool gen9_mul_mat(gen9_context * ctx, struct ggml_tensor * dst) {
     const struct ggml_tensor * w = dst->src[0], * x = dst->src[1];
-    const bool f16 = w->type == GGML_TYPE_F16;
-    const int t = f16 ? GEN9BLAS_HS : GEN9BLAS_S;
     const int K = (int) w->ne[0], N = (int) w->ne[1], M = (int) x->ne[1];
-    const int ldb = (int) (w->nb[1] / ggml_type_size(w->type));
     const int lda = (int) (x->nb[1] / sizeof(float)), ldc = (int) (dst->nb[1] / sizeof(float));
     std::lock_guard<std::mutex> lk(gpu_mu);
-    gen9blas_packed * P = nullptr;
+    packed_t p;
     bool temp = false;
     if (is_weight(w)) {
-        if (!(P = get_packed(ctx, w))) return false;
+        p = get_packed(ctx, w);
+        if (!p.P) return false;
     } else {
         n_mm_percall++;
-        if (!f16) {
-            if (gen9blas_gemm(GEN9BLAS_S, 0, 1, M, N, K, 1.0, x->data, lda, w->data, ldb, 0.0, dst->data, ldc)) {
+        if (w->type == GGML_TYPE_F32) {
+            if (gen9blas_gemm(GEN9BLAS_S, 0, 1, M, N, K, 1.0, x->data, lda, w->data, (int) (w->nb[1] / 4), 0.0, dst->data, ldc)) {
                 fprintf(stderr, "gen9: gemm failed: %s\n", gen9blas_error()); return false;
             }
             return true;
         }
-        P = gen9blas_pack_b(t, 1, K, N, w->data, ldb);
-        if (!P) { fprintf(stderr, "gen9: pack_b failed: %s\n", gen9blas_error()); return false; }
+        p = pack_weight(w);
+        if (!p.P) { fprintf(stderr, "gen9: pack_b failed: %s\n", gen9blas_error()); return false; }
         temp = true;
     }
     int rc;
-    if (!f16) rc = gen9blas_gemm_pb(GEN9BLAS_S, 0, M, 1.0, x->data, lda, P, 0.0, dst->data, ldc);
+    if (p.t == GEN9BLAS_S) rc = gen9blas_gemm_pb(GEN9BLAS_S, 0, M, 1.0, x->data, lda, p.P, 0.0, dst->data, ldc);
     else {
         int nonfinite = 0;
         n_mm_f16++;
-        rc = gen9blas_gemm_pb_f16w(M, (const float *) x->data, lda, P, (float *) dst->data, ldc, &nonfinite);
+        rc = gen9blas_gemm_pb_f16w(M, (const float *) x->data, lda, p.P, (float *) dst->data, ldc, &nonfinite);
         if (!rc && nonfinite) {   // FP16 overflow somewhere: recompute this call in F32
             n_mm_f16_fallback++;
             std::vector<float> wf((size_t) N * K);
-            for (int n = 0; n < N; n++)
-                ggml_fp16_to_fp32_row((const ggml_fp16_t *) ((const char *) w->data + (size_t) n * w->nb[1]), wf.data() + (size_t) n * K, K);
+            dequant_rows(w, wf.data(), false);
             rc = gen9blas_gemm(GEN9BLAS_S, 0, 1, M, N, K, 1.0, x->data, lda, wf.data(), K, 0.0, dst->data, ldc);
         }
     }
-    if (temp) gen9blas_packed_free(P);
+    if (temp) gen9blas_packed_free(p.P);
     if (rc) { fprintf(stderr, "gen9: MUL_MAT %s failed: %s\n", w->name, gen9blas_error()); return false; }
     return true;
 }
@@ -182,8 +241,9 @@ static bool gen9_try_ffn(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
     if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[2] != 1 || x->ne[3] != 1) return false;
     if (gate->src[0]->ne[1] != down->src[0]->ne[0] || up->src[0]->ne[1] != gate->src[0]->ne[1]) return false;
     std::lock_guard<std::mutex> lk(gpu_mu);
-    gen9blas_packed * Pg = get_packed(ctx, gate->src[0]), * Pu = get_packed(ctx, up->src[0]), * Pd = get_packed(ctx, down->src[0]);
-    if (!Pg || !Pu || !Pd) return false;
+    const packed_t g = get_packed(ctx, gate->src[0]), u = get_packed(ctx, up->src[0]), d = get_packed(ctx, down->src[0]);
+    if (!g.P || !u.P || !d.P || g.t != GEN9BLAS_HS || u.t != GEN9BLAS_HS || d.t != GEN9BLAS_HS) return false;
+    gen9blas_packed * Pg = g.P, * Pu = u.P, * Pd = d.P;
     int nonfinite = 0;
     const int M = (int) x->ne[1];
     if (gen9blas_ffn_f16w(M, (const float *) x->data, (int) (x->nb[1] / sizeof(float)), Pg, Pu, Pd, (float *) down->data,
@@ -277,7 +337,43 @@ static void gen9_dev_get_props(ggml_backend_dev_t dev, struct ggml_backend_dev_p
     };
 }
 
-static ggml_backend_buffer_type_t gen9_dev_get_buffer_type(ggml_backend_dev_t) { return ggml_backend_cpu_buffer_type(); }
+// Own buffer type "GEN9_Host": ordinary CPU memory in the standard ggml layout (is_host), allocated by the CPU buffer
+// type. It only exists so that llama.cpp puts it first in the weight list of an ACCEL device (llama-model.cpp:1234-1243
+// skips the plain CPU type): weights whose MUL_MAT GEN9 accepts then stay in the standard layout instead of going to
+// ggml-cpu's REPACK buffer, which GEN9 cannot read (Q4_K etc. were all left on the CPU before). With mmap, llama.cpp still
+// wraps the file through buffer_from_host_ptr (a plain CPU buffer). The CPU reads these weights as any host buffer.
+static const char * gen9_buft_get_name(ggml_backend_buffer_type_t) { return "GEN9_Host"; }
+static ggml_backend_buffer_type_t gen9_buft(void);
+static ggml_backend_buffer_t gen9_buft_alloc(ggml_backend_buffer_type_t, size_t size) {
+    ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+    if (b) b->buft = gen9_buft();
+    return b;
+}
+static size_t gen9_buft_get_alignment(ggml_backend_buffer_type_t) { return ggml_backend_buft_get_alignment(ggml_backend_cpu_buffer_type()); }
+static bool gen9_buft_is_host(ggml_backend_buffer_type_t) { return true; }
+
+ggml_backend_reg_t ggml_backend_gen9_reg(void);
+static ggml_backend_buffer_type_t gen9_buft(void) {
+    static struct ggml_backend_buffer_type t = {
+        /* .iface = */ {
+            /* .get_name         = */ gen9_buft_get_name,
+            /* .alloc_buffer     = */ gen9_buft_alloc,
+            /* .alloc_buffer_n   = */ NULL,
+            /* .get_alignment    = */ gen9_buft_get_alignment,
+            /* .get_max_size     = */ NULL,
+            /* .get_alloc_size   = */ NULL,
+            /* .get_alloc_size_n = */ NULL,
+            /* .is_host          = */ gen9_buft_is_host,
+        },
+        /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_gen9_reg(), 0),
+        /* .context = */ NULL,
+    };
+    return &t;
+}
+
+static ggml_backend_buffer_type_t gen9_dev_get_buffer_type(ggml_backend_dev_t) {
+    return getenv("GEN9_CPU_BUFT") ? ggml_backend_cpu_buffer_type() : gen9_buft();   // GEN9_CPU_BUFT: old behaviour (A/B)
+}
 
 static ggml_backend_buffer_t gen9_dev_buffer_from_host_ptr(ggml_backend_dev_t, void * ptr, size_t size, size_t) {
     return ggml_backend_cpu_buffer_from_ptr(ptr, size);
@@ -289,14 +385,16 @@ static bool fits_int(int64_t v) { return v > 0 && v <= INT_MAX; }
 static bool gen9_supports_mul_mat(const struct ggml_tensor * op) {
     const struct ggml_tensor * w = op->src[0], * x = op->src[1];
     n_mm_asked++;
-    if ((w->type != GGML_TYPE_F32 && w->type != GGML_TYPE_F16) || x->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
+    const bool w_ok = w->type == GGML_TYPE_F32 || w->type == GGML_TYPE_F16 ||
+                      (ggml_is_quantized(w->type) && ggml_get_type_traits(w->type)->to_float != nullptr);   // Q1: dequantized
+    if (!w_ok || x->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
         n_mm_declined_type++; return false;
     }
     if (w->ne[2] != 1 || w->ne[3] != 1 || x->ne[2] != 1 || x->ne[3] != 1 || !ggml_is_contiguous(w) || !ggml_is_contiguous(x) ||
         !ggml_is_contiguous(op) || !fits_int(w->ne[0]) || !fits_int(w->ne[1]) || !fits_int(x->ne[1])) { n_mm_declined_shape++; return false; }
     if (op->ne[0] < 32 || op->ne[1] < 32 || x->ne[0] < 32) { n_mm_declined_batch++; return false; }
     if (ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_HADAMARD) { n_mm_declined_hint++; return false; }
-    if (w->type == GGML_TYPE_F16) {   // FP16 chunk sums and FP16 activations: not allowed if F32 / BF16 precision is required
+    if (w->type != GGML_TYPE_F32) {   // FP16 chunk sums and FP16 activations: not allowed if F32 / BF16 precision is required
         const enum ggml_prec acc = ggml_prec_get_acc(op), p1 = ggml_prec_get_src(op, 1);
         if (acc == GGML_PREC_F32 || acc == GGML_PREC_BF16 || p1 == GGML_PREC_F32 || p1 == GGML_PREC_BF16) { n_mm_declined_hint++; return false; }
     }
