@@ -41,6 +41,7 @@ static std::atomic<long> n_mm_asked{0}, n_mm_declined_shape{0}, n_mm_declined_ty
 
 static std::atomic<long> n_mm_streamed{0};
 static std::atomic<long> n_multi_groups{0}, n_multi_mm{0}, n_multi_overlap{0}, n_multi_fallback{0};
+static std::atomic<long> n_ew_cpu_splits{0}, n_ew_cpu_nodes{0};
 static std::atomic<long> n_ew_norm{0}, n_ew_norm_wb{0}, n_ew_gelu{0}, n_mm_f16in{0};
 static std::atomic<long> n_ew_rms{0}, n_ew_rms_mul{0}, n_ew_add{0}, n_ew_mul{0}, n_ew_rope{0}, n_ew_sync_graphs{0}, n_ew_asked{0}, n_ew_declined{0};
 static std::atomic<long> n_dequant{0}, n_dequant_f32{0}, n_dequant_gpu{0};
@@ -56,6 +57,8 @@ static void gen9_report(void) {
     fprintf(stderr, "gen9: MUL_MAT groups on one input (Q/K/V) %ld covering %ld MUL_MATs; candidates refused for memory overlap %ld; "
             "outputs recomputed in F32 after FP16 overflow %ld\n", n_multi_groups.load(), n_multi_mm.load(), n_multi_overlap.load(),
             n_multi_fallback.load());
+    fprintf(stderr, "gen9: splits with elementwise ops but no MUL_MAT / attention (their ops run on ggml-cpu inside GEN9) %ld, nodes %ld\n",
+            n_ew_cpu_splits.load(), n_ew_cpu_nodes.load());
     fprintf(stderr, "gen9: whisper-type ops on the GPU: NORM %ld (with MUL+ADD fused %ld), GELU %ld; MUL_MAT with F16 activations %ld\n",
             n_ew_norm.load(), n_ew_norm_wb.load(), n_ew_gelu.load(), n_mm_f16in.load());
     fprintf(stderr, "gen9: elementwise ops on the GPU: RMS_NORM %ld (with MUL fused %ld), ADD %ld, MUL %ld, ROPE %ld; splits run with a "
@@ -114,7 +117,7 @@ struct packed_t { gen9blas_packed * P; int t; bool temp = false; };   // temp: n
 struct gen9_context {
     std::map<wkey, packed_t> cache;
     size_t cached_bytes = 0;
-    bool ew_sync = false, ew_pending = false;
+    bool ew_sync = false, ew_pending = false, ew_cpu = false;   // ew_cpu: split without a waiting GPU call: elementwise ops on ggml-cpu
     std::vector<char> done;   // per graph_compute: nodes already computed by a MUL_MAT group   // per graph_compute: wait after each elementwise op / ops queued, not waited for
     ggml_backend_t cpu = nullptr;   // ggml-cpu for FLASH_ATTN_EXT nodes whose mask turns out not to be supported (created on first use)
     ~gen9_context() {
@@ -454,9 +457,8 @@ static bool fa_mask_prefix(const struct ggml_tensor * m, int64_t nq, int & vis0,
 }
 
 static void ew_flush(gen9_context * ctx);
-static void fa_on_cpu(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
+static void cpu_node(gen9_context * ctx, struct ggml_cgraph * cg, int i) {   // one node on ggml-cpu (inputs ready)
     ew_flush(ctx);   // inputs may come from queued elementwise ops
-    auto t0 = std::chrono::steady_clock::now();
     if (!ctx->cpu) {
         ctx->cpu = ggml_backend_cpu_init();
         const char * e = getenv("GEN9_CPU_THREADS");
@@ -466,6 +468,10 @@ static void fa_on_cpu(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
     one.size = 0; one.n_nodes = 1; one.n_leafs = 0; one.nodes = cg->nodes + i;
     one.grads = nullptr; one.grad_accs = nullptr; one.leafs = nullptr; one.uid = 0;
     GGML_ASSERT(ggml_backend_graph_compute(ctx->cpu, &one) == GGML_STATUS_SUCCESS);
+}
+static void fa_on_cpu(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
+    auto t0 = std::chrono::steady_clock::now();
+    cpu_node(ctx, cg, i);
     t_fa_cpu_s = t_fa_cpu_s + std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
 
@@ -710,16 +716,20 @@ static bool gen9_rope(gen9_context * ctx, struct ggml_tensor * node) {
 
 // Start of a split: when it holds elementwise ops, register the buffers its nodes write as spans (else: wait per op).
 static void ew_begin(gen9_context * ctx, struct ggml_cgraph * cg) {
-    ctx->ew_sync = ew_force_sync(); ctx->ew_pending = false;
-    bool any = false;
+    ctx->ew_sync = ew_force_sync(); ctx->ew_pending = false; ctx->ew_cpu = false;
+    bool any = false, waits = false;
     std::set<ggml_backend_buffer_t> bufs;
     for (int i = 0; i < cg->n_nodes; i++) {
         const struct ggml_tensor * n = cg->nodes[i];
         if (!(n->flags & GGML_TENSOR_FLAG_COMPUTE)) continue;
         any |= is_ew_op(n->op);
+        waits |= n->op == GGML_OP_MUL_MAT || n->op == GGML_OP_FLASH_ATTN_EXT;
         ggml_backend_buffer_t b = n->view_src ? n->view_src->buffer : n->buffer;
         if (b && b->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) bufs.insert(b);
     }
+    // No call in this split waits for the GPU anyway: queued ops would cost a wait of their own at the end of the split
+    // (~0.2 ms), more than ggml-cpu needs for them at these sizes (whisper's decoder prompt was 6 % slower).
+    if (any && !waits && !getenv("GEN9_EW_LONE_GPU")) { ctx->ew_cpu = true; n_ew_cpu_splits++; return; }
     if (!any || ctx->ew_sync) return;
     std::lock_guard<std::mutex> lk(gpu_mu);
     for (ggml_backend_buffer_t b : bufs)
@@ -756,24 +766,29 @@ static enum ggml_status gen9_graph_compute(ggml_backend_t backend, struct ggml_c
                 gen9_glu_alone(node);
                 break;
             case GGML_OP_RMS_NORM: {
+                if (ctx->ew_cpu) { cpu_node(ctx, cgraph, i); n_ew_cpu_nodes++; break; }
                 const int used = gen9_rms_norm(ctx, cgraph, i);
                 if (!used) return GGML_STATUS_FAILED;
                 i += used - 1;
                 break;
             }
             case GGML_OP_ADD: case GGML_OP_MUL:
+                if (ctx->ew_cpu) { cpu_node(ctx, cgraph, i); n_ew_cpu_nodes++; break; }
                 if (!gen9_binop(ctx, node)) return GGML_STATUS_FAILED;
                 break;
             case GGML_OP_ROPE:
+                if (ctx->ew_cpu) { cpu_node(ctx, cgraph, i); n_ew_cpu_nodes++; break; }
                 if (!gen9_rope(ctx, node)) return GGML_STATUS_FAILED;
                 break;
             case GGML_OP_NORM: {
+                if (ctx->ew_cpu) { cpu_node(ctx, cgraph, i); n_ew_cpu_nodes++; break; }
                 const int used = gen9_layer_norm(ctx, cgraph, i);
                 if (!used) return GGML_STATUS_FAILED;
                 i += used - 1;
                 break;
             }
             case GGML_OP_UNARY:
+                if (ctx->ew_cpu) { cpu_node(ctx, cgraph, i); n_ew_cpu_nodes++; break; }
                 if (!gen9_gelu(ctx, node)) return GGML_STATUS_FAILED;
                 break;
             case GGML_OP_FLASH_ATTN_EXT:

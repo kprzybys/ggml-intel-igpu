@@ -63,3 +63,7 @@ Threshold GEN9_EW_MIN_ROWS = 384 (6c1ef03) tested on llama.cpp Qwen 1.5B Q4_K_M,
   225.0/201.7 (mixed); pp512 default / off: 241.7/231.4, 241.1/233.8 (+4.5, +3.1 %).
   -> row count does not separate the cases; default back to GEN9_MIN_BATCH (env kept for diagnostics). Working
   hypothesis for whisper's decoder: GEN9 splits with elementwise ops but no waiting GPU call pay an extra wait.
+Fix for the hypothesis (next commit): a GEN9 split with elementwise ops but no MUL_MAT / FLASH_ATTN_EXT runs those ops
+on ggml-cpu inside GEN9 (no wait of their own); GEN9_EW_LONE_GPU=1 keeps them on the GPU (needed by test-backend-ops,
+whose graphs are such splits: with it NORM 27, GELU 3, ADD 26, RMS_NORM 37, ROPE 138 OK, 0 FAIL). llama.cpp Qwen: 0 such
+splits, perplexity 15.2610 unchanged. Whisper decoder: to be measured separately.
