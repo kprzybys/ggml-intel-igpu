@@ -357,6 +357,10 @@ alternating runs in one session:
 | Q8_0 | 183-186 | 51-53 | 139-140 | -0.18 % vs CPU Q8_0 |
 | Q4_K_M | 183 | 77-82 | 45 | -0.012 % vs CPU on the dequantized weights |
 
+Other architectures, Q4_K_M (`results/ggml-backend-architectures-2026-11-13.txt`): Llama-3.2-1B 248-253 t/s vs CPU
+102-104 and OpenVINO 89 (2.4x CPU); gemma-2-2b 110-113 vs 49 and 42 (2.3x). Every weight MUL_MAT ran on GEN9 in both;
+perplexity -0.07 % / -0.46 % vs ggml-cpu (which quantizes activations to Q8_K).
+
 What was built: design D0 (section 3), weights packed once into a per-backend cache; F16 and every quantized type with
 `to_float` go through the accurate FP16 GEMM (quantized types dequantized to FP16 at first use, step Q1); an overflow
 flag in the epilogue recomputes a call in F32; a device buffer type `GEN9_Host` (host memory, standard layout) keeps the
