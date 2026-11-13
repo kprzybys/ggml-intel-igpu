@@ -25,6 +25,7 @@
 #include <mutex>
 #include <tuple>
 #include <vector>
+#include <unistd.h>
 
 #ifndef GEN9_BENCH_DIR
 #define GEN9_BENCH_DIR ""
@@ -37,19 +38,20 @@ static std::atomic<long> n_graphs{0}, n_noop{0}, n_mm_cached{0}, n_mm_packed{0},
 static std::atomic<long> n_mm_asked{0}, n_mm_declined_shape{0}, n_mm_declined_type{0}, n_mm_declined_batch{0},
                          n_mm_declined_hint{0}, n_mm_declined_gpu{0};
 
-static std::atomic<long> n_dequant{0}, n_dequant_f32{0};
-static std::atomic<double> t_dequant_s{0}, t_deq_alloc_s{0}, t_deq_cpu_s{0}, t_deq_pack_s{0};
+static std::atomic<long> n_mm_streamed{0};
+static std::atomic<long> n_dequant{0}, n_dequant_f32{0}, n_dequant_gpu{0};
+static std::atomic<double> t_dequant_s{0}, t_deq_alloc_s{0}, t_deq_cpu_s{0}, t_deq_pack_s{0}, t_deq_gpu_s{0};
 
 static void gen9_report(void) {
     fprintf(stderr, "gen9: graph_compute %ld; no-op nodes %ld; MUL_MAT run: cached weight %ld, packed now %ld, per call %ld; "
-            "F16 weights %ld (recomputed in F32 after FP16 overflow: %ld)\n", n_graphs.load(), n_noop.load(), n_mm_cached.load(),
-            n_mm_packed.load(), n_mm_percall.load(), n_mm_f16.load(), n_mm_f16_fallback.load());
+            "F16 weights %ld (recomputed in F32 after FP16 overflow: %ld); weights over the cache budget, packed per use %ld\n",
+            n_graphs.load(), n_noop.load(), n_mm_cached.load(), n_mm_packed.load(), n_mm_percall.load(), n_mm_f16.load(), n_mm_f16_fallback.load(), n_mm_streamed.load());
     fprintf(stderr, "gen9: FFN blocks fused %ld (recomputed unfused after FP16 overflow: %ld); SWIGLU alone %ld; "
             "supports_op GLU asked %ld, declined %ld\n", n_ffn_fused.load(), n_ffn_fallback.load(), n_glu_alone.load(),
             n_glu_asked.load(), n_glu_declined.load());
-    fprintf(stderr, "gen9: quantized weights dequantized %ld (to F32 because of FP16 range: %ld), %.2f s "
-            "(alloc %.2f, to_float+FP16 %.2f, pack_b %.2f)\n", n_dequant.load(), n_dequant_f32.load(), t_dequant_s.load(),
-            t_deq_alloc_s.load(), t_deq_cpu_s.load(), t_deq_pack_s.load());
+    fprintf(stderr, "gen9: quantized weights dequantized %ld (on the GPU: %ld; to F32 because of FP16 range: %ld), %.2f s "
+            "(GPU %.2f; CPU path: alloc %.2f, to_float+FP16 %.2f, pack_b %.2f)\n", n_dequant.load(), n_dequant_gpu.load(),
+            n_dequant_f32.load(), t_dequant_s.load(), t_deq_gpu_s.load(), t_deq_alloc_s.load(), t_deq_cpu_s.load(), t_deq_pack_s.load());
     fprintf(stderr, "gen9: supports_op MUL_MAT asked %ld, declined: shape/layout %ld, type %ld, batch<32 %ld, hint %ld, no GPU %ld\n",
             n_mm_asked.load(), n_mm_declined_shape.load(), n_mm_declined_type.load(), n_mm_declined_batch.load(),
             n_mm_declined_hint.load(), n_mm_declined_gpu.load());
@@ -78,9 +80,10 @@ struct wkey {
 
 // The cache lives and dies with the backend, which llama.cpp frees with the context, before the model
 // (design section 3.1): a data pointer cannot be reused for another weight while an entry exists.
-struct packed_t { gen9blas_packed * P; int t; };   // t: GEN9BLAS_S (F32 GEMM) or GEN9BLAS_HS (accurate FP16 GEMM)
+struct packed_t { gen9blas_packed * P; int t; bool temp = false; };   // temp: not cached, free after use   // t: GEN9BLAS_S (F32 GEMM) or GEN9BLAS_HS (accurate FP16 GEMM)
 struct gen9_context {
     std::map<wkey, packed_t> cache;
+    size_t cached_bytes = 0;
     ~gen9_context() { std::lock_guard<std::mutex> lk(gpu_mu); for (auto & kv : cache) gen9blas_packed_free(kv.second.P); }
 };
 
@@ -119,8 +122,18 @@ static bool dequant_rows(const struct ggml_tensor * w, void * out, bool to_f16) 
     return ok;
 }
 
-// Packs a weight for the GEMM: F32 -> SGEMM; F16 -> accurate FP16 GEMM; quantized -> dequantized to FP16 on the CPU
-// (step Q1), or to F32 if any value does not fit FP16. Caller holds gpu_mu.
+// gen9blas GPU dequantization type for a ggml type, -1 if the GPU kernel does not handle it.
+static int gpu_qtype(enum ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_Q8_0: return GEN9BLAS_Q8_0;
+        case GGML_TYPE_Q4_K: return GEN9BLAS_Q4_K;
+        case GGML_TYPE_Q6_K: return GEN9BLAS_Q6_K;
+        default: return -1;
+    }
+}
+
+// Packs a weight for the GEMM: F32 -> SGEMM; F16 -> accurate FP16 GEMM; quantized -> dequantized to FP16 on the GPU (Q8_0, Q4_K,
+// Q6_K; GEN9_CPU_DEQ=1: CPU) or on the CPU (step Q1, other types), or to F32 if any value does not fit FP16. Caller holds gpu_mu.
 static packed_t pack_weight(const struct ggml_tensor * w) {
     const int K = (int) w->ne[0], N = (int) w->ne[1];
     if (w->type == GGML_TYPE_F32) return { gen9blas_pack_b(GEN9BLAS_S, 1, K, N, w->data, (int) (w->nb[1] / 4)), GEN9BLAS_S };
@@ -128,9 +141,40 @@ static packed_t pack_weight(const struct ggml_tensor * w) {
     auto now = [] { return std::chrono::steady_clock::now(); };
     auto secs = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) { return std::chrono::duration<double>(b - a).count(); };
     auto t0 = now();
+    n_dequant++;
+    const int qt = gpu_qtype(w->type);
+    if (qt >= 0 && !getenv("GEN9_CPU_DEQ")) {   // dequantized on the GPU straight into the packed layout (bit-identical)
+        int oor = 0;
+        gen9blas_packed * P = gen9blas_pack_b_q(qt, K, N, w->data, w->nb[1], &oor);
+        if (P && !oor && getenv("GEN9_DEQ_VERIFY")) {   // debug: same GEMM with the CPU-path packing must give the same bits
+            std::vector<ggml_fp16_t> h((size_t) N * K);
+            dequant_rows(w, h.data(), true);
+            gen9blas_packed * P2 = gen9blas_pack_b(GEN9BLAS_HS, 1, K, N, h.data(), K);
+            const int M = 32;
+            std::vector<float> A((size_t) M * K), C1((size_t) M * N), C2((size_t) M * N);
+            for (size_t i = 0; i < A.size(); i++) A[i] = (float) ((i * 2654435761u) % 2001) / 1000.0f - 1.0f;
+            int nf = 0;
+            gen9blas_gemm_pb_f16w(M, A.data(), K, P, C1.data(), N, &nf);
+            gen9blas_gemm_pb_f16w(M, A.data(), K, P2, C2.data(), N, &nf);
+            size_t bad = 0, first = (size_t) -1;
+            for (size_t i = 0; i < C1.size(); i++) if (memcmp(&C1[i], &C2[i], 4)) { bad++; if (first == (size_t) -1) first = i; }
+            fprintf(stderr, "gen9: verify %-28s %s K=%d N=%d nb1=%zu data%%64=%zu: %zu of %zu differ (first col %zu)\n", w->name,
+                    ggml_type_name(w->type), K, N, (size_t) w->nb[1], (size_t) ((uintptr_t) w->data % 64), bad, C1.size(),
+                    first == (size_t) -1 ? 0 : first % N);
+            gen9blas_packed_free(P2);
+        }
+        if (P && !oor) {
+            n_dequant_gpu++;
+            const double t = secs(t0, now());
+            t_deq_gpu_s = t_deq_gpu_s + t; t_dequant_s = t_dequant_s + t;
+            return { P, GEN9BLAS_HS };
+        }
+        if (P) gen9blas_packed_free(P);   // beyond FP16: the CPU path below packs it as F32
+        else fprintf(stderr, "gen9: GPU dequantization of %s failed (%s); CPU path\n", w->name, gen9blas_error());
+        t0 = now();
+    }
     std::vector<ggml_fp16_t> h((size_t) N * K);
     packed_t r;
-    n_dequant++;
     auto t1 = now();
     const bool fits = dequant_rows(w, h.data(), true);
     auto t2 = now();
@@ -149,16 +193,33 @@ static packed_t pack_weight(const struct ggml_tensor * w) {
     return r;
 }
 
-// Packed weight from the cache (packed on first use). Caller holds gpu_mu.
+// Budget for packed weights kept on the GPU (they live in system RAM next to llama's mmap of the model): GEN9_CACHE_MB,
+// default 40 % of physical memory. Weights are cached in first-use order until the budget is full; the rest are packed
+// again on every use and freed (a forward pass touches weights cyclically, so keeping the first ones beats LRU).
+static size_t cache_budget(void) {
+    static size_t v = 0;
+    if (!v) {
+        const char * e = getenv("GEN9_CACHE_MB");
+        v = e && atof(e) > 0 ? (size_t) (atof(e) * 1048576.0) : (size_t) sysconf(_SC_PHYS_PAGES) * (size_t) sysconf(_SC_PAGE_SIZE) / 10 * 4;
+    }
+    return v;
+}
+
+// Packed weight from the cache (packed on first use), or packed for this use only (r.temp) when over the budget.
+// Caller holds gpu_mu and frees a temp result with release().
 static packed_t get_packed(gen9_context * ctx, const struct ggml_tensor * w) {
     wkey k = { w->data, ggml_nbytes(w), (int) w->type, w->ne[0], w->ne[1] };
     auto it = ctx->cache.find(k);
     if (it != ctx->cache.end()) { n_mm_cached++; return it->second; }
+    const size_t bytes = (size_t) ((w->ne[1] + 15) / 16 * 16) * (size_t) ((w->ne[0] + 31) / 32 * 32) * (w->type == GGML_TYPE_F32 ? 4 : 2);
     packed_t r = pack_weight(w);
     if (!r.P) { fprintf(stderr, "gen9: pack_b %s failed: %s\n", w->name, gen9blas_error()); return r; }
-    ctx->cache[k] = r; n_mm_packed++;
+    if (ctx->cached_bytes + bytes > cache_budget()) { r.temp = true; n_mm_streamed++; return r; }
+    ctx->cache[k] = r; ctx->cached_bytes += bytes; n_mm_packed++;
     return r;
 }
+
+static void release(const packed_t & p) { if (p.temp && p.P) gen9blas_packed_free(p.P); }
 
 // dst[M x N] = src1[M x K] . src0^T with src0 stored N x K row-major: gemm(A = src1, B = src0 transposed).
 // F32 weights: SGEMM. F16 and quantized weights: accurate FP16 GEMM (gemm_pb_f16w); a call whose result overflows FP16 is
@@ -173,6 +234,7 @@ static bool gen9_mul_mat(gen9_context * ctx, struct ggml_tensor * dst) {
     if (is_weight(w)) {
         p = get_packed(ctx, w);
         if (!p.P) return false;
+        temp = p.temp;
     } else {
         n_mm_percall++;
         if (w->type == GGML_TYPE_F32) {
@@ -242,6 +304,7 @@ static bool gen9_try_ffn(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
     if (gate->src[0]->ne[1] != down->src[0]->ne[0] || up->src[0]->ne[1] != gate->src[0]->ne[1]) return false;
     std::lock_guard<std::mutex> lk(gpu_mu);
     const packed_t g = get_packed(ctx, gate->src[0]), u = get_packed(ctx, up->src[0]), d = get_packed(ctx, down->src[0]);
+    struct rel3 { const packed_t & a, & b, & c; ~rel3() { release(a); release(b); release(c); } } rel{ g, u, d };
     if (!g.P || !u.P || !d.P || g.t != GEN9BLAS_HS || u.t != GEN9BLAS_HS || d.t != GEN9BLAS_HS) return false;
     gen9blas_packed * Pg = g.P, * Pu = u.P, * Pd = d.P;
     int nonfinite = 0;

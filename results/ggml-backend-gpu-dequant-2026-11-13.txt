@@ -1,0 +1,49 @@
+# ggml backend GEN9: quantized weights dequantized on the GPU (Q8_0, Q4_K, Q6_K), 2026-11-13
+# Kernel gen9blas_dequant_b16 (bench/hgemm.cl): one work-item = one ggml block of one row, writes FP16 straight into the
+# packed B16 layout of the accurate FP16 GEMM; no CPU to_float, no FP16 staging buffer, no second pack pass. Arithmetic in
+# ggml's order with FP_CONTRACT OFF, RTE rounding. API gen9blas_pack_b_q; backend uses it for Q8_0 / Q4_K / Q6_K
+# (GEN9_CPU_DEQ=1: the old CPU path). Before: 5.06-5.35 s first use for Qwen2.5-1.5B Q4_K_M (CPU to_float 3.2 s).
+
+## Unit test (ggml-backend/tools/test_dequant.py, against ggml's own dequantize_row_* + ggml_fp32_to_fp16_row)
+Random blocks, 3 shapes x 3 types incl. N = 37 (padding) and subnormal FP16 results: 0 differing FP16 values
+(first run showed Q6_K "differences": all were -0.0 in ggml vs +0.0 read back through the identity GEMM, a test
+artifact: 1 * -0 + 0 = +0; the comparison now treats them as equal). FP16 range flag: set exactly when ggml's values
+exceed 65504 (Q8_0 d ~1000, Q6_K d ~60).
+One 8960 x 1536 weight (Qwen2.5-1.5B FFN), from NumPy memory (userptr): Q4_K 15-19 ms, Q8_0 13-15 ms, Q6_K 41-48 ms
+(1.8 / 1.8 / 0.6 GB/s of FP16 written) vs ggml CPU 1 thread 87-325 ms.
+
+## Prediction (written before the model runs)
+[HYP] Qwen2.5-1.5B Q4_K_M first-use dequantization 5.1-5.4 s -> 1.5-2.5 s (Q4_K ~2 GB FP16 at ~1.8 GB/s, Q6_K output
+      head + some ffn_down ~0.7 GB at 0.6 GB/s); Q8_0 model 2.6 GB at 1.8 GB/s -> 1.2-2 s.
+[HYP] pp512 unchanged within noise (183 Q4_K_M, 183-186 Q8_0): same packed bits, so the same GEMMs.
+[HYP] Perplexity identical to the CPU-path GEN9 values to all printed digits (15.2592 Q4_K_M, 14.8877 Q8_0).
+Falsified if: first use > 2.5 s (Q4_K_M), any perplexity digit differs, any GPU reset.
+
+## Measurements
+A first kernel version passed the unit test (N <= 160) but broke Qwen2.5 Q4_K_M (perplexity 38 million; Q8_0 was
+exact). GEN9_DEQ_VERIFY=1 (new debug mode: every GPU-dequantized weight also packed through the CPU path, same 32-row
+GEMM on both, bits compared) showed every Q4_K weight with N >= 1536 wrong, Q6_K right. Reproduced on random data:
+Q4_K wrong from N = 1024 (5749 values) up, nondeterministic counts, garbage values; N <= 512 exact; not alignment
+(offsets 0 / 2 / 32 / 4128 exact). The Q4_K scale decode used private arrays (uchar sc[2], m[2]); rewritten with
+scalars -> exact at every N. Cause not identified: the old binary has no scratch / private memory in its ze_info and was
+SIMD8, but the new code forced to SIMD8 is exact too. The unit test now includes N = 4096 for every type.
+
+After the fix:
+GEN9_DEQ_VERIFY=1, every weight bit-identical to the CPU path: Qwen2.5-1.5B Q4_K_M 193 (166 Q4_K + 27 Q6_K),
+Llama 3.2 1B Q4_K_M 109 (94 + 15), Gemma 2 2B Q4_K_M 179 (154 + 25); 0 differ.
+llama-perplexity -c 512 --chunks 10 (same text as before): Q4_K_M 15.2592 +/- 0.89599, Q8_0 14.8877 +/- 0.87110:
+identical to the CPU-path values to every printed digit.
+
+llama-bench -p 512 -n 0 -r 3, Qwen2.5-1.5B, alternating GPU / CPU dequantization (GEN9_CPU_DEQ=1), 2 rounds:
+                 first-use dequantization          pp512
+Q4_K_M  GPU      2.23 / 2.28 s                     175.17 / 175.86
+        CPU      5.66 / 5.63 s (to_float 3.6)      174.64 / 175.04
+Q8_0    GPU      1.85 / 1.88 s                     173.82 / 173.41
+        CPU      5.31 / 5.22 s                     174.15 / 174.59
+(llama-perplexity: 2.98 s Q4_K_M, 2.30 s Q8_0 for 197 weights, cold page cache for part of the file.)
+
+## Against the prediction
+- First use 1.5-2.5 s (Q4_K_M): confirmed, 2.23-2.28 s (2.5x faster). Q8_0 1.2-2 s: confirmed, 1.85-1.88 s (2.8x).
+- pp512 unchanged: confirmed (175 both ways; today's runs ~175 vs 183 yesterday for both paths alike).
+- Perplexity identical to every digit: confirmed (after the fix). No GPU reset.
+Remaining cost: Q6_K at 0.6-0.8 GB/s (byte loads per work-item); the 151936 x 1536 Q6_K output head alone ~0.5 s.
