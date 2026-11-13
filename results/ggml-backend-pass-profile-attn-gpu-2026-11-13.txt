@@ -21,10 +21,14 @@ first-use submissions (fresh packed-weight buffers, ~3 GB). The rest: 90 vs 128 
 Lesson: a per-call average over a run that mixes one-time and steady-state calls says nothing about steady state;
 vary the number of passes (-r 1 vs -r 6) and take the difference.
 With GEN9BLAS_NO_USERPTR=1 execbuf was 0.67 ms on average, pp512 193.5 (copies cost more).
-Still unexplained: ~225 ms per pass (~9.6 %) with the GPU idle. perf: 76 % of samples at one user-space address
-(likely an OpenMP spin / wait), so: synchronisation and CPU ops, to be split separately.
+Idle split (GEMM an earlier run, r=1 vs r=6, two series; perf with kernel symbols): pass 2310 ms, GPU kernels 2108 ms
+(GEMM 1870, pk_a3 86, epilogue 78, attention 74); GPU idle 202 ms = ~43 ms wake-up / interrupts over 221 GEM_WAITs
+(~0.19 ms each) + ~158 ms on the CPU side. CPU-ms per pass on 4 threads: swiglu 298, rms_norm_mul 102, rope+sincos 65,
+add 50, q6_K vec_dot for the output row (M = 1) 36; libgomp spin 4412 (threads waiting for the GPU). GOMP_SPINCOUNT
+10k / 1k: slower. The fused FFN (GEN9_FFN=1) never ran on Q4_K_M before c1b8586 (condition was F16 only); now
+pp512 +3-8 %, d2048 +6-15 %, perplexity unchanged (results/ggml-backend-ffn-quantized-2026-11-13.txt).
 ## Reading
 - GEMM is 80 % of the pass and issue-bound (~10 % headroom inside the kernel = ~8 % of the pass).
-- ~9.6 % GPU idle per pass, cause open (waits / CPU ops), not submission cost.
+- ~9 % GPU idle per pass: ~2 % GPU wake-up per wait, ~7 % CPU ops (swiglu, rms_norm, rope, add) -- the fused FFN removes swiglu.
 - Activation packing + epilogue 7 %; attention 3 %.
 - No single new kernel has more than ~8 % of the pass to gain.
