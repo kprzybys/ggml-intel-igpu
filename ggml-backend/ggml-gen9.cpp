@@ -692,7 +692,11 @@ static bool gen9_rope(gen9_context * ctx, struct ggml_tensor * node) {
     float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, corr[2];
     memcpy(&freq_base, pp + 5, 4); memcpy(&freq_scale, pp + 6, 4); memcpy(&ext_factor, pp + 7, 4);
     memcpy(&attn_factor, pp + 8, 4); memcpy(&beta_fast, pp + 9, 4); memcpy(&beta_slow, pp + 10, 4);
+#ifndef GEN9_GGML_NO_ROPE_TRUNCATE
     ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, ggml_rope_get_truncate(node), corr);
+#else   // older ggml (whisper.cpp): no truncate; ROPE is declined in supports_op, this is never reached
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr);
+#endif
     int rc;
     { std::lock_guard<std::mutex> lk(gpu_mu);
       rc = gen9blas_rope(n_dims, (int) x->ne[1], (int) x->ne[2], (const float *) x->data, (long) (x->nb[1] / 4), (long) (x->nb[2] / 4),
@@ -914,8 +918,13 @@ static bool gen9_supports_mul_mat(const struct ggml_tensor * op) {
     return true;
 }
 
-// Elementwise ops (see gen9_rms_norm): F32 rows, at least GEN9_MIN_BATCH rows (tokens), like MUL_MAT -- token generation
-// (one row) stays on the CPU.
+// Elementwise ops (see gen9_rms_norm): F32 rows, at least GEN9_EW_MIN_ROWS rows (tokens; default 384). Below that the CPU
+// does them faster than the extra wait they cause when they end a short GPU split: whisper's decoder prompt (256 rows)
+// was 6 % slower with them, pp512 / the whisper encoder (512 / 1500 rows) faster (results/ggml-backend-gpu-ops-2026-11-13.txt).
+static int ew_min_rows(void) {
+    static const int v = [] { const char * e = getenv("GEN9_EW_MIN_ROWS"); const int b = e ? atoi(e) : 384; return b >= 1 ? b : 384; }();
+    return std::max(v, min_batch());
+}
 static bool gen9_supports_ew(const struct ggml_tensor * op) {
     n_ew_asked++;
     auto f32_rows = [](const struct ggml_tensor * t) {
@@ -928,26 +937,29 @@ static bool gen9_supports_ew(const struct ggml_tensor * op) {
     if (!ew_off() && !(skip && strstr(skip, nm))) switch (op->op) {
         case GGML_OP_RMS_NORM: {
             float eps; memcpy(&eps, op->op_params, sizeof eps);
-            ok = f32_rows(op->src[0]) && f32_rows(op) && ggml_are_same_shape(op->src[0], op) && eps >= 0.0f && ggml_nrows(op) >= min_batch();
+            ok = f32_rows(op->src[0]) && f32_rows(op) && ggml_are_same_shape(op->src[0], op) && eps >= 0.0f && ggml_nrows(op) >= ew_min_rows();
             break;
         }
         case GGML_OP_NORM: {
             float eps; memcpy(&eps, op->op_params, sizeof eps);
-            ok = f32_rows(op->src[0]) && f32_rows(op) && ggml_are_same_shape(op->src[0], op) && eps >= 0.0f && ggml_nrows(op) >= min_batch();
+            ok = f32_rows(op->src[0]) && f32_rows(op) && ggml_are_same_shape(op->src[0], op) && eps >= 0.0f && ggml_nrows(op) >= ew_min_rows();
             break;
         }
         case GGML_OP_UNARY:
             ok = ggml_get_unary_op(op) == GGML_UNARY_OP_GELU && f32_rows(op->src[0]) && f32_rows(op) &&
-                 ggml_are_same_shape(op->src[0], op) && ggml_nrows(op) >= min_batch();
+                 ggml_are_same_shape(op->src[0], op) && ggml_nrows(op) >= ew_min_rows();
             break;
         case GGML_OP_ADD: case GGML_OP_MUL: {
             const struct ggml_tensor * a = op->src[0], * b = op->src[1];
             ok = f32_rows(a) && f32_rows(b) && f32_rows(op) && ggml_are_same_shape(a, op) && (b->ne[0] == a->ne[0] || b->ne[0] == 1) &&
                  (ggml_nrows(b) == 1 || ggml_are_same_shape(a, b) ||
-                  (b->ne[0] == 1 && b->ne[1] == a->ne[1] && b->ne[2] == a->ne[2] && b->ne[3] == a->ne[3])) && ggml_nrows(op) >= min_batch();
+                  (b->ne[0] == 1 && b->ne[1] == a->ne[1] && b->ne[2] == a->ne[2] && b->ne[3] == a->ne[3])) && ggml_nrows(op) >= ew_min_rows();
             break;
         }
         case GGML_OP_ROPE: {
+#ifdef GEN9_GGML_NO_ROPE_TRUNCATE
+            break;   // ggml without ggml_rope_get_truncate (whisper.cpp): ROPE stays on the CPU
+#endif
             const struct ggml_tensor * x = op->src[0], * pos = op->src[1], * ff = op->src[2];
             const int32_t * pp = (const int32_t *) op->op_params;
             const int n_dims = pp[1], mode = pp[2], n_offs = pp[15];
@@ -958,7 +970,7 @@ static bool gen9_supports_ew(const struct ggml_tensor * op) {
                  fits_int(x->ne[1]) && fits_int(x->ne[2]) && n_dims % 2 == 0 &&
                  pos && pos->type == GGML_TYPE_I32 && ggml_is_contiguous(pos) && pos->ne[0] == x->ne[2] &&
                  (!ff || (ff->type == GGML_TYPE_F32 && ggml_is_contiguous(ff) && ff->ne[0] >= n_dims / 2)) &&
-                 x->ne[2] >= min_batch();
+                 x->ne[2] >= ew_min_rows();
             break;
         }
         default: break;
