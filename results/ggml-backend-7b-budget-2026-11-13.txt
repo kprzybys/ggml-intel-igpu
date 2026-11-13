@@ -12,3 +12,27 @@
 [HYP] No swap traffic (swap already holds 2 GB from earlier; measured as the change of pswpin+pswpout), no OOM (mmap 4.5 GB + cache 6.2 GB + one temporary weight <= 1.1 GB + llama buffers < 14 GB).
 [HYP] Perplexity (-c 512 --chunks 10) within 0.5 % of ggml-cpu on the same file (GEN9 has FP32 activations, CPU Q8_K).
 Falsified if: GEN9 not faster than ggml-cpu, swap traffic > 100 MB, OOM, GPU reset, perplexity off by > 0.5 %.
+
+## Measurements
+llama-bench -p 512 -n 0 -r 2 (GEN9_INFO=1; peak memory = max of MemTotal - MemAvailable sampled every 0.5 s):
+                         pp512 t/s       per-use packs   first-use + per-use dequant (3 passes)   peak used   swap in/out pages
+GEN9 default budget      29.21 +- 1.37   246             19.38 s                                   -           377589 (first run
+                                                                                                                after the download)
+GEN9 GEN9_CACHE_MB=4000  27.36 +- 0.31   357             21.34 s                                   7.7 GB      5197 / 0
+GEN9 default budget      29.81 +- 1.03   246             17.39 s                                   9.7 GB      1021 / 2
+Alternating with ggml-cpu (no backend): cpu 13.39 +- 1.54, GEN9 29.15 +- 0.35, cpu 12.59 +- 0.02 -> 2.2-2.3x.
+Default budget: 111 of 197 weights cached (~6.2 GB), 82 packed on every use (~7.9 GB FP16 per pass at ~1.1 GB/s).
+
+llama-perplexity -c 512 --chunks 10 (same text as the 1.5B runs; GEN9 with -ot to load the backend):
+GEN9      PPL = 11.9242 +/- 0.68881   79.5 s per pass (n_batch 2048 = 4 chunks)
+ggml-cpu  PPL = 11.9601 +/- 0.69154  152.8 s per pass
+-> -0.30 %; 1950 FP16 MUL_MATs, 0 recomputed after FP16 overflow, 840 per-use packs. No GPU reset, no OOM.
+
+## Against the prediction
+- pp512 20-30 t/s: confirmed (29.2-29.8). ggml-cpu 14-20: wrong, slower (12.6-13.4). GEN9 / CPU 1.2-1.8x: wrong, better
+  (2.2-2.3x; perplexity pass 1.9x).
+- No swap traffic: the first run after downloading the model moved 1.47 GB through swap (377589 pages; the machine
+  was already holding 2 GB in swap); repeated runs 4-20 MB (1021-5197 pages). Criterion (> 100 MB) failed once, on the
+  cold run; not reproduced. Peak 9.7 GB used of 15.5 GB with the default budget.
+- Perplexity within 0.5 %: confirmed (-0.30 %).
+A smaller budget is slower (4000 MB: 27.4 t/s), so on this machine the default (40 % of RAM) is the better setting.

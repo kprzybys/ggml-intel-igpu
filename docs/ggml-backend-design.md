@@ -381,3 +381,19 @@ What was learned:
 
 Open: GPU dequant kernel; energy per token (RAPL); other architectures (Llama, Gemma: RoPE / GELU variants stay on the
 CPU, MUL_MAT is generic); stage B (QKV) only if energy says so; separate repository and name.
+
+### 12.x Update 2026-11-13 (day): GPU dequantization, models above the memory budget, energy
+
+- Q8_0 / Q4_K / Q6_K are dequantized on the GPU straight into the packed layout (`gen9blas_pack_b_q`, kernel
+  `gen9blas_dequant_b16`), bit-identical to ggml's `dequantize_row_*` + RTE FP16 (checked per weight on three models
+  with `GEN9_DEQ_VERIFY=1`). First use for Qwen2.5-1.5B: Q4_K_M 5.6 -> 2.3 s, Q8_0 5.3 -> 1.9 s. Other types keep
+  the CPU path (Q1). `results/ggml-backend-gpu-dequant-2026-11-13.txt`.
+- Cache budget `GEN9_CACHE_MB` (default 40 % of RAM): weights cached in first-use order, the rest dequantized again
+  on every use (cyclic access: keeping the first ones beats LRU). Qwen2.5-7B Q4_K_M (14 GB FP16): pp512 29.2-29.8 vs
+  ggml-cpu 12.6-13.4 t/s (2.2-2.3x), perplexity -0.30 %, peak 9.7 GB. `results/ggml-backend-7b-budget-2026-11-13.txt`.
+- Energy (RAPL): GEN9 ~115 vs ggml-cpu ~368 mJ per prompt token (3.2x less). FFN fusion: 113 vs 127 mJ/token
+  (-10.7 %) at -1-3 % speed: slower but cheaper, because the lower CPU clock makes the CPU work cheaper.
+  `results/ggml-backend-energy-2026-11-13.txt`.
+- Lesson: a kernel that passed the unit test at N <= 160 was wrong from N ~ 1024 on real models (Q4_K scale decode in
+  private arrays; cause not found, scalar rewrite is exact). Unit tests now include N = 4096; `GEN9_DEQ_VERIFY=1`
+  checks a real model end to end.
