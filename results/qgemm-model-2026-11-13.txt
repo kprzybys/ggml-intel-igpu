@@ -1,0 +1,43 @@
+# Model (no kernel written, nothing run): FP16 GEMM that reads Q4_K weights directly and decodes them in registers,
+# versus today's path (weights dequantized to an FP16 packed cache; beyond the cache budget, dequantized on every use).
+# 2026-11-13. Inputs: hgemm_kc_v / gemm_gen "hd" loop as described by the GEMM session at ef7253a; results files
+# named below. All numbers [EST] unless tagged.
+
+## Today
+- hgemm_kc_v: 16x16 tile per SIMD16 thread (16 token rows x 16 output columns), quarters of 4 k: 128 B of A + 128 B of
+  B per 64 mad; carry h -> f every 32 k (one mixed add per row); ~705 GFLOPS kernel-only at M = 512 on UHD 620,
+  51 non-mad per 512 mad, issue-bound (OA both FPU 81 % before the trim) [MEAS, results/gemm-accurate-trim-*,
+  results/ggml-backend-pass-profile-2026-11-13.txt].
+- Each decoded B element is used 16 times (once per tile row): 16 mad per k per 16 columns.
+- Qwen2.5-7B Q4_K_M, default budget: 111 of 197 weights cached as FP16, 82 dequantized per use; pp512 ~37-40 t/s,
+  per-use dequantization ~1.3-2.5 s of a ~13 s pass [MEAS, results/ggml-backend-dequant-v2-2026-11-13.txt, as
+  summarised separately]. Models up to ~3B: all weights cached, no per-use cost.
+
+## Cheapest decode found (per 16 columns x 1 k = 16 values = one SIMD16 hf operand)
+- Scale / min out of the inner loop: Q4_K w = d*sc_j*q - dmin*m_j per 32-value sub-block j, and 32 = the carry chunk
+  kc. So h = sum_k a*q over the chunk (q = 0..15 exact in FP16), and the carry becomes
+  f = f + (d*sc_j)[n] * h - (dmin*m_j)[n] * Asum_j[m], Asum_j[m] = sum of the chunk's A row (computed when packing A).
+  Cost: the carry add becomes a mixed mad, plus one mad per row per chunk for the min term: +16 per 512 mad = +3 %.
+- q to FP16 without a conversion: repack the nibbles once (still 0.5 B/weight) so that one dword holds the two nibbles
+  of a hf pair at bit offsets s and s+16; shl/shr by s, then bfi2 with mask 0x03C003C0 into 0x3C003C00 gives
+  1 + q/16 exactly. ~2 instructions per 16 values = 2 per 16 mad = +12.5 %. The constant part sums to Asum_j and goes
+  to the min term (no extra cost); the cancellation 16 * (sum a*(1+q/16) - Asum) costs ~3x the FP16 product error
+  (2^-11 relative on |a| * 1.5 against a signal of ~0.47 |a|): an accuracy risk to measure, not assumed fine.
+- Plain variant (and + shr + 2 mov :ub -> :hf per 2 k): 2 per k, same +12.5 %, without the cancellation.
+- h overflow: |sum a*q| over 32 k can reach 32 * 15 * |a|; |a| ~ 100 already gives 48000 (FP16 max 65504). Today's
+  nonfinite fallback would trigger far more often. Must be measured on real activations before anything else.
+- Registers: the GEMM has 0-1 GRF free (results/solver-hgemm-budget-2026-11-13.txt); decode needs 2-4 GRF of temporaries
+  and the per-column scale vectors (2 x 16 hf per chunk). A taller tile to amortise the decode does not fit.
+
+## Gain for 7B (the only case with per-use cost)
+- A) Fused kernel for all weights: GEMM ~10.2 s (7.2 TFLOP / 705 GFLOPS) x 1.155 = +1.6 s, saves 1.3-2.5 s of
+  dequantization: net -0.3 to +0.9 s of 13 s -> -2 % to +7 %. Frees ~6 GB of FP16 cache (the real benefit).
+- B) Fused kernel only for the 82 per-use weights (~42 % of GEMM time, ~4.3 s): +0.7 s vs -1.3 to -2.5 s:
+  net 0.6-1.8 s -> +5 % to +14 % pp512 on 7B; nothing for models that fit.
+- Smaller models: none (A would make them 13-15 % slower).
+
+## Verdict
+Not worth starting as the next kernel: at best +5-14 % on 7B only, with an FP16 overflow risk in h and no register
+room. The decode is cheap only because the scales fold into the carry; the per-element nibble work alone eats the
+headroom of an already issue-bound loop. Revisit if (1) memory becomes the goal (7B+ alongside other work: variant A
+frees ~6 GB) or (2) the GEMM gets register room (a taller tile).
