@@ -1,0 +1,30 @@
+# whisper.cpp large-v3-turbo F16 with the GEN9 backend: where a whole transcription goes (gp-laptop UHD 620, 2026-11-13
+# 20:33, idle otherwise). whisper-cli -l pl -t 4 -bs 1 -bo 1 -nf on fleurs-pl/pl60.wav (645.6 s audio), backend
+# libggml-gen9-whisper.so from ef7253a (attention on the GPU), lib/kernels.c from kp; KCL_PROFILE_KERNELS=1 KCL_PHASES=1
+# GEN9_INFO=1. One run (no repeat: a profile, not a speed claim).
+## Prediction (before the run)
+[HYP] Of the ~85 s that the earlier estimate (encoder 22 x 5.4 s, decoder ~57 s, total 263 s) left unexplained, the
+      largest part is the prompt (previous text per window) and token sampling; mel < 5 s.
+## whisper_print_timings
+load 0.61 s | mel 0.76 s | sample 2.86 s | encode 177.35 s / 33 runs (5.37 s each) | decode 67.77 s / 2870 runs
+(23.6 ms each) | batchd 0.03 s | prompt 7.60 s / 7056 tokens (1.08 ms each) | total 258.03 s (wall 4:18).
+-> Everything is accounted for. The prediction was wrong: there was no unexplained 85 s; the encoder runs 33 times,
+   not 22 (windows overlap through the seek), so encode = 69 % and decode = 26 % of the run; prompt 3 %, sample 1 %,
+   mel 0.3 %.
+## GPU kernels (sums over the run)
+hgemm_kc_v 93.43 s (7656 launches) | pk_a3_f32v 10.38 s | gen9blas_epilog_hf8 8.50 s | k_attn 34.95 s + k_kt 0.95 s
+(1060 launches, 334.8 GFLOPS incl. pinning/submit/wait) | pk_b16_t 0.41 s (first use) -> 148.6 s
+execbuf 8949 x 0.105 ms = 0.9 s; GEM_WAIT 8949 calls.
+MUL_MAT asked 197375, declined batch<32 189486 (decoder, M = 1); FLASH_ATTN_EXT declined shape 124 (cross-attention).
+## Per encoder window (5.37 s) [EST: GPU sums split by launch counts; prompt GEMMs are a small part]
+GEMM ~2.8 s + activation packing + epilogue ~0.57 s + attention ~1.09 s = ~4.5 s on the GPU; ~0.9 s (16 %) is CPU work
+and waits: LayerNorm, GELU, bias adds, conv1d (im2col and its MUL_MAT, declined because src1 is F16), sync.
+For comparison, OpenVINO on the same window (PERF_COUNT): FullyConnected with fused epilogue ~4.5 s, SDPA 1.6 s,
+convolution 0.7 s -> our GEMM (~3.4 s incl. packing) and attention (1.1 s) are both faster.
+## Reading
+- Encoder 69 %: the GPU part is ~84 % of each window; the rest (~0.9 s/window = ~29 s per run, 11 % of the run) is CPU
+  ops + conv + waits. Packing + epilogue (18.9 s, 7 % of the run) is larger than in llama (M 1500, many GEMMs).
+- Decoder 26 %: CPU only (M = 1), 23.6 ms per token. Unlike quantized LLMs, whisper's weights are F16, so the CPU
+  reads the same 2 B per weight as the GPU would. [EST] decoder weights ~170 M params x 2 B = ~340 MB per token ->
+  CPU ~14 GB/s; GPU GEMV at ~27 GB/s (docs/ggml-backend-design.md) would take ~12 ms + ~33 waits x ~0.19 ms = ~18 ms:
+  ~1.3x on the decoder, ~6 % of the run. To be measured before any work (the decoder parameter count is an estimate).
