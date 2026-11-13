@@ -1,0 +1,39 @@
+# GPU dequantization kernel v2 (SLM staging, contiguous writes), UHD 620, 2026-11-13
+# v1 (gen9blas_dequant_b16): work-item = one block of one row, 256 values in a loop; neighbouring lanes = neighbouring
+# rows, so every byte load is a gather over 16 rows (16 cache lines) and every store is 2 B per lane.
+# Measured v1 (test_dequant.py, 8960x1536, FP16 out): Q4_K 2.8-3.0 GB/s, Q6_K 0.6-0.7, Q8_0 1.6-1.9 (NEO and kcl alike).
+# v2 (gen9blas_dequant_b16s): work-group of 128 = 16 rows x one 256-value chunk. Phase 1: the 16 rows' chunk bytes
+# (16 x 144 / 210 / 272 B) copied to SLM with consecutive lanes on consecutive bytes. Phase 2: lane t computes k = t and
+# t + 128 for all 16 rows from SLM (same formulas, no FMA, RTE) and writes them with one vstore_half16 = 32 B
+# contiguous; consecutive lanes write consecutive 32 B -> the whole 8 KB output tile is contiguous.
+# Bit-identity to ggml stays the acceptance test (test_dequant.py incl. N = 4096, GEN9_DEQ_VERIFY=1 on 3 models).
+## Prediction (before measuring)
+[HYP] Roofline: read 0.56 / 0.82 / 1.06 B + write 2 B per weight; ~20 GB/s RAM (GEMV ran at 24-25 GB/s) ->
+      FP16-out ceiling ~15 / 14 / 13 GB/s. Expected v2: Q4_K 6-12 GB/s (2-4x), Q6_K 4-10 (6-15x), Q8_0 6-12 (3-6x).
+[HYP] Qwen2.5-1.5B Q4_K_M first use 2.25 s -> 0.7-1.2 s (the rest of first use is not dequantization).
+[HYP] Qwen2.5-7B Q4_K_M at the default budget (82 weights dequantized on every use): pp512 29-30 -> 32-36 t/s.
+Falsified if any type lands outside its range or a single bit differs from ggml.
+
+## Measured (laptop, other sessions idle; KCL_PROFILE_KERNELS for kernel-only time; K=1536 N=8960, 27.5 MB FP16 out)
+Design changes while measuring (each kept bit-identical, test_dequant.py errors 0):
+ a) first v2: per value 5-7 SLM byte reads (scales recomputed per value)  -> Q8_0 7.4, Q4_K 15.3, Q6_K 12.4 ms
+ b) sub-block parameters computed once into SLM (phase 2), broadcast reads -> Q8_0 5.9, Q4_K 4.8, Q6_K 5.8 ms
+ c) stores as half2 with 8 lanes per k (full 64 B lines instead of 32 B at 32 B stride) -> 6.0 / 6.2 / 5.4 ms (no gain)
+v1 kernel-only: Q8_0 6.8, Q4_K 5.7, Q6_K 28.6 ms. Kept: c (same speed as b, cleaner lines).
+Kernel-only throughput v2: 4.4-5.1 GB/s FP16 out (v1: 1.0 Q6_K, 4.0-4.8 Q8_0/Q4_K); COPY ceiling ~24 GB/s read+write.
+Wall time per gen9blas_pack_b_q call is ~2x the kernel: allocation of the output buffer (i915 zeroes new pages) and
+userptr, both proportional to size (~3.7 GB/s): N 1024 / 4096 / 8960 / 17920 -> kernel 0.85 / 3.4 / 6.2 / 12.6 ms,
+rest 1.8 / 5.6 / 8.1 / 15.0 ms.
+Real models (llama-bench, alternating):
+ Qwen2.5-1.5B Q4_K_M first-use dequantization (GEN9_INFO): v2 1.81 s vs v1 2.16 s; pp512 181.3 vs 174.5 (noise).
+ Qwen2.5-7B Q4_K_M default budget, 3 passes: dequantization v2 20.8 / v1 18.8-20.2 s; pp512 v2 29.6-31.7, v1 29.3-30.7.
+ (A first v2 run at 6.7 GB used + 2.6 GB swap gave 80 s / 24.0 +- 11.3: memory pressure, discarded.)
+GEN9_DEQ_VERIFY=1 (GPU v2 vs CPU path, every weight): Qwen Q4_K_M 193, Llama 109, Gemma 179, Qwen Q8_0 193 -> 0 differ.
+
+## Against the prediction
+- Kernel 6-12 GB/s (Q4_K), 4-10 (Q6_K), 6-12 (Q8_0): falsified, 4.4-5.1 GB/s for all three. Q6_K gained 5.3x, Q4_K
+  1.2x, Q8_0 1.1x. The store layout did not matter; the remaining limit is not identified (OA counters need
+  perf_stream_paranoid=0). [HYP] SLM byte gathers in phases 1 and 3.
+- First use 0.7-1.2 s: falsified, 1.81 s; half of each call is buffer allocation/zeroing and userptr, not the kernel.
+- 7B pp512 32-36 t/s: falsified, unchanged (29-32). The per-use path is dominated by the per-call overhead.
+Next: reuse the output buffer of per-use packings (no allocation/zeroing per use), then re-measure 7B.
