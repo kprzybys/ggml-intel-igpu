@@ -1,0 +1,27 @@
+# Where a pp512 pass goes now (attention on the GPU since 3ba9d0a, GEMM trim at ef7253a): Qwen2.5-1.5B-Instruct
+# Q4_K_M, GEN9 backend built from ef7253a, UHD 620 (kp-laptop; other sessions confirmed idle; ollama serve idle in the
+# background), llama-bench -p 512 -n 0 -r 4 -t 4 -fa on (+ warm-up = 5 passes), 2026-11-13 19:25.
+# Earlier profile for comparison: results/ggml-backend-pass-profile-2026-11-13.txt (184 t/s, 2786 ms per pass).
+pp512: 216.9 +- 1.9, 222.8 +- 1.2 (plain), 218.9 +- 6.2 (KCL_PROFILE_KERNELS), 210.0 +- 4.7 (KCL_PHASES)
+-> ~220 t/s = ~2330 ms per pass.
+## GPU kernel time per pass (KCL_PROFILE_KERNELS=1, sums / 5 passes; dequantization is first use only)
+hgemm_kc_v (weight GEMMs)        1862 ms   80 %   193 per pass (~700 GFLOPS)
+pk_a3_f32v (activation packing)    89 ms    3.8 %
+gen9blas_epilog_hf8                78 ms    3.4 %
+k_attn + k_kt (flash attention)    77 ms    3.3 %   28 per pass (265 GFLOPS incl. pinning/submit/wait, GEN9_INFO)
+sum                              2106 ms   90.4 %
+GPU idle                         ~225 ms    9.6 %
+## The idle time is submission, not CPU ops (KCL_PHASES=1)
+execbuf ioctl: 1298 calls (221 per pass + 193 first-use dequant), 0.74-0.83 ms wall each, all of it CPU time in the
+kernel (softpin + NO_RELOC already; ~9-10 objects per execbuf). 221 x 0.74-0.83 = 165-185 ms per pass = 7-8 %.
+With GEN9BLAS_NO_USERPTR=1 (copies instead of userptr): execbuf still 0.67 ms, pp512 193.5 -> userptr pinning is
+not the cause. GEM_WAIT: CPU 28-48 us per call (sleeping wait, fine).
+Left for CPU ops (norms, RoPE, adds, get_rows) and the rest: ~40-60 ms per pass (~2 %).
+## Reading
+- GEMM is 80 % of the pass and issue-bound (~10 % headroom inside the kernel = ~8 % of the pass).
+- The largest item outside the GEMM is the execbuf ioctl: ~0.75 ms of kernel CPU per submission while the GPU waits.
+  Unknown why it costs that much for ~9 softpinned objects [open: i915 per-object work, batch size, or fences].
+  Levers: find the cost (e.g. ftrace/perf on i915_gem_do_execbuffer needs root), or submit the next independent op
+  before waiting (Q/K/V GEMMs share an input) so the ioctl overlaps GPU work.
+- Activation packing + epilogue 7 %; attention 3 %; CPU ops ~2 %.
+- No single new kernel has more than ~8 % of the pass to gain.
