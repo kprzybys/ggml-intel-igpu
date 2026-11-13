@@ -397,7 +397,7 @@ CPU, MUL_MAT is generic); stage B (QKV) only if energy says so; separate reposit
 - Lesson: a kernel that passed the unit test at N <= 160 was wrong from N ~ 1024 on real models (Q4_K scale decode in
   private arrays; cause not found, scalar rewrite is exact). Unit tests now include N = 4096; `GEN9_DEQ_VERIFY=1`
   checks a real model end to end.
-- Flash attention on the GPU (2026-11-13 evening, opt-in `GEN9_ATTN=1`, [attention-gpu.md](attention-gpu.md) section
+- Flash attention on the GPU (2026-11-13 evening, on by default, `GEN9_ATTN=0` turns it off, [attention-gpu.md](attention-gpu.md) section
   11): FLASH_ATTN_EXT with F16 K/V and the single-sequence causal mask runs the hand-scheduled kernel through kcl on
   userptr; anything else stays on ggml-cpu. HD 530: pp512 at depth 3584 83.8 -> 131.0 t/s (Qwen2.5-1.5B, -36 % time)
   and 104.7 -> 182.5 (Llama-3.2-1B, -43 %), d0 +11 % / +18 %; perplexity -0.007 % / -0.008 % vs GEN9_ATTN=0.

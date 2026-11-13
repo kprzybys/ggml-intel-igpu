@@ -348,7 +348,8 @@ static bool gen9_try_ffn(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
 // a mask with other values) is computed by ggml-cpu inside this backend (counted).
 // n_k need not be a multiple of 16 when there is no mask and the KV tensor behind the views has the rows up to the next
 // multiple (whisper.cpp's encoder: 1500 keys, buffer of 1536 rows); see fa_rows_behind.
-static bool attn_on(void) { static const bool v = getenv("GEN9_ATTN") && atoi(getenv("GEN9_ATTN")) != 0; return v; }
+// On by default since 2026-11-13 (measured on HD 530 and UHD 620, docs/attention-gpu.md section 11); GEN9_ATTN=0 turns it off.
+static bool attn_on(void) { static const bool v = !getenv("GEN9_ATTN") || atoi(getenv("GEN9_ATTN")) != 0; return v; }
 
 static float fa_param(const struct ggml_tensor * op, int i) { float v; memcpy(&v, (const float *) op->op_params + i, sizeof v); return v; }
 
