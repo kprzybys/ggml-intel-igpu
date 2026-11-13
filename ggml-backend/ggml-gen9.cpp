@@ -40,6 +40,7 @@ static std::atomic<long> n_mm_asked{0}, n_mm_declined_shape{0}, n_mm_declined_ty
                          n_mm_declined_hint{0}, n_mm_declined_gpu{0};
 
 static std::atomic<long> n_mm_streamed{0};
+static std::atomic<long> n_multi_groups{0}, n_multi_mm{0}, n_multi_overlap{0}, n_multi_fallback{0};
 static std::atomic<long> n_ew_rms{0}, n_ew_rms_mul{0}, n_ew_add{0}, n_ew_mul{0}, n_ew_rope{0}, n_ew_sync_graphs{0}, n_ew_asked{0}, n_ew_declined{0};
 static std::atomic<long> n_dequant{0}, n_dequant_f32{0}, n_dequant_gpu{0};
 static std::atomic<double> t_dequant_s{0}, t_deq_alloc_s{0}, t_deq_cpu_s{0}, t_deq_pack_s{0}, t_deq_gpu_s{0};
@@ -51,6 +52,9 @@ static std::atomic<long> n_fa_tail{0}, n_fa_cpu_tail{0};   // n_k not a multiple
 static std::atomic<double> t_fa_gpu_s{0}, t_fa_mask_s{0}, t_fa_cpu_s{0}, fa_flop{0};
 
 static void gen9_report(void) {
+    fprintf(stderr, "gen9: MUL_MAT groups on one input (Q/K/V) %ld covering %ld MUL_MATs; candidates refused for memory overlap %ld; "
+            "outputs recomputed in F32 after FP16 overflow %ld\n", n_multi_groups.load(), n_multi_mm.load(), n_multi_overlap.load(),
+            n_multi_fallback.load());
     fprintf(stderr, "gen9: elementwise ops on the GPU: RMS_NORM %ld (with MUL fused %ld), ADD %ld, MUL %ld, ROPE %ld; splits run with a "
             "wait per op (span not registered or GEN9_EW_SYNC) %ld; supports_op asked %ld, declined %ld\n", n_ew_rms.load(),
             n_ew_rms_mul.load(), n_ew_add.load(), n_ew_mul.load(), n_ew_rope.load(), n_ew_sync_graphs.load(), n_ew_asked.load(),
@@ -107,7 +111,8 @@ struct packed_t { gen9blas_packed * P; int t; bool temp = false; };   // temp: n
 struct gen9_context {
     std::map<wkey, packed_t> cache;
     size_t cached_bytes = 0;
-    bool ew_sync = false, ew_pending = false;   // per graph_compute: wait after each elementwise op / ops queued, not waited for
+    bool ew_sync = false, ew_pending = false;
+    std::vector<char> done;   // per graph_compute: nodes already computed by a MUL_MAT group   // per graph_compute: wait after each elementwise op / ops queued, not waited for
     ggml_backend_t cpu = nullptr;   // ggml-cpu for FLASH_ATTN_EXT nodes whose mask turns out not to be supported (created on first use)
     ~gen9_context() {
         if (cpu) ggml_backend_free(cpu);
@@ -502,6 +507,71 @@ static void gen9_flash_attn(gen9_context * ctx, struct ggml_cgraph * cg, int i) 
     t_fa_gpu_s = t_fa_gpu_s + std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
 }
 
+// ---------------- MUL_MAT groups on one input (Q/K/V) ----------------
+// At a weight MUL_MAT, later weight MUL_MATs of the same split with the same input (Q, K, V after the attention norm) are
+// computed with it: input packed once, one wait (gen9blas_gemm_multi_f16w). Computing a later node early is only valid
+// if its output memory is not used by any node in between (ggml-alloc may give it memory of a tensor that dies between
+// the two nodes): every candidate's byte range is checked against the tensors (sources and results) of the nodes in
+// between, otherwise the candidate is left for its turn. GEN9_QKV=0 turns it off.
+static bool multi_off(void) { static const bool v = [] { const char * e = getenv("GEN9_QKV"); return e && !strcmp(e, "0"); }(); return v; }
+static bool overlaps(const struct ggml_tensor * a, const struct ggml_tensor * b) {
+    if (!a || !b || !a->data || !b->data) return false;
+    const char * a0 = (const char *) a->data, * b0 = (const char *) b->data;
+    return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+}
+static void mm_f32_recompute(struct ggml_tensor * dst) {   // F32 weights for one MUL_MAT after FP16 overflow
+    const struct ggml_tensor * w = dst->src[0], * x = dst->src[1];
+    const int K = (int) w->ne[0], N = (int) w->ne[1], M = (int) x->ne[1];
+    std::vector<float> wf((size_t) N * K);
+    dequant_rows(w, wf.data(), false);
+    std::lock_guard<std::mutex> lk(gpu_mu);
+    if (gen9blas_gemm(GEN9BLAS_S, 0, 1, M, N, K, 1.0, x->data, (int) (x->nb[1] / 4), wf.data(), K, 0.0, dst->data, (int) (dst->nb[1] / 4)))
+        fprintf(stderr, "gen9: F32 recompute of %s failed: %s\n", dst->name, gen9blas_error());
+}
+static bool gen9_try_multi(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
+    struct ggml_tensor * n0 = cg->nodes[i];
+    if (multi_off() || !is_f16_weight_mm(n0)) return false;
+    const struct ggml_tensor * x = n0->src[1];
+    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[2] != 1 || x->ne[3] != 1) return false;
+    std::vector<int> grp{ i };
+    for (int j = i + 1; j < cg->n_nodes && j <= i + 24 && grp.size() < 4; j++) {
+        struct ggml_tensor * c = cg->nodes[j];
+        if (!(c->flags & GGML_TENSOR_FLAG_COMPUTE) || c->src[1] != x || !is_f16_weight_mm(c) || c->src[0]->ne[0] != n0->src[0]->ne[0] ||
+            !ggml_is_contiguous(c) || c->ne[1] != n0->ne[1]) continue;
+        bool clash = overlaps(c, x);
+        for (int k = i; k < j && !clash; k++) {
+            const struct ggml_tensor * m = cg->nodes[k];
+            clash = overlaps(c, m);
+            for (int s = 0; s < GGML_MAX_SRC && !clash; s++) clash = overlaps(c, m->src[s]);
+        }
+        if (clash) { n_multi_overlap++; continue; }
+        grp.push_back(j);
+    }
+    if (grp.size() < 2) return false;
+    const int n = (int) grp.size(), M = (int) x->ne[1];
+    std::vector<packed_t> P(n);
+    int rc;
+    std::vector<int> nf(n), ldc(n);
+    {
+        std::lock_guard<std::mutex> lk(gpu_mu);
+        bool ok = true;
+        for (int g = 0; g < n; g++) { P[g] = get_packed(ctx, cg->nodes[grp[g]]->src[0]); ok &= P[g].P && P[g].t == GEN9BLAS_HS; }
+        std::vector<const gen9blas_packed *> pp(n); std::vector<float *> C(n);
+        for (int g = 0; g < n; g++) { pp[g] = P[g].P; C[g] = (float *) cg->nodes[grp[g]]->data; ldc[g] = (int) (cg->nodes[grp[g]]->nb[1] / 4); }
+        rc = ok ? gen9blas_gemm_multi_f16w(M, (const float *) x->data, (int) (x->nb[1] / 4), n, pp.data(), C.data(), ldc.data(), nf.data()) : 1;
+        for (int g = 0; g < n; g++) release(P[g]);
+    }
+    if (rc < 0) { fprintf(stderr, "gen9: gemm_multi_f16w failed: %s\n", gen9blas_error()); return false; }
+    if (rc > 0) return false;
+    ctx->ew_pending = false;   // the call waited for everything queued before it
+    for (int g = 0; g < n; g++) {
+        if (nf[g]) { n_multi_fallback++; mm_f32_recompute(cg->nodes[grp[g]]); }
+        if (g) ctx->done[grp[g]] = 1;
+    }
+    n_multi_groups++; n_multi_mm += n;
+    return true;
+}
+
 // ---------------- per-layer elementwise ops: RMS_NORM (+ its weight MUL), ADD, MUL, ROPE ----------------
 // They only enqueue: the kernels run in the batch of the next GEMM / attention call, which waits anyway, or at the end
 // of the split (gen9_graph_compute). The ggml buffers written in the split are registered as kcl spans first, so a tensor
@@ -610,15 +680,18 @@ static enum ggml_status gen9_graph_compute(ggml_backend_t backend, struct ggml_c
     n_graphs++;
     ew_begin(ctx, cgraph);
     struct ew_guard { gen9_context * c; ~ew_guard() { ew_end(c); } } guard{ ctx };
+    ctx->done.assign(cgraph->n_nodes, 0);
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) { n_noop++; continue; }
+        if (ctx->done[i]) continue;
         switch (node->op) {
             case GGML_OP_NONE: case GGML_OP_RESHAPE: case GGML_OP_VIEW: case GGML_OP_PERMUTE: case GGML_OP_TRANSPOSE:
                 n_noop++;
                 break;
             case GGML_OP_MUL_MAT:
                 if (gen9_try_ffn(ctx, cgraph, i)) { i += 3; break; }
+                if (gen9_try_multi(ctx, cgraph, i)) break;
                 if (!gen9_mul_mat(ctx, node)) return GGML_STATUS_FAILED;
                 break;
             case GGML_OP_GLU:
