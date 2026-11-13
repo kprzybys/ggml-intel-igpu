@@ -1,0 +1,11 @@
+# Q/K/V block (one A packing, bias in the epilogue, one wait): attempted and withdrawn, 2026-11-13 evening
+Implemented (patch kept outside the repo): gen9blas_gemm_multi_f16w (A packed once, n GEMMs, epilogue gen9blas_epilog_hf4b
+with a bias row, one wait), gen9_try_qkv in graph_compute (2-4 weight MUL_MATs on the same input, each optionally
+followed by its bias ADD), supports_op(ADD) for bias ADDs after weight MUL_MATs, CPU fallback for a lone bias ADD.
+Result: Q/K/V groups fused 0 on Qwen2.5-1.5B (bias ADDs claimed: 840 computed alone) and on Llama-3.2-1B; perplexity
+unchanged (15.2591 / 42.7157). Cause: ggml orders nodes by dependencies, so Q's RoPE (on the CPU) follows Q's MUL_MAT
+before K's MUL_MAT; the scheduler cuts GEN9 splits at every CPU node, and graph_optimize only sees one split
+(ggml-backend.cpp: called per split). Q, K and V never meet in one GEN9 split.
+Ways that would work: RoPE (and RMS norm) on the GPU, so Q/K/V and their RoPEs form one split; or computing K and V
+early from the Q node by reading past the split (relies on ggml internals: rejected). Gain was estimated at 1.5-3 %.
+Withdrawn: all four files back to HEAD; lib rebuilt from HEAD (kernels.c generated with the committed gen_kernels.py).
