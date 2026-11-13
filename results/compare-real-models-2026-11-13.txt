@@ -163,3 +163,11 @@ chunk, subagent run), not investigated.
   the context looks like a residual n_kv-dependent error, not only Q4_K precision (Qwen Q4_K_M +2.4 %, Llama +5.0 % at
   c 512 have no such series). Together with Llama 3.2 1B at c 300 (OpenVINO 76.6 vs ggml-cpu 69.0, +11 %, one chunk),
   "Gemma 2 alone" is not established; to check before any upstream report (also in ~/upstream/llama.cpp-openvino-gemma2).
+
+## Correction (2026-11-13 evening): "GEN9+FFN" on quantized models was the same configuration as "GEN9"
+gen9_try_ffn / supports_op GLU (ggml-backend/ggml-gen9.cpp ~308 and ~651) fuse only F16 weights. With GEN9_FFN=1 on
+Qwen2.5-1.5B Q4_K_M, GEN9_INFO reports "FFN blocks fused 0". So every GEN9+FFN row for Q8_0 / Q4_K_M models (phase 1)
+and the phase-4 energy line "GEN9+FFN 129.1 vs GEN9 122.3 mJ/token, +5.6 %" compare two identical configurations:
+the differences are run-to-run noise (energy: ~5 %, speed: up to ~5 %). Only the F16 rows and the morning energy
+result on F16 (results/ggml-backend-energy-*: -10.7 %) measure the fusion. The statement "on Q4_K_M the fused FFN
+costs +5.6 % energy" is withdrawn.
