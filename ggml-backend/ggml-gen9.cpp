@@ -304,8 +304,15 @@ static void gen9_glu_alone(struct ggml_tensor * dst) {
 // power budget moves to the GPU and the CPU attention slows down by as much (results/ggml-backend-ffn-fusion-2026-11-13.txt).
 static bool ffn_off(void) { static const bool v = getenv("GEN9_FFN") == nullptr; return v; }
 
+// Weights the fused FFN takes: F16, or a quantized type with to_float (dequantized into the same HS packed layout; a
+// weight that falls back to F32 because of the FP16 range is rejected later by the g/u/d .t == HS check). Until
+// 2026-11-13 only F16 was accepted, so GEN9_FFN=1 never fused on Q4_K_M / Q8_0 models (GEN9_INFO "fused 0").
+static bool ffn_weight_type(enum ggml_type t) {
+    return t == GGML_TYPE_F16 || (ggml_is_quantized(t) && ggml_get_type_traits(t)->to_float != nullptr);
+}
+
 static bool is_f16_weight_mm(const struct ggml_tensor * n) {
-    return n->op == GGML_OP_MUL_MAT && n->src[0]->type == GGML_TYPE_F16 && is_weight(n->src[0]);
+    return n->op == GGML_OP_MUL_MAT && ffn_weight_type(n->src[0]->type) && is_weight(n->src[0]);
 }
 
 // Gated FFN block at nodes i..i+3: two MUL_MATs on the same input (gate, up; either order), SWIGLU of the two, MUL_MAT
@@ -648,8 +655,8 @@ static bool gen9_dev_supports_op(ggml_backend_dev_t, const struct ggml_tensor * 
             const bool ok = ggml_get_glu_op(op) == GGML_GLU_OP_SWIGLU && b && a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 &&
                             op->type == GGML_TYPE_F32 && ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(op) &&
                             ggml_are_same_shape(a, b) && a->ne[2] == 1 && a->ne[3] == 1 && op->ne[1] >= 32 &&
-                            a->op == GGML_OP_MUL_MAT && b->op == GGML_OP_MUL_MAT && a->src[0]->type == GGML_TYPE_F16 &&
-                            b->src[0]->type == GGML_TYPE_F16 && !ffn_off() && gpu_ok();   // only what gen9_try_ffn can fuse
+                            a->op == GGML_OP_MUL_MAT && b->op == GGML_OP_MUL_MAT && ffn_weight_type(a->src[0]->type) &&
+                            ffn_weight_type(b->src[0]->type) && !ffn_off() && gpu_ok();   // only what gen9_try_ffn can fuse
             if (!ok) n_glu_declined++;
             return ok;
         }

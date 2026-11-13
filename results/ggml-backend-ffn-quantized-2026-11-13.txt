@@ -1,0 +1,20 @@
+# Fused FFN for quantized weights (GEN9_FFN=1), Qwen2.5-1.5B-Instruct Q4_K_M, UHD 620, 2026-11-13 evening
+## Why
+GPU idle per pp512 pass ~202 ms of 2310 (r=1 vs r=6 differencing, KCL_PHASES + KCL_PROFILE_KERNELS): wake-up / gaps
+~43 ms (221 GEM_WAITs, ~0.19 ms each), CPU side ~158 ms. perf (r=6 minus r=1, CPU-ms per pass over 4 threads):
+ggml_vec_swiglu_f32 298, rms_norm_mul 102, rope + sincos 65, add 50, q6_K x q8_K vec_dot (output row, M = 1) 36;
+libgomp spinning 4412 (threads wait while the GPU works). Shorter spinning loses: GOMP_SPINCOUNT=10000 216 / 210,
+=1000 210 / 205 vs default 223 / 224 t/s.
+GEN9_FFN=1 did nothing on Q4_K_M: gen9_try_ffn and supports_op(GLU) accepted only F16 weights ("FFN blocks fused 0").
+Quantized weights are dequantized into the same HS packed layout, so the fused path applies unchanged.
+## Change
+ggml-gen9.cpp: ffn_weight_type() = F16 or quantized with to_float, in is_f16_weight_mm and supports_op(GLU). A weight
+that falls back to F32 (FP16 range) still makes gen9_try_ffn return false (g/u/d .t == HS check).
+## Measured
+Fused blocks: 54 in a 2-pass llama-bench (27 per pass); perplexity run 275 fused, 0 recomputed, 0 GLU declined.
+Perplexity (-c 512 --chunks 10): 15.2591 fused vs 15.2592 unfused.
+llama-bench -p 512 -n 0 -r 5 -d 0,2048, alternating (GPU attention on by default; laptop clocks vary, sd up to 13):
+  d 0     unfused 193.5 / 206.6 / 214.6   fused 228.4 / 196.4 / 219.2   -> mean +5 % (one round lower)
+  d 2048  unfused 153.8 / 163.6 / 166.8   fused 176.6 / 174.6 / 176.6   -> +6-15 %, every round
+(An earlier round with both configurations low, 158 / 167 and 129.5 / 133.7, was also in favour of fusion.)
+Energy not measured yet; on F16 the fusion saved 10.7 % (results/ggml-backend-energy-*).
