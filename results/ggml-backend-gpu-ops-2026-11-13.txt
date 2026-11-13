@@ -70,3 +70,15 @@ splits, perplexity 15.2610 unchanged. Whisper decoder: to be measured separately
 Whole pl60 on gp (whisper large-v3-turbo, encoder + decoder, -bs 1 -bo 1), with 30bbea4 (before 350d801):
   EWOPS=1 / =0: 256 / 261 s (-1.9 %), energy 4.31 / 4.73 kJ (-8.9 %), WER unchanged; NORM 2587 (all fused with MUL+ADD),
   GELU 1258, MUL_MAT with F16 src1 66, ADD 9017; graph_compute 2983 vs 7722 (fewer splits).
+
+## Whisper decoder prompt after 350d801 (on gp, results/whisper-ewops-decoder-ab-gp-2026-11-14.txt, 489649a)
+Hypothesis "extra waits of GEN9 splits without MUL_MAT" FALSIFIED: the rule caught only 6 splits; prompt (256 rows) still
++5-6 % slower with the ops (3332 / 3357 / 3183 ms default / LONE_GPU / off), encoder -2.9 %. What changes with the ops:
+fewer splits (465 vs 1194) but MORE submissions (execbuf 1862 vs 1595) and dearer ones (~520 vs ~400 us CPU, ~8.4 userptr
+objects per execbuf); GEM_WAIT ~10 ms each in both. a separate run's hypothesis: cost = submissions x object handling in execbuf.
+Candidates to check (not done; no new tasks after 2026-11-13 22:35):
+- spans put whole ggml buffers into every execbuf (large userptr objects: i915 validates their page state per execbuf);
+- kbo_release of an object listed in the batch being built now submits first (6caf81c): per-call packed weights of the
+  decoder (non-weight src0, packed and freed per MUL_MAT) can force extra submissions while elementwise ops are queued;
+- batches reach the 64-IDD limit sooner with many small kernels.
+Workaround available today: GEN9_EWOPS=0 for the decoder-heavy whisper path costs the encoder its -2.9 %.
