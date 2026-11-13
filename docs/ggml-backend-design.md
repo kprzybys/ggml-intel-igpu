@@ -402,3 +402,11 @@ CPU, MUL_MAT is generic); stage B (QKV) only if energy says so; separate reposit
   userptr; anything else stays on ggml-cpu. HD 530: pp512 at depth 3584 83.8 -> 131.0 t/s (Qwen2.5-1.5B, -36 % time)
   and 104.7 -> 182.5 (Llama-3.2-1B, -43 %), d0 +11 % / +18 %; perplexity -0.007 % / -0.008 % vs GEN9_ATTN=0.
   `results/attn-integration-hd530-2026-11-13.txt`.
+- Per-layer elementwise ops on the GPU (2026-11-13 night, `GEN9_EWOPS=0` / `GEN9_QKV=0` turn them off): RMS_NORM with its
+  weight MUL, ADD, MUL and ROPE only enqueue (no own wait; the ggml buffers of a split are registered as kcl spans so each
+  byte has one GPU address in a batch), and up to 2 of the 3 Q/K/V MUL_MATs share one packed input and one wait. pp512
+  +2.5 % on gp, perplexity +/-0.01 %. `results/ggml-backend-gpu-ops-2026-11-13.txt`.
+- **Measurement rule (from 2026-11-13 night): every llama.cpp measurement with GEN9 uses `-ngl 0` and states the `-ngl`
+  used in its results file**, because with the default `-ngl` (full offload) llama.cpp pins every layer's norm to the
+  CPU (`src/llama-context.cpp:3257-3265`), and GEN9 (an ACCEL device) is affected by `-ngl` in no other way; older results
+  are not recomputed, but a new-vs-old comparison needs a fresh baseline with the same `-ngl`.
