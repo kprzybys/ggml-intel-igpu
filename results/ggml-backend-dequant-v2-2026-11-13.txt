@@ -5,7 +5,8 @@
 # v2 (gen9blas_dequant_b16s): work-group of 128 = 16 rows x one 256-value chunk. Phase 1: the 16 rows' chunk bytes
 # (16 x 144 / 210 / 272 B) copied to SLM with consecutive lanes on consecutive bytes. Phase 2: lane t computes k = t and
 # t + 128 for all 16 rows from SLM (same formulas, no FMA, RTE) and writes them with one vstore_half16 = 32 B
-# contiguous; consecutive lanes write consecutive 32 B -> the whole 8 KB output tile is contiguous.
+# contiguous; consecutive lanes write consecutive 32 B -> the whole 8 KB output tile is contiguous. [first design;
+# the final kernel (v2b) stores half2 per lane, 8 lanes per k, see design step c below]
 # Bit-identity to ggml stays the acceptance test (test_dequant.py incl. N = 4096, GEN9_DEQ_VERIFY=1 on 3 models).
 ## Prediction (before measuring)
 [HYP] Roofline: read 0.56 / 0.82 / 1.06 B + write 2 B per weight; ~20 GB/s RAM (GEMV ran at 24-25 GB/s) ->
@@ -56,7 +57,7 @@ Qwen2.5-7B Q4_K_M, default cache budget, llama-bench -p 512 -n 0 -r 2, alternati
 2 B aligned -> 2 B loads) -> kernel 2x.
 Steps (kernel-only ms per call, K=1536 N=8960; test_dequant.py errors 0 after each):
   start (v2c above)                            Q8_0 6.0  Q4_K 6.2  Q6_K 5.4
-  16 B / 2 B phase-1 loads                     3.8       6.0       3.75   (prediction hit for Q8_0/Q6_K, not Q4_K)
+  16 B / 2 B phase-1 loads                     3.8       6.0       3.75   (prediction 2x falsified: 1.6x / 1.03x / 1.44x)
   SLM row stride chunk + 4 B (Q8_0/Q4_K)       3.2       5.2       3.7    lanes read rows 0,2,..,14: 2 x 144 B = 72 dwords
                                                                           -> only banks 0 and 8 (4-way conflict)
   parameter arrays stride 17 / 9 (was 16 / 8)  2.2       2.4       3.4    same rows hit one bank (8-way)
@@ -67,5 +68,11 @@ Qwen2.5-1.5B Q4_K_M first use: v1 2.06 s, v2b 1.31 s (pp512 178.8 / 186.7).
 Qwen2.5-7B Q4_K_M (spare buffers on; 5.3-5.5 GB in swap from earlier runs, so noisy), pp512 t/s and dequant s (3 passes):
   v1  33.02 (17.2 s)  33.82 (15.9 s)  34.34 (12.5 s)
   v2b  4.79 (17.8 s, outlier)  38.18 (8.3 s)  37.16 (7.5 s)  29.27 +- 12.83 (6.7 s)
-  -> clean runs +10-13 % over v1 (and +20-25 % over the morning's 29-30 without spare buffers). The 4.79 run is not
+  -> the two v2b runs without outlier/noise +10-13 % over v1 (2 of 4 v2b runs discarded, see above) (and +20-25 % over the morning's 29-30 without spare buffers). The 4.79 run is not
   explained; it coincides with the swap at 5.4 GB and other noisy runs (+-12); to be re-checked on a quiet machine.
+## Corrections after review (review, 2026-11-13 evening; numbers unchanged, wording fixed)
+- v2b step "16 B / 2 B phase-1 loads": the 2x prediction was falsified for every type (1.6x, 1.03x, 1.44x); the
+  earlier wording "hit for Q8_0/Q6_K" was wrong.
+- 7B "+10-13 %": from 2 of 4 v2b runs (one 4.79 outlier, one +-12.8); not a clean comparison. Re-measure on a quiet
+  machine. The spare-buffer prediction "dequantization roughly halves" got -25 % (pair 2) and -43 % (pair 3): partly.
+- The v2 header describes the first design (vstore_half16); the committed v2b kernel stores half2 (8 lanes per k).

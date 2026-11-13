@@ -23,3 +23,6 @@ Falsified: packing reached 93 ms, not ~40; epilogue 87, not ~35. [HYP] the epilo
 pages, snooped) and both kernels are short launches (193 per pass, ~0.5 ms each) where launch overhead and ramp-up
 weigh; a bigger saving needs fewer launches (pack A once for Q/K/V and gate/up; merged GEMMs) or no epilogue at all
 (GEMM writing F32 directly).
+## Corrections after review (review, 2026-11-13 evening; numbers unchanged, wording fixed)
+- Epilogue "-14 %": two 4-per-lane runs (469, 396 ms per 5 passes) against a baseline of 479-556; inside the noise.
+  Only the packing gain (-35 %, 5 runs each side, no overlap) is established. The commit title a94ecc9 overstates it.
