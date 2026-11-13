@@ -622,6 +622,14 @@ static ggml_backend_buffer_t gen9_dev_buffer_from_host_ptr(ggml_backend_dev_t, v
 
 static bool fits_int(int64_t v) { return v > 0 && v <= INT_MAX; }
 
+// Smallest batch (tokens, op->ne[1]) taken by MUL_MAT and the fused FFN: GEN9_MIN_BATCH, default 32 (a design choice,
+// not a measured crossover: below ~26-30 rows the FP16 GEMM is bound by reading 2 B per weight, docs/ggml-backend-design
+// section 12). For measuring the crossover, e.g. speculative verification with k = 8-16.
+static int min_batch(void) {
+    static const int v = [] { const char * e = getenv("GEN9_MIN_BATCH"); const int b = e ? atoi(e) : 32; return b >= 1 ? b : 32; }();
+    return v;
+}
+
 // Design section 7: F32 or F16 weights, F32 activations and result.
 static bool gen9_supports_mul_mat(const struct ggml_tensor * op) {
     const struct ggml_tensor * w = op->src[0], * x = op->src[1];
@@ -633,7 +641,7 @@ static bool gen9_supports_mul_mat(const struct ggml_tensor * op) {
     }
     if (w->ne[2] != 1 || w->ne[3] != 1 || x->ne[2] != 1 || x->ne[3] != 1 || !ggml_is_contiguous(w) || !ggml_is_contiguous(x) ||
         !ggml_is_contiguous(op) || !fits_int(w->ne[0]) || !fits_int(w->ne[1]) || !fits_int(x->ne[1])) { n_mm_declined_shape++; return false; }
-    if (op->ne[0] < 32 || op->ne[1] < 32 || x->ne[0] < 32) { n_mm_declined_batch++; return false; }
+    if (op->ne[0] < 32 || op->ne[1] < min_batch() || x->ne[0] < 32) { n_mm_declined_batch++; return false; }
     if (ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_HADAMARD) { n_mm_declined_hint++; return false; }
     if (w->type != GGML_TYPE_F32) {   // FP16 chunk sums and FP16 activations: not allowed if F32 / BF16 precision is required
         const enum ggml_prec acc = ggml_prec_get_acc(op), p1 = ggml_prec_get_src(op, 1);
@@ -656,7 +664,7 @@ static bool gen9_dev_supports_op(ggml_backend_dev_t, const struct ggml_tensor * 
             const struct ggml_tensor * a = op->src[0], * b = op->src[1];
             const bool ok = ggml_get_glu_op(op) == GGML_GLU_OP_SWIGLU && b && a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 &&
                             op->type == GGML_TYPE_F32 && ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(op) &&
-                            ggml_are_same_shape(a, b) && a->ne[2] == 1 && a->ne[3] == 1 && op->ne[1] >= 32 &&
+                            ggml_are_same_shape(a, b) && a->ne[2] == 1 && a->ne[3] == 1 && op->ne[1] >= min_batch() &&
                             a->op == GGML_OP_MUL_MAT && b->op == GGML_OP_MUL_MAT && ffn_weight_type(a->src[0]->type) &&
                             ffn_weight_type(b->src[0]->type) && !ffn_off() && gpu_ok();   // only what gen9_try_ffn can fuse
             if (!ok) n_glu_declined++;
