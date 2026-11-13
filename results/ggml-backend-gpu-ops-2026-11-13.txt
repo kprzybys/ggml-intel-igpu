@@ -53,3 +53,13 @@ output gets memory of a tensor still live in between) and runs at its turn.
 Not done: grouping the third MUL_MAT (needs a scratch output and a copy at its turn: ~0.4 % at most); bias in the epilogue.
 All measurements in this file use -ngl 0 (except the one marked -ngl -1); rule from 2026-11-13 night: every llama.cpp
 measurement with GEN9 uses -ngl 0 and states it, and new-vs-old comparisons need a fresh baseline with the same -ngl.
+
+## Whisper encoder ops and a row threshold (kp, 2026-11-13 22:10, -ngl 0)
+NORM(+MUL+ADD), GELU, column-broadcast ADD, MUL_MAT with F16 src1 (30bbea4): test-backend-ops on kp and gp 0 FAIL.
+On gp (whisper.cpp, jfk): text identical, encoder 5.16-5.19 s vs 5.30-5.31 s (-2.4 %), decoder prompt (256 rows)
+3.35 vs 3.17 s (+6 %, slower with the ops).
+Threshold GEN9_EW_MIN_ROWS = 384 (6c1ef03) tested on llama.cpp Qwen 1.5B Q4_K_M, -r 3, alternating:
+  pp256 ops on GPU / off: 241.2/238.2, 241.9/233.7, 241.1/236.0 (+1.3, +3.5, +2.2 %); pp128: 225.9/227.5, 212.2/220.2,
+  225.0/201.7 (mixed); pp512 default / off: 241.7/231.4, 241.1/233.8 (+4.5, +3.1 %).
+  -> row count does not separate the cases; default back to GEN9_MIN_BATCH (env kept for diagnostics). Working
+  hypothesis for whisper's decoder: GEN9 splits with elementwise ops but no waiting GPU call pay an extra wait.

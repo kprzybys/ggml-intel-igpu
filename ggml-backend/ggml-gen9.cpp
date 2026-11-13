@@ -918,11 +918,11 @@ static bool gen9_supports_mul_mat(const struct ggml_tensor * op) {
     return true;
 }
 
-// Elementwise ops (see gen9_rms_norm): F32 rows, at least GEN9_EW_MIN_ROWS rows (tokens; default 384). Below that the CPU
-// does them faster than the extra wait they cause when they end a short GPU split: whisper's decoder prompt (256 rows)
-// was 6 % slower with them, pp512 / the whisper encoder (512 / 1500 rows) faster (results/ggml-backend-gpu-ops-2026-11-13.txt).
+// Elementwise ops (see gen9_rms_norm): F32 rows, at least GEN9_EW_MIN_ROWS rows (tokens; default GEN9_MIN_BATCH, as
+// MUL_MAT). A 384-row default was tried and dropped: on llama.cpp pp256 the GPU ops win (+1-3.5 %, 3 pairs), so row count
+// does not explain whisper's decoder prompt (256 rows, 6 % slower with them; under investigation).
 static int ew_min_rows(void) {
-    static const int v = [] { const char * e = getenv("GEN9_EW_MIN_ROWS"); const int b = e ? atoi(e) : 384; return b >= 1 ? b : 384; }();
+    static const int v = [] { const char * e = getenv("GEN9_EW_MIN_ROWS"); return e && atoi(e) >= 1 ? atoi(e) : 0; }();
     return std::max(v, min_batch());
 }
 static bool gen9_supports_ew(const struct ggml_tensor * op) {
