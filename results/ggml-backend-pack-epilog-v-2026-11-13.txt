@@ -1,0 +1,25 @@
+# Activation packing and epilogue with 16 B per lane (pk_a3_f32v, gen9blas_epilog_hf8), UHD 620, 2026-11-13
+# Before: pk_a3_f32 and gen9blas_epilog_hf handle one element per work-item (4 B read + 2 B scattered write; 2 B read
+# + 4 B write). Pass profile (results/ggml-backend-pass-profile-*): 141 + 97 ms of a 2786 ms pp512 pass, Qwen 1.5B Q4_K_M.
+[HYP, before measuring] 16 B messages (results/message-16B-*: ~24 GB/s read+write) -> pack 141 -> ~40 ms, epilogue
+97 -> ~35 ms per pass; pass -5 %.
+## Design
+pk_a3_f32v: one 16-lane work-group per 16 x 16 A3 tile; lane reads its row as 4 x float4, tile through SLM, lane writes
+two 8-half chunks of the tile's contiguous 256 halves as one 16 B store (convert_half8_rte + uint4: vstore_half8 split
+into 4 B byte-scatter writes). First version had the even/odd-k run of PK_IDX_A3 swapped: caught by the bit test.
+gen9blas_epilog_hf8: first 8 per lane (16 B read, 32 B write) -> slower than v1 (485 -> 600 ms / 5 passes): 32 B per
+lane splits every 64 B line over two store messages (as noted in docs/isa-notes.md). Now 4 per lane (8 B read, 16 B
+write).
+## Correctness
+gemm_pb_f16w on 5 shapes (512x1536x256; 37x100x45 with lda/ldc padding; 1x17x9; 300x896x4864; 64x2048x8) and
+ffn_f16w (70x256x640), GEN9BLAS_PKV=0 vs 1 in separate processes: output bytes identical. PKV=0 deterministic.
+## Measured (llama-bench -p 512 -n 0 -r 4 + warm-up = 5 passes, KCL_PROFILE_KERNELS sums over 5 passes, alternating)
+PKV=0  pk_a3 709 / 703 / 754 ms   epilogue 493 / 479 / 556 ms   pp512 175.9 / 175.9 / 166.8 (+-5.7 ... 14.5)
+PKV=1  pk_a3 452 / 467 / 499 / 448 epilogue (8/lane) 583 / 612; (4/lane) 469 / 396   pp512 180.4 / 170.3 / 164.1 / 183.4
+Per pass: packing 142 -> 93 ms (-35 %), epilogue 101 -> 87 ms (-14 %), together ~240 -> ~180 ms (~2 % of the pass).
+pp512 differences are inside the run-to-run noise (other sessions active, sd up to 14).
+## Against the prediction
+Falsified: packing reached 93 ms, not ~40; epilogue 87, not ~35. [HYP] the epilogue writes into the userptr C (host
+pages, snooped) and both kernels are short launches (193 per pass, ~0.5 ms each) where launch overhead and ramp-up
+weigh; a bigger saving needs fewer launches (pack A once for Q/K/V and gate/up; merged GEMMs) or no epilogue at all
+(GEMM writing F32 directly).
