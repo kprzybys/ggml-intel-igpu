@@ -1,0 +1,41 @@
+# /sys/class/drm/card1/engine/bcs0/preempt_timeout_ms = 640
+# /sys/class/drm/card1/engine/rcs0/preempt_timeout_ms = 640
+# /sys/class/drm/card1/engine/vcs0/preempt_timeout_ms = 640
+# /sys/class/drm/card1/engine/vecs0/preempt_timeout_ms = 640
+# host gp-laptop, 2026-11-13T22:22:40+01:00, load 1.58 1.02 1.19
+# whisper.cpp 5922450, backend ~/src/whisper.cpp/build-cpu/libggml-gen9-whisper-ew.so (9e33dd8bcaeb5e8c), -t 4 -bs 1 -bo 1, GEN9_ATTN=1 GEN9_EWOPS=1 (with MIN_BATCH 1 the elementwise ops also go to the GPU: best case for the GPU)
+# clip: ~/data/wl/janko60.wav first 60 s, 16000 Hz, 1 ch
+## GEN9_MIN_BATCH=8 round 1 (exit 0)
+whisper_print_timings:     fallbacks =   0 p /   0 h
+whisper_print_timings:   encode time = 16607.13 ms /     3 runs (  5535.71 ms per run)
+whisper_print_timings:   decode time =  9403.82 ms /   404 runs (    23.28 ms per run)
+whisper_print_timings:   batchd time =    77.47 ms /     6 runs (    12.91 ms per run)
+whisper_print_timings:   prompt time =   521.48 ms /   196 runs (     2.66 ms per run)
+whisper_print_timings:    total time = 27726.27 ms
+gen9: graph_compute 244; no-op nodes 720; MUL_MAT run: cached weight 400, packed now 233, per call 6; F16 weights 639 (recomputed in F32 after FP16 overflow: 0); weights over the cache budget, packed per use 0
+## GEN9_MIN_BATCH=1 round 1 (exit 0)
+whisper_print_timings:     fallbacks =   0 p /   0 h
+whisper_print_timings:   encode time = 16690.16 ms /     3 runs (  5563.39 ms per run)
+whisper_print_timings:   decode time = 16667.00 ms /   404 runs (    41.25 ms per run)
+whisper_print_timings:   batchd time =   310.17 ms /     6 runs (    51.70 ms per run)
+whisper_print_timings:   prompt time =   195.02 ms /   196 runs (     0.99 ms per run)
+whisper_print_timings:    total time = 34831.17 ms
+gen9: graph_compute 7146; no-op nodes 8840; MUL_MAT run: cached weight 13798, packed now 233, per call 6; F16 weights 14037 (recomputed in F32 after FP16 overflow: 0); weights over the cache budget, packed per use 0
+## GEN9_MIN_BATCH=8 round 2 (exit 0)
+whisper_print_timings:     fallbacks =   0 p /   0 h
+whisper_print_timings:   encode time = 16636.44 ms /     3 runs (  5545.48 ms per run)
+whisper_print_timings:   decode time =  9378.46 ms /   404 runs (    23.21 ms per run)
+whisper_print_timings:   batchd time =    77.20 ms /     6 runs (    12.87 ms per run)
+whisper_print_timings:   prompt time =   520.80 ms /   196 runs (     2.66 ms per run)
+whisper_print_timings:    total time = 27765.43 ms
+gen9: graph_compute 244; no-op nodes 720; MUL_MAT run: cached weight 400, packed now 233, per call 6; F16 weights 639 (recomputed in F32 after FP16 overflow: 0); weights over the cache budget, packed per use 0
+## GEN9_MIN_BATCH=1 round 2 (exit 0)
+whisper_print_timings:     fallbacks =   0 p /   0 h
+whisper_print_timings:   encode time = 16713.62 ms /     3 runs (  5571.21 ms per run)
+whisper_print_timings:   decode time = 16660.11 ms /   404 runs (    41.24 ms per run)
+whisper_print_timings:   batchd time =   303.25 ms /     6 runs (    50.54 ms per run)
+whisper_print_timings:   prompt time =   200.61 ms /   196 runs (     1.02 ms per run)
+whisper_print_timings:    total time = 34853.94 ms
+gen9: graph_compute 7146; no-op nodes 8840; MUL_MAT run: cached weight 13798, packed now 233, per call 6; F16 weights 14037 (recomputed in F32 after FP16 overflow: 0); weights over the cache budget, packed per use 0
+## transcripts identical? yes
+# done 2026-11-13T22:24:46+01:00

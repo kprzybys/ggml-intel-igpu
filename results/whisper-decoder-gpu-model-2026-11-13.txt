@@ -42,3 +42,19 @@ ceiling is ~1.2x on 26 % of the run (<= ~5 % end-to-end).
 One short A/B on gp (60 s clip, -t 4 -bs 1, same build): GEN9_MIN_BATCH=8 (today) vs 1, read whisper's own
 "decode time" per run, plus GEN9_INFO to confirm the M = 1 MUL_MATs really went to the GPU. ~3 min of gp,
 coordinated separately (whisper scripts, gp), no code change.
+
+## Measured (gp, 2026-11-13 22:22, results/whisper-decoder-gpu-ab-gp-2026-11-13-timings.txt; GEN9_INFO evidence in
+## results/whisper-decoder-gpu-ab-gp-2026-11-13.txt)
+janko60.wav (60 s), whisper.cpp 5922450, backend libggml-gen9-whisper-ew.so (sha256 9e33dd8b...), -t 4 -bs 1 -bo 1,
+GEN9_ATTN=1 GEN9_EWOPS=1, rounds A B A B, transcripts identical. GEN9_MIN_BATCH=1 really moved the decoder: MUL_MAT on
+the GPU 400 -> 13798, NORM 208 -> 5486, graph_compute 244 -> 7146.
+                     MIN_BATCH 8 (CPU decoder)   MIN_BATCH 1 (GPU decoder)
+decode, ms/token     23.28 / 23.21               41.25 / 41.24          -> 0.56x (GPU slower)
+prompt, ms/run        2.66 /  2.66                0.99 /  1.02          (small batches: GPU faster, 0.3 s per minute)
+batchd, ms/run       12.91 / 12.87               51.70 / 50.54
+total, s             27.73 / 27.77               34.83 / 34.85          -> +25 % end-to-end
+## Against the prediction
+Predicted 30-34 ms/token (0.7-0.8x); measured 41.2 ms (0.56x): the direction holds, the GPU side is ~8 ms worse than
+modelled (more submissions per token than 20-40: graph_compute 7146 / ~404 tokens ~ 17.7 graphs per token, each with
+its own waits). Falsification criterion (2) (decode <= 20 ms/token) not met -> topic (a) CLOSED: the whisper decoder
+stays on the CPU on gp. Side result: prompt (M ~ tens of tokens) is 2.6x faster on the GPU, but it is ~2 % of a run.

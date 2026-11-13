@@ -1,0 +1,33 @@
+# /sys/class/drm/card1/engine/bcs0/preempt_timeout_ms = 640
+# /sys/class/drm/card1/engine/rcs0/preempt_timeout_ms = 640
+# /sys/class/drm/card1/engine/vcs0/preempt_timeout_ms = 640
+# /sys/class/drm/card1/engine/vecs0/preempt_timeout_ms = 640
+# host gp-laptop, 2026-11-13T22:20:23+01:00, load 0.11 0.56 1.09
+# whisper.cpp 5922450, backend ~/src/whisper.cpp/build-cpu/libggml-gen9-whisper-ew.so (9e33dd8bcaeb5e8c), -t 4 -bs 1 -bo 1, GEN9_ATTN=1 GEN9_EWOPS=1 (with MIN_BATCH 1 the elementwise ops also go to the GPU: best case for the GPU)
+# clip: ~/data/wl/janko60.wav first 60 s, 16000 Hz, 1 ch
+## GEN9_MIN_BATCH=8 round 1 (exit 0)
+gen9: MUL_MAT groups on one input (Q/K/V) 0 covering 0 MUL_MATs; candidates refused for memory overlap 0; outputs recomputed in F32 after FP16 overflow 0
+gen9: whisper-type ops on the GPU: NORM 208 (with MUL+ADD fused 208), GELU 106; MUL_MAT with F16 activations 6
+gen9: elementwise ops on the GPU: RMS_NORM 0 (with MUL fused 0), ADD 734, MUL 0, ROPE 0; splits run with a wait per op (span not registered or GEN9_EW_SYNC) 0; supports_op asked 45856, declined 43848
+gen9: graph_compute 244; no-op nodes 720; MUL_MAT run: cached weight 400, packed now 233, per call 6; F16 weights 639 (recomputed in F32 after FP16 overflow: 0); weights over the cache budget, packed per use 0
+gen9: FFN blocks fused 0 (recomputed unfused after FP16 overflow: 0); SWIGLU alone 0; supports_op GLU asked 0, declined 0
+## GEN9_MIN_BATCH=1 round 1 (exit 0)
+gen9: MUL_MAT groups on one input (Q/K/V) 0 covering 0 MUL_MATs; candidates refused for memory overlap 0; outputs recomputed in F32 after FP16 overflow 0
+gen9: whisper-type ops on the GPU: NORM 5486 (with MUL+ADD fused 5486), GELU 1730; MUL_MAT with F16 activations 6
+gen9: elementwise ops on the GPU: RMS_NORM 0 (with MUL fused 0), ADD 17380, MUL 0, ROPE 0; splits run with a wait per op (span not registered or GEN9_EW_SYNC) 0; supports_op asked 36112, declined 0
+gen9: graph_compute 7146; no-op nodes 8840; MUL_MAT run: cached weight 13798, packed now 233, per call 6; F16 weights 14037 (recomputed in F32 after FP16 overflow: 0); weights over the cache budget, packed per use 0
+gen9: FFN blocks fused 0 (recomputed unfused after FP16 overflow: 0); SWIGLU alone 0; supports_op GLU asked 0, declined 0
+## GEN9_MIN_BATCH=8 round 2 (exit 0)
+gen9: MUL_MAT groups on one input (Q/K/V) 0 covering 0 MUL_MATs; candidates refused for memory overlap 0; outputs recomputed in F32 after FP16 overflow 0
+gen9: whisper-type ops on the GPU: NORM 208 (with MUL+ADD fused 208), GELU 106; MUL_MAT with F16 activations 6
+gen9: elementwise ops on the GPU: RMS_NORM 0 (with MUL fused 0), ADD 734, MUL 0, ROPE 0; splits run with a wait per op (span not registered or GEN9_EW_SYNC) 0; supports_op asked 45856, declined 43848
+gen9: graph_compute 244; no-op nodes 720; MUL_MAT run: cached weight 400, packed now 233, per call 6; F16 weights 639 (recomputed in F32 after FP16 overflow: 0); weights over the cache budget, packed per use 0
+gen9: FFN blocks fused 0 (recomputed unfused after FP16 overflow: 0); SWIGLU alone 0; supports_op GLU asked 0, declined 0
+## GEN9_MIN_BATCH=1 round 2 (exit 0)
+gen9: MUL_MAT groups on one input (Q/K/V) 0 covering 0 MUL_MATs; candidates refused for memory overlap 0; outputs recomputed in F32 after FP16 overflow 0
+gen9: whisper-type ops on the GPU: NORM 5486 (with MUL+ADD fused 5486), GELU 1730; MUL_MAT with F16 activations 6
+gen9: elementwise ops on the GPU: RMS_NORM 0 (with MUL fused 0), ADD 17380, MUL 0, ROPE 0; splits run with a wait per op (span not registered or GEN9_EW_SYNC) 0; supports_op asked 36112, declined 0
+gen9: graph_compute 7146; no-op nodes 8840; MUL_MAT run: cached weight 13798, packed now 233, per call 6; F16 weights 14037 (recomputed in F32 after FP16 overflow: 0); weights over the cache budget, packed per use 0
+gen9: FFN blocks fused 0 (recomputed unfused after FP16 overflow: 0); SWIGLU alone 0; supports_op GLU asked 0, declined 0
+## transcripts identical? yes
+# done 2026-11-13T22:22:29+01:00
