@@ -67,3 +67,6 @@ Fix for the hypothesis (next commit): a GEN9 split with elementwise ops but no M
 on ggml-cpu inside GEN9 (no wait of their own); GEN9_EW_LONE_GPU=1 keeps them on the GPU (needed by test-backend-ops,
 whose graphs are such splits: with it NORM 27, GELU 3, ADD 26, RMS_NORM 37, ROPE 138 OK, 0 FAIL). llama.cpp Qwen: 0 such
 splits, perplexity 15.2610 unchanged. Whisper decoder: to be measured separately.
+Whole pl60 on gp (whisper large-v3-turbo, encoder + decoder, -bs 1 -bo 1), with 30bbea4 (before 350d801):
+  EWOPS=1 / =0: 256 / 261 s (-1.9 %), energy 4.31 / 4.73 kJ (-8.9 %), WER unchanged; NORM 2587 (all fused with MUL+ADD),
+  GELU 1258, MUL_MAT with F16 src1 66, ADD 9017; graph_compute 2983 vs 7722 (fewer splits).
