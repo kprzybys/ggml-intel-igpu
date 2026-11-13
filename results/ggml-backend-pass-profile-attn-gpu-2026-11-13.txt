@@ -11,17 +11,20 @@ gen9blas_epilog_hf8                78 ms    3.4 %
 k_attn + k_kt (flash attention)    77 ms    3.3 %   28 per pass (265 GFLOPS incl. pinning/submit/wait, GEN9_INFO)
 sum                              2106 ms   90.4 %
 GPU idle                         ~225 ms    9.6 %
-## The idle time is submission, not CPU ops (KCL_PHASES=1)
-execbuf ioctl: 1298 calls (221 per pass + 193 first-use dequant), 0.74-0.83 ms wall each, all of it CPU time in the
-kernel (softpin + NO_RELOC already; ~9-10 objects per execbuf). 221 x 0.74-0.83 = 165-185 ms per pass = 7-8 %.
-With GEN9BLAS_NO_USERPTR=1 (copies instead of userptr): execbuf still 0.67 ms, pp512 193.5 -> userptr pinning is
-not the cause. GEM_WAIT: CPU 28-48 us per call (sleeping wait, fine).
-Left for CPU ops (norms, RoPE, adds, get_rows) and the rest: ~40-60 ms per pass (~2 %).
+## The idle time is NOT submission (corrected the same evening)
+KCL_PHASES=1 gave execbuf 0.74-0.83 ms wall per call over 1298 calls. First reading (wrong): 221 per pass x 0.75 ms =
+7-8 % of the pass. The average hides a split: perf with kernel symbols (GEMM an earlier run, perf_event_paranoid=1):
+i915_gem_do_execbuffer 908 ms total with -r 1 and 909 ms with -r 6, i.e. independent of the number of passes; of it
+shmem_get_pages (allocating and zeroing the pages of new objects at their first bind) 818 / 781 ms, all in the 193
+first-use submissions (fresh packed-weight buffers, ~3 GB). The rest: 90 vs 128 ms -> ~8 ms per extra pass =
+~0.035 ms per submission = ~0.3 % of a pass [MEAS, perf data in that session's scratchpad].
+Lesson: a per-call average over a run that mixes one-time and steady-state calls says nothing about steady state;
+vary the number of passes (-r 1 vs -r 6) and take the difference.
+With GEN9BLAS_NO_USERPTR=1 execbuf was 0.67 ms on average, pp512 193.5 (copies cost more).
+Still unexplained: ~225 ms per pass (~9.6 %) with the GPU idle. perf: 76 % of samples at one user-space address
+(likely an OpenMP spin / wait), so: synchronisation and CPU ops, to be split separately.
 ## Reading
 - GEMM is 80 % of the pass and issue-bound (~10 % headroom inside the kernel = ~8 % of the pass).
-- The largest item outside the GEMM is the execbuf ioctl: ~0.75 ms of kernel CPU per submission while the GPU waits.
-  Unknown why it costs that much for ~9 softpinned objects [open: i915 per-object work, batch size, or fences].
-  Levers: find the cost (e.g. ftrace/perf on i915_gem_do_execbuffer needs root), or submit the next independent op
-  before waiting (Q/K/V GEMMs share an input) so the ioctl overlaps GPU work.
-- Activation packing + epilogue 7 %; attention 3 %; CPU ops ~2 %.
+- ~9.6 % GPU idle per pass, cause open (waits / CPU ops), not submission cost.
+- Activation packing + epilogue 7 %; attention 3 %.
 - No single new kernel has more than ~8 % of the pass to gain.
