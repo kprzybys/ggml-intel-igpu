@@ -1,0 +1,21 @@
+# Where a pp512 pass goes: Qwen2.5-1.5B-Instruct Q4_K_M, GEN9 backend at 651fb9b, UHD 620, 2026-11-13 (laptop idle
+# otherwise). llama-bench -p 512 -n 0 -r 4 (+ warm-up = 5 passes): 183.75 +- 2.13 t/s -> 2786 ms per pass.
+## GPU kernel time per pass (KCL_PROFILE_KERNELS=1, sums / 5 passes; dequantization is first use only)
+hgemm_kc_v (all weight GEMMs)   2002 ms   72 %     965 launches = 193 per pass
+pk_a3_f32 (activation packing)   141 ms    5 %
+gen9blas_epilog_hf               97 ms    3.5 %
+no GPU kernel running           ~545 ms   19.5 %  (CPU ops: flash attention ~350 ms per earlier files, norms, RoPE,
+                                                    adds, plus synchronisation)
+GEMM rate: ~1300 GFLOP per pass (results/ggml-backend-step1-f16-*) / 2.0 s = ~650 GFLOPS.
+## OA counters (bench/oa.sh -n 1 -b 95, reports with GpuBusy > 95 %, i.e. mostly hgemm_kc_v)
+1160 busy reports, GPU time 4080 ms, clock 1077 MHz
+EU active 91.4 %  stall 4.9 %  idle 3.7 %  occupancy 92.1 %
+FPU both 80.8 % (88 % of active)  FPU0 86.6 %  FPU1 85.3 %  send 3.3 %  IPC 1.87
+L3 79.6 GB/s  GTI read 11.7 GB/s  write 2.7 GB/s  SLM read 17.5 GB/s
+-> FP16 peak at 1077 MHz = 827 GFLOPS; x 0.808 (FPU both) = 668, matching the ~650 measured. The GEMM keeps both FPUs
+   busy 81 % of the time with < 5 % stall and < 4 % idle EUs: no work-split or memory problem. What is left (12 % of
+   active cycles not dual-issuing: address/block-read instructions; 9 % not active) is within ~10 % of the ceiling.
+## Conclusion
+More GEMM kernel work buys at most ~10 % of 72 %. The pass has 20 % with the GPU idle (CPU attention -> the stage 3
+work of the other session) and 8.5 % of activation packing + epilogues (the fused FFN removes part of it but loses to
+the shared power budget, results/ggml-backend-ffn-fusion-*).
