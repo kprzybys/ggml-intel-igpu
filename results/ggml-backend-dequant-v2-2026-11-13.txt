@@ -50,3 +50,22 @@ Qwen2.5-7B Q4_K_M, default cache budget, llama-bench -p 512 -n 0 -r 2, alternati
   pair 3: 30.63 +- 0.55 / 35.93 +- 0.31 t/s, 15.39 / 8.75 s; peak used memory 10703 / 10802 MB (+0.1 GB)
   -> +14-17 % pp512 (prediction +10-20 %: hit). Perplexity (-c 512 --chunks 10): 11.9242, identical to before;
   71.4 s per pass (before: 79.5).
+
+## v2b: 16 B loads and SLM bank-conflict fixes (later the same day)
+[HYP] phase-1 byte gathers are the limit: 16 B loads (Q8_0 / Q4_K: 272 / 144 B chunks, 16 B aligned; Q6_K 210 B only
+2 B aligned -> 2 B loads) -> kernel 2x.
+Steps (kernel-only ms per call, K=1536 N=8960; test_dequant.py errors 0 after each):
+  start (v2c above)                            Q8_0 6.0  Q4_K 6.2  Q6_K 5.4
+  16 B / 2 B phase-1 loads                     3.8       6.0       3.75   (prediction hit for Q8_0/Q6_K, not Q4_K)
+  SLM row stride chunk + 4 B (Q8_0/Q4_K)       3.2       5.2       3.7    lanes read rows 0,2,..,14: 2 x 144 B = 72 dwords
+                                                                          -> only banks 0 and 8 (4-way conflict)
+  parameter arrays stride 17 / 9 (was 16 / 8)  2.2       2.4       3.4    same rows hit one bank (8-way)
+Kernel-only now 12.5 / 11.4 / 8.1 GB/s FP16 out; wall per call with spare buffers 2.8 / 3.0 / 3.9 ms.
+Lesson: bank conflicts in SLM, not global memory, were most of the gap; the store layout (c above) never was.
+GEN9_DEQ_VERIFY=1: Qwen Q4_K_M 193, Llama 109, Gemma 179, Qwen Q8_0 193 weights -> 0 differ.
+Qwen2.5-1.5B Q4_K_M first use: v1 2.06 s, v2b 1.31 s (pp512 178.8 / 186.7).
+Qwen2.5-7B Q4_K_M (spare buffers on; 5.3-5.5 GB in swap from earlier runs, so noisy), pp512 t/s and dequant s (3 passes):
+  v1  33.02 (17.2 s)  33.82 (15.9 s)  34.34 (12.5 s)
+  v2b  4.79 (17.8 s, outlier)  38.18 (8.3 s)  37.16 (7.5 s)  29.27 +- 12.83 (6.7 s)
+  -> clean runs +10-13 % over v1 (and +20-25 % over the morning's 29-30 without spare buffers). The 4.79 run is not
+  explained; it coincides with the swap at 5.4 GB and other noisy runs (+-12); to be re-checked on a quiet machine.
