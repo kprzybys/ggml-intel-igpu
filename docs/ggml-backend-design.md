@@ -210,6 +210,27 @@ spinning meanwhile under the shared 15 W budget; step 2 measures a CPU/GPU round
 So token generation on the GPU pays off only with per-split submission and mostly for F16 and smaller types; F32 may
 not beat the CPU and will not reach Vulkan's 3.87 t/s. This is the main uncertainty of step 2.
 
+**Measured 2026-11-13 (F16, before writing step 2)** [MEAS]: one token replayed as its 197 FP16 GEMVs with the existing
+`skinny_k1` on USM (`bench/token_gemv.py`, `bench/token_submit.py`; `results/token-gemv-2026-11-13-quiet.txt`,
+`results/token-submit-2026-11-13*.txt`). Activations are FP16 here (F32 in the backend) and the CPU ops are left out.
+
+| waits for the GPU per token | ms / token | t/s |
+|---|---|---|
+| 197 (one per GEMV) | 150-193 (machine state: 170-390 us per wait) | 5.2-6.7 |
+| 169 (one per split, this section's plan) | 176-180 | 5.6-5.7 |
+| 29 (one per layer) | 140-145 | 6.9-7.2 |
+| 1 (one per token) | 115-120 | 8.3-8.7 |
+| summed kernel time | 114-120 (26-27 GB/s of weights) | |
+| llama.cpp CPU tg F16 (`llama-cpp-openvino-2026-11-13.txt`) | 145 | 6.9 |
+
+Consequences: (1) the GEMV kernel is at the RAM ceiling (~27 GB/s), so a new packed GEMV (`gemv_pb`) can save at most
+~2-5 ms per token and is dropped as a goal; the M = 1 path stays `skinny_k1`. (2) One submission per split saves
+about 5 %: the bias ADDs after Q, K and V keep the splits almost one per MUL_MAT. (3) Beating the CPU needs the token
+to run with few waits, i.e. the CPU ops between MUL_MATs (bias ADD, RMSNorm, RoPE, attention, SwiGLU) on the GPU;
+one wait per layer only ties with the CPU, one per token gives about +25 %. Step 2 is redefined accordingly. The OpenVINO
+GEMV kernel (`fully_connected_gpu_gemv.cl`, master 56346f1a) handles only INT4/UINT4 weights, so it is a reference
+for step 3 (quantized types), not for F16; its weight layout `os_iyx_osv16` matches our packed B.
+
 ### 6.3 Falsification criteria (set now)
 
 - Step 1: D0/F16 pp512 below 130 t/s, or D0/F32 below 100 t/s, in alternating runs against the BLAS path; perplexity

@@ -1,0 +1,11 @@
+# 197 GEMVs per token, 3.087 GB FP16 weights; power online=1
+round mode     wall_med  wall_min  cpu_med  kernels  [ms/token]   GB/s(kernels)
+0     plain       436.0     329.9     36.0  
+0     profile     447.4     358.2     34.6     165.3    18.7
+1     profile     210.2     193.6     30.5     145.5    21.2
+1     plain       241.8     195.4     38.4  
+2     plain       214.0     184.9     35.3  
+2     profile     547.0     458.9     54.4     170.7    18.1
+
+median: wall 241.8 ms/token (4.14 t/s), CPU 36.0 ms, kernels 165.3 ms (18.7 GB/s), wall - kernels 76.5 ms = 388 us per submission
+decision (from the review): kernels > 125 ms -> no kernel beats the CPU (145 ms); kernels <= 125 and wall > 145 -> work on submissions; otherwise -> microbenchmark gemv_pb

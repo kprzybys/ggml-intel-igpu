@@ -1,0 +1,7 @@
+# 197 GEMVs, 3.087 GB FP16; deferred enqueue of a whole token: 27.22 ms (shim active)
+# 5 rounds x 5 tokens, modes rotated; reference: kernels 117 ms (token-gemv-2026-11-13-quiet.txt), CPU llama.cpp 145 ms
+mode       waits  wall_med  wall_min  cpu_med  [ms/token]   t/s   overhead/wait vs 117 ms
+per_gemv     197     192.6     157.1     49.6    5.19      384 us
+per_split    169     180.2     150.6     41.8    5.55      374 us
+per_layer     29     144.7     127.1     18.4    6.91      955 us
+one            1     120.2     114.9     25.9    8.32     3160 us
