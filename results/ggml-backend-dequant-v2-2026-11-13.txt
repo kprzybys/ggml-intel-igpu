@@ -37,3 +37,16 @@ GEN9_DEQ_VERIFY=1 (GPU v2 vs CPU path, every weight): Qwen Q4_K_M 193, Llama 109
 - First use 0.7-1.2 s: falsified, 1.81 s; half of each call is buffer allocation/zeroing and userptr, not the kernel.
 - 7B pp512 32-36 t/s: falsified, unchanged (29-32). The per-use path is dominated by the per-call overhead.
 Next: reuse the output buffer of per-use packings (no allocation/zeroing per use), then re-measure 7B.
+
+## Spare packed buffers (gen9blas_packed_free keeps up to 4 freed buffers, GEN9BLAS_SPARE_MB, default 512)
+[HYP, written after the v2 measurement] per-use packings skip allocation + page zeroing: 7B dequantization roughly
+halves, pp512 +10-20 %.
+Per call (K=1536 N=8960, dqbench, wall): Q4_K 13.4 -> 7.0 ms, Q6_K 14.7 -> 6.2 ms.
+Dirty-buffer test (pack 2048x2048 of 3e4 / 1e30, free, then pack odd shapes into the reused buffer; HS, H, S):
+12 of 12 shapes match NumPy -> no packing relies on a zeroed buffer. test_packed.py, test_basic.py, test_dequant.py pass.
+Qwen2.5-7B Q4_K_M, default cache budget, llama-bench -p 512 -n 0 -r 2, alternating GEN9BLAS_SPARE_MB=0 / 512:
+  pair 1 (swap still settling after earlier runs): 21.41 +- 11.79 / 28.70 +- 9.99 -> discarded
+  pair 2: 30.86 +- 0.17 / 35.24 +- 0.82 t/s, dequantization (3 passes) 16.47 / 12.38 s
+  pair 3: 30.63 +- 0.55 / 35.93 +- 0.31 t/s, 15.39 / 8.75 s; peak used memory 10703 / 10802 MB (+0.1 GB)
+  -> +14-17 % pp512 (prediction +10-20 %: hit). Perplexity (-c 512 --chunks 10): 11.9242, identical to before;
+  71.4 s per pass (before: 79.5).
