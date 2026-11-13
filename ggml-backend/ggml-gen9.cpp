@@ -45,6 +45,7 @@ static std::atomic<double> t_dequant_s{0}, t_deq_alloc_s{0}, t_deq_cpu_s{0}, t_d
 static std::atomic<long> n_fa_asked{0}, n_fa_off{0}, n_fa_decl_type{0}, n_fa_decl_param{0}, n_fa_decl_shape{0}, n_fa_decl_layout{0},
                          n_fa_decl_nq{0}, n_fa_decl_mask{0}, n_fa_decl_gpu{0};
 static std::atomic<long> n_fa_gpu{0}, n_fa_launch{0}, n_fa_rows{0}, n_fa_cpu_mask{0}, n_fa_cpu_rows{0}, n_fa_cpu_lib{0}, n_fa_cpu_err{0};
+static std::atomic<long> n_fa_tail{0}, n_fa_cpu_tail{0};   // n_k not a multiple of 16: rounded up on the GPU / V tail not finite
 static std::atomic<double> t_fa_gpu_s{0}, t_fa_mask_s{0}, t_fa_cpu_s{0}, fa_flop{0};
 
 static void gen9_report(void) {
@@ -69,6 +70,8 @@ static void gen9_report(void) {
             "identity %ld, library declined %ld, GPU error %ld (%.3f s)\n", n_fa_gpu.load(), n_fa_launch.load(), n_fa_rows.load(),
             t_fa_gpu_s.load(), fa_flop.load() * 1e-9, t_fa_gpu_s.load() > 0 ? fa_flop.load() * 1e-9 / t_fa_gpu_s.load() : 0.0,
             t_fa_mask_s.load(), n_fa_cpu_mask.load(), n_fa_cpu_rows.load(), n_fa_cpu_lib.load(), n_fa_cpu_err.load(), t_fa_cpu_s.load());
+    fprintf(stderr, "gen9: FLASH_ATTN_EXT with n_k not a multiple of 16: rounded up on the GPU %ld, V tail not finite -> ggml-cpu %ld\n",
+            n_fa_tail.load(), n_fa_cpu_tail.load());
 }
 
 // ---------------- GPU (lazy: first use) ----------------
@@ -343,9 +346,21 @@ static bool gen9_try_ffn(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
 // pattern (0 then -inf in every row; llama.cpp's single-sequence causal mask, or no mask); with kv_rows the listed rows
 // must be the identity over the visible columns. Anything else (several sequences, holes after a context shift, SWA,
 // a mask with other values) is computed by ggml-cpu inside this backend (counted).
+// n_k need not be a multiple of 16 when there is no mask and the KV tensor behind the views has the rows up to the next
+// multiple (whisper.cpp's encoder: 1500 keys, buffer of 1536 rows); see fa_rows_behind.
 static bool attn_on(void) { static const bool v = getenv("GEN9_ATTN") && atoi(getenv("GEN9_ATTN")) != 0; return v; }
 
 static float fa_param(const struct ggml_tensor * op, int i) { float v; memcpy(&v, (const float *) op->op_params + i, sizeof v); return v; }
+
+// Key rows of K / V readable behind the view: rows up to the end of the tensor the view points into (view_src is the
+// root tensor in ggml). A key count that is not a multiple of 16 (whisper.cpp's encoder: n_k = 1500 in a KV buffer
+// padded to 1536 rows and zeroed at creation) is rounded up to 16 when these rows exist; the kernel masks keys >= vis0
+// by substitution (-1e30 into the score lanes, asm/attn_gen.py mask()), so whatever K holds there is harmless, but
+// p = 0 times a non-finite V value is NaN: the V tail is checked at compute time (gen9_flash_attn).
+static int64_t fa_rows_behind(const struct ggml_tensor * t, size_t row) {
+    if (!t->view_src) return t->ne[1];
+    return (int64_t) ((ggml_nbytes(t->view_src) - t->view_offs) / row);
+}
 
 static bool gen9_supports_fa(const struct ggml_tensor * op) {
     n_fa_asked++;
@@ -355,11 +370,15 @@ static bool gen9_supports_fa(const struct ggml_tensor * op) {
     if (op->src[4] || fa_param(op, 1) != 0.0f || fa_param(op, 2) != 0.0f) { n_fa_decl_param++; return false; }
     const int64_t D = q->ne[0], nq = q->ne[1], H = q->ne[2], nk = k->ne[1], HKV = k->ne[2];
     if (k->ne[0] != D || v->ne[0] != D || v->ne[1] != nk || v->ne[2] != HKV || q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 ||
-        HKV <= 0 || H % HKV || nk % 16 || nk > INT_MAX || !gpu_ok() || !gen9blas_attn_supported((int) D, (int) H, (int) HKV)) {
+        HKV <= 0 || H % HKV || nk > INT_MAX || !gpu_ok() || !gen9blas_attn_supported((int) D, (int) H, (int) HKV)) {
         if (!gpu_ok()) n_fa_decl_gpu++; else n_fa_decl_shape++;
         return false;
     }
     const size_t row = (size_t) (HKV * D * 2);
+    if (nk % 16) {   // only without a mask (a mask has n_k columns) and with the rounded-up rows behind both views
+        const int64_t nk16 = (nk + 15) / 16 * 16;
+        if (m || rows || fa_rows_behind(k, row) < nk16 || fa_rows_behind(v, row) < nk16) { n_fa_decl_shape++; return false; }
+    }
     if (q->nb[0] != 4 || q->nb[1] != (size_t) (H * D * 4) || q->nb[2] != (size_t) (D * 4) || k->nb[0] != 2 || k->nb[1] != row ||
         k->nb[2] != (size_t) (D * 2) || v->nb[0] != 2 || v->nb[1] != row || v->nb[2] != (size_t) (D * 2) || !ggml_is_contiguous(op) ||
         op->ne[0] != D || op->ne[1] != H || op->ne[2] != nq || op->ne[3] != 1) { n_fa_decl_layout++; return false; }
@@ -431,7 +450,17 @@ static void gen9_flash_attn(gen9_context * ctx, struct ggml_cgraph * cg, int i) 
     }
     auto t1 = std::chrono::steady_clock::now();
     t_fa_mask_s = t_fa_mask_s + std::chrono::duration<double>(t1 - t0).count();
-    const int nk = (int) std::min<int64_t>((vmax + 15) / 16 * 16, k->ne[1]);   // key rows the kernel reads (multiple of 16)
+    int nk = (int) std::min<int64_t>((vmax + 15) / 16 * 16, k->ne[1]);   // key rows the kernel reads (multiple of 16)
+    if (nk % 16) {   // n_k itself not a multiple of 16 (no mask, checked in supports_op): read the rows behind the view
+        nk = (nk + 15) / 16 * 16;
+        bool fin = true;   // keys >= vis0 get p = 0, but 0 * Inf/NaN in V is NaN: their V rows must be finite
+        for (int64_t j = vmax; j < nk && fin; j++) {
+            const uint16_t * r = (const uint16_t *) ((const char *) v->data + j * v->nb[1]);
+            for (int64_t x = 0; x < (int64_t) HKV * D; x++) if ((r[x] & 0x7C00) == 0x7C00) { fin = false; break; }   // exponent all ones
+        }
+        if (!fin) { n_fa_cpu_tail++; fa_on_cpu(ctx, cg, i); return; }
+        n_fa_tail++;
+    }
     // pin the whole KV tensor behind the view (its first row is the view's first row in llama.cpp)
     auto reg_bytes = [](const struct ggml_tensor * t) {
         const struct ggml_tensor * b = t->view_src ? t->view_src : t;

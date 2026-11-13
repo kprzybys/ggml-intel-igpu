@@ -7,7 +7,12 @@
 // Usage: GEN9_ATTN=1 test_attn <libggml-gen9.so> <D> <H> <HKV> <n_q> <depth> <kv_size> [mode] [qrange]
 //   mode: causal (default: token t sees cells 0 .. depth+t), full (no mask), rows (kv_rows = identity list + causal
 //         mask over its columns), hole (causal with cell 3 masked for every token: must fall back to ggml-cpu),
-//         nonpad (n_kv = depth + n_q, not padded to 256: declined if not a multiple of 16)
+//         nonpad (n_kv = depth + n_q, not padded to 256: declined if not a multiple of 16 and masked),
+//         whisper (no mask, n_kv = depth + n_q not a multiple of 16, kv_size >= the next multiple: whisper.cpp's
+//         encoder, e.g. 64 20 20 1500 0 1536; the rows behind n_kv are zero as in its kv_pad buffer),
+//         whispernan (as whisper, V rows n_kv.. set to NaN: the GPU must not be used, the result must stay finite);
+//         the whisper shape with mode causal (64 20 20 512 0 1536) must be computed by ggml-cpu ("library declined"):
+//         with G 1 < RQ 4 a subgroup holds 4 tokens and the kernel takes the visible key count of the first one
 //   qrange: Q uniform in [-qrange, qrange] (default 1; 20 = large logits as test_flash_attn_ext_large_logits)
 // Output: supports_op, NMSE (test-backend-ops metric, its FLASH_ATTN_EXT bound is 5e-4), max |gpu - cpu| / max |cpu|,
 // wall times. GEN9_INFO=1 prints the backend's counters at exit.
@@ -25,11 +30,12 @@
 #include <vector>
 
 int main(int argc, char ** argv) {
-    if (argc < 8) { fprintf(stderr, "usage: %s lib D H HKV n_q depth kv_size [causal|full|rows|hole|nonpad] [qrange]\n", argv[0]); return 2; }
+    if (argc < 8) { fprintf(stderr, "usage: %s lib D H HKV n_q depth kv_size [causal|full|rows|hole|nonpad|whisper|whispernan] [qrange]\n", argv[0]); return 2; }
     const int D = atoi(argv[2]), H = atoi(argv[3]), HKV = atoi(argv[4]), nq = atoi(argv[5]), depth = atoi(argv[6]), kv_size = atoi(argv[7]);
     const std::string mode = argc > 8 ? argv[8] : "causal";
     const float qrange = argc > 9 ? atof(argv[9]) : 1.0f;
-    int n_kv = mode == "nonpad" ? depth + nq : (depth + nq + 255) / 256 * 256;
+    const bool whisper = mode == "whisper" || mode == "whispernan";
+    int n_kv = mode == "nonpad" || whisper ? depth + nq : (depth + nq + 255) / 256 * 256;
     if (n_kv > kv_size) n_kv = kv_size;
     ggml_backend_reg_t reg = ggml_backend_load(argv[1]);
     if (!reg) { fprintf(stderr, "cannot load %s\n", argv[1]); return 1; }
@@ -45,7 +51,7 @@ int main(int argc, char ** argv) {
     ggml_tensor * qcur = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, H, nq);
     const bool rows_mode = mode == "rows";
     ggml_tensor * rows = rows_mode ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, 1) : nullptr;
-    ggml_tensor * mask = mode == "full" ? nullptr : ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, nq);
+    ggml_tensor * mask = mode == "full" || whisper ? nullptr : ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, nq);
     // views as in llama_kv_cache::get_k / get_v (flash attention: V not transposed) and build_attn_mha
     const int64_t nrows = rows_mode ? kv_size : n_kv;
     ggml_tensor * k = ggml_view_4d(ctx, kc, D, HKV, nrows, 1, D * 2, row, row * nrows, 0);
@@ -73,6 +79,11 @@ int main(int argc, char ** argv) {
     std::vector<ggml_fp16_t> h((size_t) HKV * D * kv_size);
     for (auto & x : h) { x = ggml_fp32_to_fp16(u(rng)); } memcpy(kc->data, h.data(), ggml_nbytes(kc));
     for (auto & x : h) { x = ggml_fp32_to_fp16(u(rng)); } memcpy(vc->data, h.data(), ggml_nbytes(vc));
+    if (whisper) {   // rows behind n_kv: zero (whisper.cpp clears kv_pad once), or NaN in V for whispernan
+        memset((char *) kc->data + (size_t) n_kv * row, 0, (size_t) (kv_size - n_kv) * row);
+        ggml_fp16_t f = ggml_fp32_to_fp16(mode == "whispernan" ? NAN : 0.0f);
+        for (size_t i = (size_t) n_kv * HKV * D; i < (size_t) kv_size * HKV * D; i++) ((ggml_fp16_t *) vc->data)[i] = f;
+    }
     for (int64_t i = 0; i < ggml_nelements(qcur); i++) ((float *) qcur->data)[i] = qrange * u(rng);
     if (rows) for (int c = 0; c < n_kv; c++) ((int32_t *) rows->data)[c] = c < depth + nq ? c : -1;
     if (mask) {
