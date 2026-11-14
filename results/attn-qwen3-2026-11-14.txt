@@ -25,8 +25,69 @@ Qwen2.5-1.5B (12/2/128) attn 37.93 / 37.97 ms/layer = 318.6 / 318.2 GFLOPS; k_kt
 -> Qwen3 runs 3-4 % lower per GFLOP; k_kt is 4x larger (8 KV heads vs 2) and ~4 % of the layer.
 Short shapes: d0 n_q 512: 282 GFLOPS (3.81 ms/layer); n_q 75 n_k 128: 130 GFLOPS (too little work to fill the GPU).
 
-## Not measured yet
-End to end (llama.cpp with the GEN9 backend, Qwen3-Embedding-0.6B in llama-server --embedding, and Qwen3 LLM prefill).
-Expected share of attention in embedding chunks of ~300-500 tokens: ~5-6 % of the FLOP [EST: 4*(n/2)*D*H*layers per
-token vs ~0.88 GFLOP of weights per token], so the embedding gain from this kernel is small; long-context LLM prefill
-(Qwen3-0.6B/1.7B) is where it pays, as for Qwen2.5 (docs/attention-gpu.md sections 11 and 13).
+## End to end on the second laptop UHD 620, 2026-11-14 03:11-03:23 (lib/backend built there from d380001 with
+## IGC 17537: lib/kernels.c sha256 identical to the first laptop's build), llama.cpp 2cbe0ec, -t 4, -fa on, -ngl 0
+
+Qwen3-Embedding-0.6B Q8_0, llama-server --embedding --pooling last -c 8192 -b 2048 -ub 512, chunks of 1500 chars
+(alternately Polish narration and English technical text, ~550 tokens each), GEN9_ATTN 0, 1, 1, 0:
+                                   ATTN=0            ATTN=1            change
+  32 texts, one per request        380 / 363 tok/s   496 / 491 tok/s   +30 %   (0.66-0.69 -> 0.89-0.90 chunks/s)
+  64 texts in one request          408 / 377 tok/s   408 / 394 tok/s    ~0     (several sequences in one ubatch:
+                                                                                 the mask is block-diagonal, the
+                                                                                 library declines, attention on CPU)
+  GPU attention per server run: 1596 launches (all with kv_rows), 1402 GFLOP at 260 GFLOPS incl. pinning/submit.
+  Embeddings GPU vs CPU attention (12 texts, first laptop): cosine >= 0.999995.
+  The estimate above (attention ~5-6 % of the FLOP) undershot: CPU flash attention at ~550-token chunks costs far more
+  than its FLOP share, so moving it gives +30 %.
+
+Qwen3-1.7B Q8_0, llama-bench pp512 -r 3 (ATTN order alternating per depth):
+                 ATTN=0           ATTN=1           prompt time
+  d0             158.83 +- 0.66   210.97 +- 0.19   -25 %
+  d2048           78.91 +- 0.17   158.20 +- 0.32   -50 %
+  d3584           67.88 +- 0.52   131.27 +- 1.26   -48 %
+  GPU attention: 257.6 (d0) / 301.1 (d2048) / 295.9 (d3584) GFLOPS incl. pinning/submit/wait; no node fell back.
+
+Raw log:
+## embeddings (llama-server --embedding --pooling last, -c 8192 -b 2048 -ub 512)
+# 03:11:42 load 0.48 0.34 0.29 gpu 983 MHz GEN9_ATTN=0
+batch n=64: 65.48 s, 0.98 chunks/s, 408 tok/s (26727 tokens)
+single n=32: 46.28 s, 0.69 chunks/s, 380 tok/s (17595 tokens)
+gen9: supports_op FLASH_ATTN_EXT asked 3444, declined: GEN9_ATTN off 3444, type 0, ALiBi/softcap/sinks 0, shape/no binary 0, layout 0, n_q<32 0, mask/kv_rows shape 0, no GPU 0
+gen9: FLASH_ATTN_EXT run on the GPU 0 (0 launches, 0 with kv_rows), 0.000 s, 0.0 GFLOP (0.0 GFLOPS incl. pinning/submit/wait); mask analysis 0.000 s; computed by ggml-cpu inside GEN9: mask not causal/
+# 03:13:47 load 2.91 1.31 0.66 gpu 1067 MHz GEN9_ATTN=1
+batch n=64: 65.48 s, 0.98 chunks/s, 408 tok/s (26727 tokens)
+single n=32: 35.45 s, 0.90 chunks/s, 496 tok/s (17595 tokens)
+gen9: supports_op FLASH_ATTN_EXT asked 3444, declined: GEN9_ATTN off 0, type 0, ALiBi/softcap/sinks 0, shape/no binary 112, layout 0, n_q<32 252, mask/kv_rows shape 0, no GPU 0
+gen9: FLASH_ATTN_EXT run on the GPU 1596 (1596 launches, 1596 with kv_rows), 5.387 s, 1402.3 GFLOP (260.3 GFLOPS incl. pinning/submit/wait); mask analysis 0.143 s; computed by ggml-cpu inside GEN9: ma
+# 03:15:42 load 3.78 2.24 1.08 gpu 1050 MHz GEN9_ATTN=1
+batch n=64: 67.91 s, 0.94 chunks/s, 394 tok/s (26727 tokens)
+single n=32: 35.84 s, 0.89 chunks/s, 491 tok/s (17595 tokens)
+gen9: supports_op FLASH_ATTN_EXT asked 3444, declined: GEN9_ATTN off 0, type 0, ALiBi/softcap/sinks 0, shape/no binary 112, layout 0, n_q<32 252, mask/kv_rows shape 0, no GPU 0
+gen9: FLASH_ATTN_EXT run on the GPU 1596 (1596 launches, 1596 with kv_rows), 5.380 s, 1402.3 GFLOP (260.7 GFLOPS incl. pinning/submit/wait); mask analysis 0.146 s; computed by ggml-cpu inside GEN9: ma
+# 03:17:39 load 4.12 3.10 1.54 gpu 1050 MHz GEN9_ATTN=0
+batch n=64: 70.88 s, 0.90 chunks/s, 377 tok/s (26727 tokens)
+single n=32: 48.52 s, 0.66 chunks/s, 363 tok/s (17595 tokens)
+gen9: supports_op FLASH_ATTN_EXT asked 3444, declined: GEN9_ATTN off 3444, type 0, ALiBi/softcap/sinks 0, shape/no binary 0, layout 0, n_q<32 0, mask/kv_rows shape 0, no GPU 0
+gen9: FLASH_ATTN_EXT run on the GPU 0 (0 launches, 0 with kv_rows), 0.000 s, 0.0 GFLOP (0.0 GFLOPS incl. pinning/submit/wait); mask analysis 0.000 s; computed by ggml-cpu inside GEN9: mask not causal/
+## Qwen3-1.7B Q8_0 prefill (llama-bench -r 3 -ngl 0)
+# 03:19:51 load 3.09 3.04 1.73 gpu 1050 MHz GEN9_ATTN=0 -p 512 -n 0 -d 0
+{"build_commit": "2cbe0ec42", "build_number": 12309, "cpu_info": "Intel(R) Core(TM) i5-8265U CPU @ 1.60GHz, Intel Gen9 GPU via gen9blas (kcl, i915)", "gpu_info": "", "backends": "GEN9", "model_filename": "~/models/qwen3-1.7b/Qwen3-1.7B-Q8_0.gguf", "model_type": "qwen3 1.7B Q8_0", "model_size": 1828474880, "model_n_params": 1720574976, "n_batch": 2048, "n_ubatch": 512, "n_threads": 4, "cpu_mask": "0x0", "cpu_strict": false, "poll": 50, "type_k": "f16", "type_v": "f16", "n_gpu_layers": 0, "n_cpu_moe": 0, "split_mode": "layer", "main_gpu": 0, "no_kv_offload": false, "flash_attn": 1, "devices": "auto", "tensor_split": "0.00", "tensor_buft_overrides": "^gen9_load_backends_only$=CPU", "load_mode": "auto", "lazy_mode": "auto", "embeddings": false, "no_op_offload": 0, "no_host": false, "repack": true, "fit_target": 0, "fit_min_ctx": 0, "n_prompt": 512, "n_gen": 0, "n_depth": 0, "test_time": "2026-11-14T02:19:51Z", "avg_ns": 3223644938, "stddev_ns": 13498690, "avg_ts": 158.828280, "stddev_ts": 0.664767, "samples_ns": [ 3222656763, 3237610323, 3210667730 ],"samples_ts": [ 158.875, 158.141, 159.468 ]}
+gen9: FLASH_ATTN_EXT run on the GPU 0 (0 launches, 0 with kv_rows), 0.000 s, 0.0 GFLOP (0.0 GFLOPS incl. pinning/submit/wait); mask analysis 0.000 s; computed by ggml-cpu inside GEN9: mask not causal/full 0, kv_rows not identity 0, library declined 0, GPU error 0 (0.000 s)
+# 03:20:06 load 2.63 2.94 1.72 gpu 1067 MHz GEN9_ATTN=1 -p 512 -n 0 -d 0
+{"build_commit": "2cbe0ec42", "build_number": 12309, "cpu_info": "Intel(R) Core(TM) i5-8265U CPU @ 1.60GHz, Intel Gen9 GPU via gen9blas (kcl, i915)", "gpu_info": "", "backends": "GEN9", "model_filename": "~/models/qwen3-1.7b/Qwen3-1.7B-Q8_0.gguf", "model_type": "qwen3 1.7B Q8_0", "model_size": 1828474880, "model_n_params": 1720574976, "n_batch": 2048, "n_ubatch": 512, "n_threads": 4, "cpu_mask": "0x0", "cpu_strict": false, "poll": 50, "type_k": "f16", "type_v": "f16", "n_gpu_layers": 0, "n_cpu_moe": 0, "split_mode": "layer", "main_gpu": 0, "no_kv_offload": false, "flash_attn": 1, "devices": "auto", "tensor_split": "0.00", "tensor_buft_overrides": "^gen9_load_backends_only$=CPU", "load_mode": "auto", "lazy_mode": "auto", "embeddings": false, "no_op_offload": 0, "no_host": false, "repack": true, "fit_target": 0, "fit_min_ctx": 0, "n_prompt": 512, "n_gen": 0, "n_depth": 0, "test_time": "2026-11-14T02:20:07Z", "avg_ns": 2426838081, "stddev_ns": 2151962, "avg_ts": 210.974219, "stddev_ts": 0.187169, "samples_ns": [ 2424368910, 2427831133, 2428314200 ],"samples_ts": [ 211.189, 210.888, 210.846 ]}
+gen9: FLASH_ATTN_EXT run on the GPU 112 (112 launches, 0 with kv_rows), 0.468 s, 120.5 GFLOP (257.6 GFLOPS incl. pinning/submit/wait); mask analysis 0.022 s; computed by ggml-cpu inside GEN9: mask not causal/full 0, kv_rows not identity 0, library declined 0, GPU error 0 (0.000 s)
+# 03:20:19 load 2.76 2.96 1.74 gpu 1067 MHz GEN9_ATTN=1 -p 512 -n 0 -d 2048
+{"build_commit": "2cbe0ec42", "build_number": 12309, "cpu_info": "Intel(R) Core(TM) i5-8265U CPU @ 1.60GHz, Intel Gen9 GPU via gen9blas (kcl, i915)", "gpu_info": "", "backends": "GEN9", "model_filename": "~/models/qwen3-1.7b/Qwen3-1.7B-Q8_0.gguf", "model_type": "qwen3 1.7B Q8_0", "model_size": 1828474880, "model_n_params": 1720574976, "n_batch": 2048, "n_ubatch": 512, "n_threads": 4, "cpu_mask": "0x0", "cpu_strict": false, "poll": 50, "type_k": "f16", "type_v": "f16", "n_gpu_layers": 0, "n_cpu_moe": 0, "split_mode": "layer", "main_gpu": 0, "no_kv_offload": false, "flash_attn": 1, "devices": "auto", "tensor_split": "0.00", "tensor_buft_overrides": "^gen9_load_backends_only$=CPU", "load_mode": "auto", "lazy_mode": "auto", "embeddings": false, "no_op_offload": 0, "no_host": false, "repack": true, "fit_target": 0, "fit_min_ctx": 0, "n_prompt": 512, "n_gen": 0, "n_depth": 2048, "test_time": "2026-11-14T02:20:19Z", "avg_ns": 3236470207, "stddev_ns": 6580513, "avg_ts": 158.197473, "stddev_ts": 0.321269, "samples_ns": [ 3244029163, 3233356558, 3232024902 ],"samples_ts": [ 157.828, 158.349, 158.415 ]}
+gen9: FLASH_ATTN_EXT run on the GPU 224 (224 launches, 0 with kv_rows), 4.395 s, 1323.3 GFLOP (301.1 GFLOPS incl. pinning/submit/wait); mask analysis 0.119 s; computed by ggml-cpu inside GEN9: mask not causal/full 0, kv_rows not identity 0, library declined 0, GPU error 0 (0.000 s)
+# 03:20:44 load 2.37 2.85 1.74 gpu 1067 MHz GEN9_ATTN=0 -p 512 -n 0 -d 2048
+{"build_commit": "2cbe0ec42", "build_number": 12309, "cpu_info": "Intel(R) Core(TM) i5-8265U CPU @ 1.60GHz, Intel Gen9 GPU via gen9blas (kcl, i915)", "gpu_info": "", "backends": "GEN9", "model_filename": "~/models/qwen3-1.7b/Qwen3-1.7B-Q8_0.gguf", "model_type": "qwen3 1.7B Q8_0", "model_size": 1828474880, "model_n_params": 1720574976, "n_batch": 2048, "n_ubatch": 512, "n_threads": 4, "cpu_mask": "0x0", "cpu_strict": false, "poll": 50, "type_k": "f16", "type_v": "f16", "n_gpu_layers": 0, "n_cpu_moe": 0, "split_mode": "layer", "main_gpu": 0, "no_kv_offload": false, "flash_attn": 1, "devices": "auto", "tensor_split": "0.00", "tensor_buft_overrides": "^gen9_load_backends_only$=CPU", "load_mode": "auto", "lazy_mode": "auto", "embeddings": false, "no_op_offload": 0, "no_host": false, "repack": true, "fit_target": 0, "fit_min_ctx": 0, "n_prompt": 512, "n_gen": 0, "n_depth": 2048, "test_time": "2026-11-14T02:20:45Z", "avg_ns": 6488418326, "stddev_ns": 13851471, "avg_ts": 78.910071, "stddev_ts": 0.168245, "samples_ns": [ 6504407938, 6480108051, 6480738991 ],"samples_ts": [ 78.7159, 79.011, 79.0033 ]}
+gen9: FLASH_ATTN_EXT run on the GPU 0 (0 launches, 0 with kv_rows), 0.000 s, 0.0 GFLOP (0.0 GFLOPS incl. pinning/submit/wait); mask analysis 0.000 s; computed by ggml-cpu inside GEN9: mask not causal/full 0, kv_rows not identity 0, library declined 0, GPU error 0 (0.000 s)
+# 03:21:29 load 2.49 2.83 1.78 gpu 1067 MHz GEN9_ATTN=0 -p 512 -n 0 -d 3584
+{"build_commit": "2cbe0ec42", "build_number": 12309, "cpu_info": "Intel(R) Core(TM) i5-8265U CPU @ 1.60GHz, Intel Gen9 GPU via gen9blas (kcl, i915)", "gpu_info": "", "backends": "GEN9", "model_filename": "~/models/qwen3-1.7b/Qwen3-1.7B-Q8_0.gguf", "model_type": "qwen3 1.7B Q8_0", "model_size": 1828474880, "model_n_params": 1720574976, "n_batch": 2048, "n_ubatch": 512, "n_threads": 4, "cpu_mask": "0x0", "cpu_strict": false, "poll": 50, "type_k": "f16", "type_v": "f16", "n_gpu_layers": 0, "n_cpu_moe": 0, "split_mode": "layer", "main_gpu": 0, "no_kv_offload": false, "flash_attn": 1, "devices": "auto", "tensor_split": "0.00", "tensor_buft_overrides": "^gen9_load_backends_only$=CPU", "load_mode": "auto", "lazy_mode": "auto", "embeddings": false, "no_op_offload": 0, "no_host": false, "repack": true, "fit_target": 0, "fit_min_ctx": 0, "n_prompt": 512, "n_gen": 0, "n_depth": 3584, "test_time": "2026-11-14T02:21:29Z", "avg_ns": 7543170393, "stddev_ns": 57811917, "avg_ts": 67.878624, "stddev_ts": 0.519546, "samples_ns": [ 7489092324, 7604104591, 7536314265 ],"samples_ts": [ 68.3661, 67.3321, 67.9377 ]}
+gen9: FLASH_ATTN_EXT run on the GPU 0 (0 launches, 0 with kv_rows), 0.000 s, 0.0 GFLOP (0.0 GFLOPS incl. pinning/submit/wait); mask analysis 0.000 s; computed by ggml-cpu inside GEN9: mask not causal/full 0, kv_rows not identity 0, library declined 0, GPU error 0 (0.000 s)
+# 03:22:36 load 3.14 2.91 1.88 gpu 1067 MHz GEN9_ATTN=1 -p 512 -n 0 -d 3584
+{"build_commit": "2cbe0ec42", "build_number": 12309, "cpu_info": "Intel(R) Core(TM) i5-8265U CPU @ 1.60GHz, Intel Gen9 GPU via gen9blas (kcl, i915)", "gpu_info": "", "backends": "GEN9", "model_filename": "~/models/qwen3-1.7b/Qwen3-1.7B-Q8_0.gguf", "model_type": "qwen3 1.7B Q8_0", "model_size": 1828474880, "model_n_params": 1720574976, "n_batch": 2048, "n_ubatch": 512, "n_threads": 4, "cpu_mask": "0x0", "cpu_strict": false, "poll": 50, "type_k": "f16", "type_v": "f16", "n_gpu_layers": 0, "n_cpu_moe": 0, "split_mode": "layer", "main_gpu": 0, "no_kv_offload": false, "flash_attn": 1, "devices": "auto", "tensor_split": "0.00", "tensor_buft_overrides": "^gen9_load_backends_only$=CPU", "load_mode": "auto", "lazy_mode": "auto", "embeddings": false, "no_op_offload": 0, "no_host": false, "repack": true, "fit_target": 0, "fit_min_ctx": 0, "n_prompt": 512, "n_gen": 0, "n_depth": 3584, "test_time": "2026-11-14T02:22:37Z", "avg_ns": 3900694616, "stddev_ns": 37652954, "avg_ts": 131.266809, "stddev_ts": 1.264339, "samples_ns": [ 3894759592, 3940962619, 3866361637 ],"samples_ts": [ 131.459, 129.917, 132.424 ]}
+gen9: FLASH_ATTN_EXT run on the GPU 308 (308 launches, 0 with kv_rows), 9.653 s, 2856.8 GFLOP (295.9 GFLOPS incl. pinning/submit/wait); mask analysis 0.233 s; computed by ggml-cpu inside GEN9: mask not causal/full 0, kv_rows not identity 0, library declined 0, GPU error 0 (0.000 s)
+# 03:23:15 load 2.76 2.83 1.89 gpu 1067 MHz end
+QDONE
+
