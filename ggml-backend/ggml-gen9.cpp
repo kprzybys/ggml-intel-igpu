@@ -52,6 +52,7 @@ static std::atomic<double> t_dequant_s{0}, t_deq_alloc_s{0}, t_deq_cpu_s{0}, t_d
 static std::atomic<long> n_fa_asked{0}, n_fa_off{0}, n_fa_decl_type{0}, n_fa_decl_param{0}, n_fa_decl_shape{0}, n_fa_decl_layout{0},
                          n_fa_decl_nq{0}, n_fa_decl_mask{0}, n_fa_decl_gpu{0};
 static std::atomic<long> n_fa_gpu{0}, n_fa_launch{0}, n_fa_rows{0}, n_fa_cpu_mask{0}, n_fa_cpu_rows{0}, n_fa_cpu_lib{0}, n_fa_cpu_err{0};
+static std::atomic<long> n_fa_f32kv{0};   // FLASH_ATTN_EXT with F32 K/V converted to FP16 (NeMo)
 static std::atomic<long> n_fa_tail{0}, n_fa_cpu_tail{0};   // n_k not a multiple of 16: rounded up on the GPU / V tail not finite
 static std::atomic<long> n_fa_blk{0}, n_fa_blk_runs{0}, n_fa_blk_gather{0}, n_fa_cpu_blk{0};   // general masks (fa_mask_runs)
 static std::atomic<double> t_fa_gpu_s{0}, t_fa_mask_s{0}, t_fa_cpu_s{0}, fa_flop{0};
@@ -98,6 +99,7 @@ static void gen9_report(void) {
             "shape/no binary %ld, layout %ld, n_q<32 %ld, mask/kv_rows shape %ld, no GPU %ld\n", n_fa_asked.load(), n_fa_off.load(),
             n_fa_decl_type.load(), n_fa_decl_param.load(), n_fa_decl_shape.load(), n_fa_decl_layout.load(), n_fa_decl_nq.load(),
             n_fa_decl_mask.load(), n_fa_decl_gpu.load());
+    fprintf(stderr, "gen9: FLASH_ATTN_EXT with F32 K/V (converted to FP16 in the staging buffer) on the GPU %ld\n", n_fa_f32kv.load());
     fprintf(stderr, "gen9: FLASH_ATTN_EXT run on the GPU %ld (%ld launches, %ld with kv_rows), %.3f s, %.1f GFLOP (%.1f GFLOPS incl. "
             "pinning/submit/wait); mask analysis %.3f s; computed by ggml-cpu inside GEN9: mask not causal/full %ld, kv_rows not "
             "identity %ld, library declined %ld, GPU error %ld (%.3f s)\n", n_fa_gpu.load(), n_fa_launch.load(), n_fa_rows.load(),
@@ -445,10 +447,34 @@ static int64_t fa_rows_behind(const struct ggml_tensor * t, size_t row) {
     return (int64_t) ((ggml_nbytes(t->view_src) - t->view_offs) / row);
 }
 
+// F32 K/V (NeMo-Speech.cpp's RoPE encoder: K = RoPE output, V = a view of the fused QKV projection, both permuted):
+// no mask, no kv_rows; any K/V row and head strides with contiguous D. gen9_flash_attn_f32kv converts them to FP16 in
+// the kernel's layout ([key][head][d], rows padded with zeros to a multiple of 16) in the staging buffer. Q and the
+// output in llama.cpp's layouts, as for F16 K/V. Opt-in (GEN9_ATTN_F32KV=1): on gp (UHD 620) Nemotron 3 Diarization got
+// slower with it, 120 windows 177.8 -> 208.6 s, 1 h 111 -> 134 s (the single-threaded FP16 conversion under gpu_mu and
+// ~85 GFLOPS on the GPU vs ggml-cpu's multithreaded F32 attention); results equal to the CPU path.
+static bool fa_f32kv_ok(const struct ggml_tensor * op) {
+    static const bool off = [] { const char * e = getenv("GEN9_ATTN_F32KV"); return !e || strcmp(e, "1") != 0; }();
+    const struct ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2];
+    if (off || q->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 || op->src[3] || op->src[4] || op->src[5] ||
+        fa_param(op, 1) != 0.0f || fa_param(op, 2) != 0.0f) { n_fa_decl_type++; return false; }
+    const int64_t D = q->ne[0], nq = q->ne[1], H = q->ne[2], nk = k->ne[1], HKV = k->ne[2];
+    if (k->ne[0] != D || v->ne[0] != D || v->ne[1] != nk || v->ne[2] != HKV || q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 ||
+        HKV <= 0 || H % HKV || nk > INT_MAX || !gpu_ok() || !gen9blas_attn_supported((int) D, (int) H, (int) HKV)) {
+        if (!gpu_ok()) n_fa_decl_gpu++; else n_fa_decl_shape++;
+        return false;
+    }
+    if (q->nb[0] != 4 || q->nb[1] != (size_t) (H * D * 4) || q->nb[2] != (size_t) (D * 4) || k->nb[0] != 4 || v->nb[0] != 4 ||
+        !ggml_is_contiguous(op) || op->ne[0] != D || op->ne[1] != H || op->ne[2] != nq || op->ne[3] != 1) { n_fa_decl_layout++; return false; }
+    if (nq < 32) { n_fa_decl_nq++; return false; }
+    return true;
+}
+
 static bool gen9_supports_fa(const struct ggml_tensor * op) {
     n_fa_asked++;
     if (!attn_on()) { n_fa_off++; return false; }
     const struct ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2], * m = op->src[3], * rows = op->src[5];
+    if (k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32) return fa_f32kv_ok(op);
     if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 || op->type != GGML_TYPE_F32) { n_fa_decl_type++; return false; }
     if (op->src[4] || fa_param(op, 1) != 0.0f || fa_param(op, 2) != 0.0f) { n_fa_decl_param++; return false; }
     const int64_t D = q->ne[0], nq = q->ne[1], H = q->ne[2], nk = k->ne[1], HKV = k->ne[2];
@@ -642,8 +668,55 @@ static void gen9_flash_attn_runs(gen9_context * ctx, struct ggml_cgraph * cg, in
     t_fa_gpu_s = t_fa_gpu_s + std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
 }
 
+static void gen9_flash_attn_f32kv(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
+    static char * stage = nullptr; static size_t stage_bytes = 0;   // [K rows | V rows | pad], used under gpu_mu
+    struct ggml_tensor * dst = cg->nodes[i];
+    const struct ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2];
+    const int D = (int) q->ne[0], nq = (int) q->ne[1], H = (int) q->ne[2], HKV = (int) k->ne[2], nv = (int) k->ne[1];
+    const int nk = (nv + 15) / 16 * 16;
+    const size_t row = (size_t) HKV * D * 2;
+    auto t1 = std::chrono::steady_clock::now();
+    int launches = 0, rc = 1;
+    {
+        std::lock_guard<std::mutex> lk(gpu_mu);
+        const size_t need = 2 * (size_t) nk * row + 8192;   // + the kernel's read-ahead past the end of K^T (attn_gen.py: >= NK*D*16 B)
+        if (need > stage_bytes) {
+            free(stage); stage = nullptr; stage_bytes = 0;
+            const size_t sz = (need + (1u << 20) - 1) & ~(size_t) ((1u << 20) - 1);
+            if (posix_memalign((void **) &stage, 4096, sz) == 0) { stage_bytes = sz; memset(stage, 0, sz); } else stage = nullptr;
+        }
+        if (stage) {
+            ggml_fp16_t * ks = (ggml_fp16_t *) stage, * vs = (ggml_fp16_t *) (stage + (size_t) nk * row);
+            bool fin = true;
+            for (int j = 0; j < nv; j++)
+                for (int h = 0; h < HKV; h++) {
+                    const float * kr = (const float *) ((const char *) k->data + j * k->nb[1] + h * k->nb[2]);
+                    const float * vr = (const float *) ((const char *) v->data + j * v->nb[1] + h * v->nb[2]);
+                    ggml_fp32_to_fp16_row(kr, ks + ((size_t) j * HKV + h) * D, D);
+                    ggml_fp32_to_fp16_row(vr, vs + ((size_t) j * HKV + h) * D, D);
+                }
+            for (size_t x = 0; x < (size_t) nv * HKV * D && fin; x++)   // FP16 range: |x| > 65504 -> Inf
+                fin = (ks[x] & 0x7C00) != 0x7C00 && (vs[x] & 0x7C00) != 0x7C00;
+            memset(ks + (size_t) nv * HKV * D, 0, (size_t) (nk - nv) * row);
+            memset(vs + (size_t) nv * HKV * D, 0, (size_t) (nk - nv) * row);
+            if (fin)
+                rc = gen9blas_attn_f16kv(D, H, HKV, nq, nk, (const float *) q->data, (const uint16_t *) ks, (size_t) nk * row + 4096,
+                                         (const uint16_t *) vs, (size_t) nk * row + 4096, (float *) dst->data, fa_param(dst, 0), nv, 0,
+                                         &launches);
+        }
+    }
+    if (rc) {
+        if (rc < 0) { n_fa_cpu_err++; fprintf(stderr, "gen9: attention on the GPU failed (%s); ggml-cpu\n", gen9blas_attn_error()); }
+        else n_fa_cpu_lib++;
+        fa_on_cpu(ctx, cg, i); return;
+    }
+    n_fa_gpu++; n_fa_f32kv++; n_fa_launch += launches; fa_flop = fa_flop + 4.0 * H * D * (double) nv * nq;
+    t_fa_gpu_s = t_fa_gpu_s + std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
+}
+
 static void gen9_flash_attn(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
     struct ggml_tensor * dst = cg->nodes[i];
+    if (dst->src[1]->type == GGML_TYPE_F32) { gen9_flash_attn_f32kv(ctx, cg, i); return; }
     const struct ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * m = dst->src[3], * rows = dst->src[5];
     const int D = (int) q->ne[0], nq = (int) q->ne[1], H = (int) q->ne[2], HKV = (int) k->ne[2];
     int vis0 = (int) k->ne[1], dvis = 0;
@@ -1270,7 +1343,8 @@ static bool gen9_supports_ew(const struct ggml_tensor * op) {
         }
         case GGML_OP_ROPE: {
 #ifdef GEN9_GGML_NO_ROPE_TRUNCATE
-            break;   // ggml without ggml_rope_get_truncate (whisper.cpp): ROPE stays on the CPU
+            break;   // ggml without ggml_rope_get_truncate (whisper.cpp, NeMo-Speech.cpp): ROPE stays on the CPU
+                     // (tried on NeMo's Nemotron 3 encoder: GPU ROPE changed the diarization by 10-34 % of frames)
 #endif
             const struct ggml_tensor * x = op->src[0], * pos = op->src[1], * ff = op->src[2];
             const int32_t * pp = (const int32_t *) op->op_params;
