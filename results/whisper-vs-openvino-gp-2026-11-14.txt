@@ -1,0 +1,7 @@
+# whisper-gpu (bundle 6a72bc3, Q8_0, GPU mel + epilogue fusion + norm->pack) vs OpenVINO GenAI on GPU -- gp, janko.wav 986.7 s, 2026-11-14
+# run_cmp.sh (= ~/src/whisper-eval/run_all.sh + gpu-bundle-q8), one run each, -l pl greedy, whisper.cpp default fallback and -mc; OV with preempt_timeout_ms 20000 (restored 640)
+gpu-bundle-q8   rc=0 wall_s=311.4 energy_J=6265 peak_MB=2880 temp_C=34->84 | WER 8.86 % (194 / 2190 words, hyp 2288 words) | whisper_print_timings: load time = 337.74 ms;whisper_print_timings: encode time = 209237.11 ms / 45 runs ( 4649.71 ms per run);whisper_print_timings: total time = 310906.59 ms;
+genai-mix-gpu   rc=0 wall_s=344.5 energy_J=5782 peak_MB=2871 temp_C=53->81 | WER 9.22 % (202 / 2190 words, hyp 2289 words) | load_s 5.48 transcribe_s 338.03 audio_s 986.7 features_ms 2469.7 gen_ms 337414;
+genai-fp16-gpu  rc=0 wall_s=388.7 energy_J=6330 peak_MB=2970 temp_C=55->82 | WER 9.73 % (213 / 2190 words, hyp 2277 words) | load_s 5.49 transcribe_s 382.72 audio_s 986.7 features_ms 2480.7 gen_ms 382107;
+# RTF: whisper-gpu 0.316, GenAI enc FP16 + dec INT8 0.349, GenAI FP16 0.394. Energy: whisper-gpu +8 % vs GenAI mix (45 encoder windows: -mc prompt).
+# Yesterday's same file: whisper.cpp+GEN9 F16 405 s / WER 9.36 %.
