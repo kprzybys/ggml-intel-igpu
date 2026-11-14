@@ -941,7 +941,9 @@ static int gen9_layer_norm(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
 static bool gen9_gelu(gen9_context * ctx, struct ggml_tensor * node) {
     int rc;
     { std::lock_guard<std::mutex> lk(gpu_mu);
-      rc = gen9blas_gelu((size_t) ggml_nelements(node), (const float *) node->src[0]->data, (float *) node->data, ctx->ew_sync); }
+      rc = ggml_get_unary_op(node) == GGML_UNARY_OP_GELU_ERF
+          ? gen9blas_gelu_erf((size_t) ggml_nelements(node), (const float *) node->src[0]->data, (float *) node->data, ctx->ew_sync)
+          : gen9blas_gelu((size_t) ggml_nelements(node), (const float *) node->src[0]->data, (float *) node->data, ctx->ew_sync); }
     if (!ew_after(ctx, rc, "GELU")) return false;
     n_ew_gelu++;
     return true;
@@ -1331,7 +1333,7 @@ static bool gen9_supports_ew(const struct ggml_tensor * op) {
             break;
         }
         case GGML_OP_UNARY:
-            ok = ggml_get_unary_op(op) == GGML_UNARY_OP_GELU && f32_rows(op->src[0]) && f32_rows(op) &&
+            ok = (ggml_get_unary_op(op) == GGML_UNARY_OP_GELU || ggml_get_unary_op(op) == GGML_UNARY_OP_GELU_ERF) && f32_rows(op->src[0]) && f32_rows(op) &&
                  ggml_are_same_shape(op->src[0], op) && ggml_nrows(op) >= ew_min_rows();
             break;
         case GGML_OP_ADD: case GGML_OP_MUL: {
