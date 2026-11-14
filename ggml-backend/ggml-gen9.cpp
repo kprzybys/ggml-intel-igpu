@@ -45,6 +45,7 @@ static std::atomic<long> n_ew_cpu_splits{0}, n_ew_cpu_nodes{0};
 static std::atomic<long> n_ew_norm{0}, n_ew_norm_wb{0}, n_ew_gelu{0}, n_mm_f16in{0};
 static std::atomic<long> n_ew_rms{0}, n_ew_rms_mul{0}, n_ew_add{0}, n_ew_mul{0}, n_ew_rope{0}, n_ew_sync_graphs{0}, n_ew_asked{0}, n_ew_declined{0};
 static std::atomic<long> n_dequant{0}, n_dequant_f32{0}, n_dequant_gpu{0};
+static std::atomic<long> n_epi{0}, n_epi_gelu{0}, n_epi_res{0}, n_epi_res_alias{0}, n_epi_fallback{0};
 static std::atomic<double> t_dequant_s{0}, t_deq_alloc_s{0}, t_deq_cpu_s{0}, t_deq_pack_s{0}, t_deq_gpu_s{0};
 // FLASH_ATTN_EXT (opt-in GEN9_ATTN=1, docs/attention-gpu.md section 11)
 static std::atomic<long> n_fa_asked{0}, n_fa_off{0}, n_fa_decl_type{0}, n_fa_decl_param{0}, n_fa_decl_shape{0}, n_fa_decl_layout{0},
@@ -61,6 +62,9 @@ static void gen9_report(void) {
             n_ew_cpu_splits.load(), n_ew_cpu_nodes.load());
     fprintf(stderr, "gen9: whisper-type ops on the GPU: NORM %ld (with MUL+ADD fused %ld), GELU %ld; MUL_MAT with F16 activations %ld\n",
             n_ew_norm.load(), n_ew_norm_wb.load(), n_ew_gelu.load(), n_mm_f16in.load());
+    fprintf(stderr, "gen9: MUL_MAT + bias fused in the epilogue %ld (+ GELU %ld, + residual %ld; residual left unfused because it "
+            "aliases the output %ld; FP16 overflow -> unfused %ld)\n", n_epi.load(), n_epi_gelu.load(), n_epi_res.load(),
+            n_epi_res_alias.load(), n_epi_fallback.load());
     fprintf(stderr, "gen9: elementwise ops on the GPU: RMS_NORM %ld (with MUL fused %ld), ADD %ld, MUL %ld, ROPE %ld; splits run with a "
             "wait per op (span not registered or GEN9_EW_SYNC) %ld; supports_op asked %ld, declined %ld\n", n_ew_rms.load(),
             n_ew_rms_mul.load(), n_ew_add.load(), n_ew_mul.load(), n_ew_rope.load(), n_ew_sync_graphs.load(), n_ew_asked.load(),
@@ -742,6 +746,64 @@ static void ew_end(gen9_context * ctx) {
     gen9blas_span_clear();
 }
 
+// Whisper encoder: MUL_MAT (F16 weight, F32 activations) -> ADD(row bias) [-> GELU | -> ADD(residual)], each
+// intermediate used once: one GEMM whose epilogue adds the bias, applies GELU and adds the residual
+// (gen9blas_gemm_pb_f16w_ex, bit-identical to the separate kernels; results/whisper-epilog-fusion-model-2026-11-14.txt).
+// Returns the number of nodes computed (0 = not fused). GEN9_EPI=0 turns it off.
+static bool epi_off(void) { static const bool v = [] { const char * e = getenv("GEN9_EPI"); return e && !strcmp(e, "0"); }(); return v; }
+static bool rows_f32(const struct ggml_tensor * t) {   // 2-D F32 with contiguous rows
+    return t->type == GGML_TYPE_F32 && t->ne[2] == 1 && t->ne[3] == 1 && t->nb[0] == sizeof(float);
+}
+static bool overlap(const struct ggml_tensor * a, const struct ggml_tensor * b) {
+    const char * a0 = (const char *) a->data, * b0 = (const char *) b->data;
+    return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+}
+static int gen9_try_epi(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
+    if (epi_off() || !gen9blas_epilog_ext_supported()) return 0;
+    struct ggml_tensor * mm = cg->nodes[i];
+    const struct ggml_tensor * w = mm->src[0], * x = mm->src[1];
+    if (w->type != GGML_TYPE_F16 || x->type != GGML_TYPE_F32 || !is_weight(w) || !rows_f32(mm) || !rows_f32(x)) return 0;
+    if (i + 1 >= cg->n_nodes || !ggml_node_has_n_uses(cg, i, 1)) return 0;
+    struct ggml_tensor * add = cg->nodes[i + 1];
+    if (add->op != GGML_OP_ADD || add->src[0] != mm || !ggml_are_same_shape(add, mm) || !rows_f32(add)) return 0;
+    const struct ggml_tensor * bias = add->src[1];
+    const int N = (int) mm->ne[0], M = (int) mm->ne[1], K = (int) w->ne[0];
+    if (!rows_f32(bias) || bias->ne[0] != N || bias->ne[1] != 1 || overlap(bias, add)) return 0;
+    struct ggml_tensor * out = add;
+    int gelu = 0, used = 2;
+    const float * R = nullptr; int ldr = 0;
+    if (i + 2 < cg->n_nodes && ggml_node_has_n_uses(cg, i + 1, 1)) {
+        struct ggml_tensor * nx = cg->nodes[i + 2];
+        if (nx->op == GGML_OP_UNARY && ggml_get_unary_op(nx) == GGML_UNARY_OP_GELU && nx->src[0] == add &&
+            ggml_are_same_shape(nx, add) && rows_f32(nx)) {
+            gelu = 1; out = nx; used = 3;
+        } else if (nx->op == GGML_OP_ADD && (nx->src[0] == add || nx->src[1] == add) && ggml_are_same_shape(nx, add) && rows_f32(nx)) {
+            const struct ggml_tensor * r = nx->src[0] == add ? nx->src[1] : nx->src[0];
+            if (ggml_are_same_shape(r, add) && rows_f32(r)) {
+                if (overlap(r, nx)) n_epi_res_alias++;   // in place: a fused write would destroy R before a possible
+                else { R = (const float *) r->data; ldr = (int) (r->nb[1] / sizeof(float)); out = nx; used = 3; }   // F32 redo
+            }
+        }
+    }
+    int rc, nonfinite = 0;
+    {
+        std::lock_guard<std::mutex> lk(gpu_mu);
+        packed_t p = get_packed(ctx, w);
+        if (!p.P || p.t != GEN9BLAS_HS) { if (p.P && p.temp) gen9blas_packed_free(p.P); return 0; }
+        rc = gen9blas_gemm_pb_f16w_ex(M, (const float *) x->data, (int) (x->nb[1] / sizeof(float)), p.P, (float *) out->data,
+                                      (int) (out->nb[1] / sizeof(float)), (const float *) bias->data, gelu, R, ldr, &nonfinite);
+        if (p.temp) gen9blas_packed_free(p.P);
+    }
+    (void) K;
+    if (rc) { fprintf(stderr, "gen9: fused MUL_MAT %s failed: %s\n", w->name, gen9blas_error()); return 0; }
+    if (nonfinite) {   // FP16 overflow: the MUL_MAT alone the usual way (it redoes it in F32), then the next nodes one by one
+        n_epi_fallback++;
+        return gen9_mul_mat(ctx, mm) ? 1 : -1;
+    }
+    n_epi++; n_mm_f16++; if (gelu) n_epi_gelu++; if (R) n_epi_res++;
+    return used;
+}
+
 static enum ggml_status gen9_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     gen9_context * ctx = (gen9_context *) backend->context;
     n_graphs++;
@@ -759,6 +821,11 @@ static enum ggml_status gen9_graph_compute(ggml_backend_t backend, struct ggml_c
             case GGML_OP_MUL_MAT:
                 if (gen9_try_ffn(ctx, cgraph, i)) { i += 3; break; }
                 if (gen9_try_multi(ctx, cgraph, i)) break;
+                {
+                    const int used = gen9_try_epi(ctx, cgraph, i);
+                    if (used < 0) return GGML_STATUS_FAILED;
+                    if (used > 0) { i += used - 1; break; }
+                }
                 if (!gen9_mul_mat(ctx, node)) return GGML_STATUS_FAILED;
                 break;
             case GGML_OP_GLU:

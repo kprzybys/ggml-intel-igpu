@@ -1,0 +1,43 @@
+# Whisper encoder: bias / GELU / residual fused into the GEMM epilogue -- model BEFORE implementation (2026-11-14)
+
+## Profile it starts from (gp, bundle 88528ae, janko60.wav, 3 encoder windows = 16.97 s, KCL_PROFILE_KERNELS=1)
+hgemm_kc_v 8359 ms | k_attn 3186 | gen9blas_binop_rows 1144 (728 calls) | pk_a3_f32v 926 | gen9blas_epilog_hf8 694 |
+gen9blas_gelu 427 (100) | pk_b16_t 423 | gen9blas_layer_norm 225 | k_kt 104 | mel 5.
+Per encoder layer (whisper.cpp 5922450 graph): Q = MUL_MAT + ADD(q_b); V = MUL_MAT + ADD(v_b); out = MUL_MAT + ADD(b) +
+ADD(residual); fc1 = MUL_MAT + ADD(b) + GELU; fc2 = MUL_MAT + ADD(b) + ADD(residual). All 7 ADDs and the GELU of a layer
+directly follow a MUL_MAT (single use each), so all of them can be done inside the MUL_MAT's epilogue, which already
+reads the FP16 GEMM result and writes the F32 output once.
+
+## Change
+Epilogue kernel gen9blas_epilog_hf8x: v = fp32(C16); v += bias[j]; [v = gelu(v) (same formula as gen9blas_gelu)];
+[v += R[i][j]]; same nonfinite check on the raw GEMM value. Backend: pattern MUL_MAT -> ADD(row bias) -> [GELU |
+ADD(residual)] with single uses -> one call gen9blas_gemm_pb_f16w_ex. F32 operations in the same order as the separate
+kernels -> output bit-identical to today's GPU path. FP16 overflow -> unfused recomputation as today.
+
+## Prediction (per 30 s encoder window, gp)
+Removed: binop_rows ~381 ms + gelu ~142 ms = ~523 ms. Added inside the epilogue: residual read (2 per layer x 32 layers
+x 1500 x 1280 x 4 B = 491 MB at ~13 GB/s = ~38 ms), bias reads (negligible), GELU arithmetic (32 x 1500 x 5120 evals,
+~25 ms) -> ~60 ms. Net ~0.46 s per window = ~8 % of the encoder (5.66 s), ~5 % of a whole run (encoder 60-70 %).
+## Falsification
+Wrong if the outputs are not bit-identical to the unfused GPU path (unit test + identical transcripts), or if the
+saving is < 0.2 s per window in an interleaved A/B on gp (GEN9_EPI=0 vs default).
+
+## Measured (gp, 2026-11-14 ~02:40; bundle from 11e2dda + this change, ~/whisper-gpu-epi; janko60.wav)
+Unit test bench/epi_test (fused vs gemm_pb_f16w + binop_rows + gelu + binop_rows, all on the GPU), M 600 and 1500:
+  bias, bias+GELU (N 5120), bias+residual, bias+residual in place (R = C), odd N 1283: all bit-identical.
+  First version differed for GELU (0.5 % of values, max 4.8e-7): IGC contracted the tanh-form arithmetic differently
+  in the vector epilogue. Fix: one GELU function (epi_gelu, FP_CONTRACT OFF) used by both gen9blas_gelu and the
+  epilogue -> gen9blas_gelu's own results may change in the last bit on single values (it is not bit-equal to
+  ggml-cpu's GELU anyway: different tanh).
+Whisper, GEN9_INFO: fused 520 MUL_MATs (+ GELU 100, + residual 204), residual aliasing the output 0, FP16 overflow 0;
+  separate ADD ops 728 -> 4. Transcripts identical (GEN9_EPI=0 vs default).
+Interleaved (3 rounds, order alternating):
+  r1 EPI=1 enc_ms_per_window 5084.54 total_ms 26301.42
+  r1 EPI=0 enc_ms_per_window 5528.70 total_ms 27576.92
+  r2 EPI=0 enc_ms_per_window 5568.22 total_ms 27641.21
+  r2 EPI=1 enc_ms_per_window 5044.65 total_ms 26161.11
+  r3 EPI=1 enc_ms_per_window 5052.65 total_ms 26220.58
+  r3 EPI=0 enc_ms_per_window 5534.31 total_ms 27608.67
+  encoder median 5535 -> 5053 ms per window (-0.48 s, -8.7 %); whole run 27.61 -> 26.22 s (-5.0 %).
+## Against the prediction
+Predicted -0.46 s per window (8 % of the encoder, ~5 % of a run); measured -0.48 s (8.7 %), -5.0 % of the run. Holds.
