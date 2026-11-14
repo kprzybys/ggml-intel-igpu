@@ -746,7 +746,7 @@ static void ew_end(gen9_context * ctx) {
     gen9blas_span_clear();
 }
 
-// Whisper encoder: MUL_MAT (F16 weight, F32 activations) -> ADD(row bias) [-> GELU | -> ADD(residual)], each
+// Whisper encoder: MUL_MAT (F16 or quantized weight, F32 activations) -> ADD(row bias) [-> GELU | -> ADD(residual)], each
 // intermediate used once: one GEMM whose epilogue adds the bias, applies GELU and adds the residual
 // (gen9blas_gemm_pb_f16w_ex, bit-identical to the separate kernels; results/whisper-epilog-fusion-model-2026-11-14.txt).
 // Returns the number of nodes computed (0 = not fused). GEN9_EPI=0 turns it off.
@@ -762,7 +762,8 @@ static int gen9_try_epi(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
     if (epi_off() || !gen9blas_epilog_ext_supported()) return 0;
     struct ggml_tensor * mm = cg->nodes[i];
     const struct ggml_tensor * w = mm->src[0], * x = mm->src[1];
-    if (w->type != GGML_TYPE_F16 || x->type != GGML_TYPE_F32 || !is_weight(w) || !rows_f32(mm) || !rows_f32(x)) return 0;
+    // F16 or a quantized weight with to_float (Q8_0 model): both are packed as FP16 (HS), the epilogue is the same
+    if (!ffn_weight_type(w->type) || x->type != GGML_TYPE_F32 || !is_weight(w) || !rows_f32(mm) || !rows_f32(x)) return 0;
     if (i + 1 >= cg->n_nodes || !ggml_node_has_n_uses(cg, i, 1)) return 0;
     struct ggml_tensor * add = cg->nodes[i + 1];
     if (add->op != GGML_OP_ADD || add->src[0] != mm || !ggml_are_same_shape(add, mm) || !rows_f32(add)) return 0;
