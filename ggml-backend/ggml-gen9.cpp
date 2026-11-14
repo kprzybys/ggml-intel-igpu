@@ -24,6 +24,7 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <unordered_map>
 #include <tuple>
 #include <vector>
 #include <unistd.h>
@@ -168,9 +169,40 @@ struct gen9_context {
     }
 };
 
+// Address inside a read-only, file-backed mapping (/proc/self/maps "r-.." with a path): such memory cannot change, so a
+// packed copy of a tensor there stays valid. NeMo-Speech.cpp maps its GGUF this way without marking the buffer WEIGHTS.
+// Ranges re-read when an address is not found (a model mapped later); GEN9_RO_WEIGHTS=0 turns this detection off.
+static bool in_ro_file_map(const void * p) {
+    static std::mutex mu; static std::vector<std::pair<uintptr_t, uintptr_t>> ro; static std::unordered_map<const void *, bool> memo;
+    static const bool off = [] { const char * e = getenv("GEN9_RO_WEIGHTS"); return e && !strcmp(e, "0"); }();
+    if (off || !p) return false;
+    std::lock_guard<std::mutex> lk(mu);
+    auto m = memo.find(p);
+    if (m != memo.end()) return m->second;
+    const uintptr_t a = (uintptr_t) p;
+    auto find = [&] { for (auto & r : ro) if (a >= r.first && a < r.second) return true; return false; };
+    bool hit = find();
+    if (!hit) {
+        ro.clear();
+        if (FILE * f = fopen("/proc/self/maps", "r")) {
+            char line[1024];
+            while (fgets(line, sizeof line, f)) {
+                unsigned long lo, hi; char perm[8]; unsigned long off_; char dev[16]; unsigned long ino; char path[768] = "";
+                if (sscanf(line, "%lx-%lx %7s %lx %15s %lu %767s", &lo, &hi, perm, &off_, dev, &ino, path) >= 6 &&
+                    perm[0] == 'r' && perm[1] == '-' && path[0] == '/' && ino != 0)
+                    ro.push_back({ lo, hi });
+            }
+            fclose(f);
+        }
+        hit = find();
+    }
+    memo[p] = hit;
+    return hit;
+}
 static bool is_weight(const struct ggml_tensor * w) {
-    return w->buffer && w->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS && w->op == GGML_OP_NONE &&
-           w->view_src == nullptr && (w->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_PARAM)) == 0;
+    if (w->op != GGML_OP_NONE || w->view_src != nullptr || (w->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_PARAM)) != 0 || !w->buffer)
+        return false;
+    return w->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS || in_ro_file_map(w->data);
 }
 
 static const char * gen9_backend_get_name(ggml_backend_t) { return "GEN9"; }
