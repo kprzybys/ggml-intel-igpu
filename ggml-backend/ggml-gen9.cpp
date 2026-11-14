@@ -46,6 +46,7 @@ static std::atomic<long> n_ew_norm{0}, n_ew_norm_wb{0}, n_ew_gelu{0}, n_mm_f16in
 static std::atomic<long> n_ew_rms{0}, n_ew_rms_mul{0}, n_ew_add{0}, n_ew_mul{0}, n_ew_rope{0}, n_ew_sync_graphs{0}, n_ew_asked{0}, n_ew_declined{0};
 static std::atomic<long> n_dequant{0}, n_dequant_f32{0}, n_dequant_gpu{0};
 static std::atomic<long> n_epi{0}, n_epi_gelu{0}, n_epi_res{0}, n_epi_res_alias{0}, n_epi_fallback{0};
+static std::atomic<long> n_normpack{0}, n_pa_used{0};
 static std::atomic<double> t_dequant_s{0}, t_deq_alloc_s{0}, t_deq_cpu_s{0}, t_deq_pack_s{0}, t_deq_gpu_s{0};
 // FLASH_ATTN_EXT (opt-in GEN9_ATTN=1, docs/attention-gpu.md section 11)
 static std::atomic<long> n_fa_asked{0}, n_fa_off{0}, n_fa_decl_type{0}, n_fa_decl_param{0}, n_fa_decl_shape{0}, n_fa_decl_layout{0},
@@ -66,6 +67,8 @@ static void gen9_report(void) {
     fprintf(stderr, "gen9: MUL_MAT + bias fused in the epilogue %ld (+ GELU %ld, + residual %ld; residual left unfused because it "
             "aliases the output %ld; FP16 overflow -> unfused %ld)\n", n_epi.load(), n_epi_gelu.load(), n_epi_res.load(),
             n_epi_res_alias.load(), n_epi_fallback.load());
+    fprintf(stderr, "gen9: LayerNorm writing the packed GEMM input %ld; MUL_MATs using it (no own packing) %ld\n",
+            n_normpack.load(), n_pa_used.load());
     fprintf(stderr, "gen9: elementwise ops on the GPU: RMS_NORM %ld (with MUL fused %ld), ADD %ld, MUL %ld, ROPE %ld; splits run with a "
             "wait per op (span not registered or GEN9_EW_SYNC) %ld; supports_op asked %ld, declined %ld\n", n_ew_rms.load(),
             n_ew_rms_mul.load(), n_ew_add.load(), n_ew_mul.load(), n_ew_rope.load(), n_ew_sync_graphs.load(), n_ew_asked.load(),
@@ -127,7 +130,14 @@ struct gen9_context {
     bool ew_sync = false, ew_pending = false, ew_cpu = false;   // ew_cpu: split without a waiting GPU call: elementwise ops on ggml-cpu
     std::vector<char> done;   // per graph_compute: nodes already computed by a MUL_MAT group   // per graph_compute: wait after each elementwise op / ops queued, not waited for
     ggml_backend_t cpu = nullptr;   // ggml-cpu for FLASH_ATTN_EXT nodes whose mask turns out not to be supported (created on first use)
+    // packed GEMM inputs written by LayerNorm (gen9blas_layer_norm_pack), per graph_compute; two buffers in turn: reusing
+    // one drops its map entries, so a late consumer packs for itself (correct in any node order)
+    struct pa_entry { gen9blas_packed_a * pa; const void * data; };
+    std::map<const struct ggml_tensor *, pa_entry> pa_map;
+    gen9blas_packed_a * pa_pool[2] = { nullptr, nullptr };
+    int pa_next = 0;
     ~gen9_context() {
+        for (auto * pa : pa_pool) gen9blas_packed_a_free(pa);
         if (cpu) ggml_backend_free(cpu);
         std::lock_guard<std::mutex> lk(gpu_mu); for (auto & kv : cache) gen9blas_packed_free(kv.second.P);
     }
@@ -307,8 +317,13 @@ static bool gen9_mul_mat(gen9_context * ctx, struct ggml_tensor * dst) {
     else {
         int nonfinite = 0;
         n_mm_f16++;
-        rc = xh ? gen9blas_gemm_pb_f16w_h(M, (const uint16_t *) x->data, lda, p.P, (float *) dst->data, ldc, &nonfinite)
-                : gen9blas_gemm_pb_f16w(M, (const float *) x->data, lda, p.P, (float *) dst->data, ldc, &nonfinite);
+        auto pit = xh ? ctx->pa_map.end() : ctx->pa_map.find(x);
+        if (pit != ctx->pa_map.end() && pit->second.data == x->data) {   // input packed by the LayerNorm that produced it
+            n_pa_used++;
+            rc = gen9blas_gemm_pa_f16w_ex(pit->second.pa, p.P, (float *) dst->data, ldc, nullptr, 0, nullptr, 0, &nonfinite);
+        } else
+            rc = xh ? gen9blas_gemm_pb_f16w_h(M, (const uint16_t *) x->data, lda, p.P, (float *) dst->data, ldc, &nonfinite)
+                    : gen9blas_gemm_pb_f16w(M, (const float *) x->data, lda, p.P, (float *) dst->data, ldc, &nonfinite);
         if (!rc && nonfinite) {   // FP16 overflow somewhere: recompute this call in F32
             n_mm_f16_fallback++;
             std::vector<float> wf((size_t) N * K);
@@ -724,6 +739,16 @@ static int gen9_rms_norm(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
 }
 
 // NORM at node i, fused with MUL(norm, w row) and then ADD(that, b row) when they follow and have no other use.
+static bool normpack_off(void) { static const bool v = [] { const char * e = getenv("GEN9_NORMPACK"); return e && !strcmp(e, "0"); }(); return v; }
+// does a later MUL_MAT with an FP16-packed weight of width K read `out`?
+static bool norm_feeds_mm(struct ggml_cgraph * cg, int from, const struct ggml_tensor * out, int K) {
+    for (int j = from; j < cg->n_nodes; j++) {
+        const struct ggml_tensor * n = cg->nodes[j];
+        if (n->op == GGML_OP_MUL_MAT && n->src[1] == out && ffn_weight_type(n->src[0]->type) && is_weight(n->src[0]) &&
+            n->src[0]->ne[0] == K && n->type == GGML_TYPE_F32) return true;
+    }
+    return false;
+}
 static int gen9_layer_norm(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
     struct ggml_tensor * node = cg->nodes[i];
     const struct ggml_tensor * x = node->src[0];
@@ -743,10 +768,22 @@ static int gen9_layer_norm(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
                 if (const struct ggml_tensor * bt = row_operand(cg->nodes[i + 2], out)) { out = cg->nodes[i + 2]; b = (const float *) bt->data; used = 3; }
         }
     }
+    // the GEMM input packed by the norm itself when a MUL_MAT with an FP16-packed weight reads this output (whisper:
+    // Q, K, V after norm1, fc1 after norm2); GEN9_NORMPACK=0 turns it off
+    gen9blas_packed_a * pa = nullptr;
+    if (!normpack_off() && gen9blas_norm_pack_supported() && norm_feeds_mm(cg, i + used, out, K)) {
+        const int s = ctx->pa_next++ & 1;
+        if (!ctx->pa_pool[s]) ctx->pa_pool[s] = gen9blas_packed_a_new();
+        pa = ctx->pa_pool[s];
+        for (auto it = ctx->pa_map.begin(); it != ctx->pa_map.end();) it = it->second.pa == pa ? ctx->pa_map.erase(it) : std::next(it);
+    }
     int rc;
     { std::lock_guard<std::mutex> lk(gpu_mu);
-      rc = gen9blas_layer_norm(M, K, (const float *) x->data, K, w, b, eps, (float *) out->data, K, ctx->ew_sync); }
+      rc = pa ? gen9blas_layer_norm_pack(M, K, (const float *) x->data, K, w, b, eps, (float *) out->data, K, pa, ctx->ew_sync)
+              : gen9blas_layer_norm(M, K, (const float *) x->data, K, w, b, eps, (float *) out->data, K, ctx->ew_sync); }
     if (!ew_after(ctx, rc, "NORM")) return 0;
+    if (pa) { ctx->pa_map[out] = { pa, out->data }; n_normpack++; }
+    else ctx->pa_map.erase(out);
     n_ew_norm++;
     if (used == 3) n_ew_norm_wb++;
     return used;
@@ -871,8 +908,14 @@ static int gen9_try_epi(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
         std::lock_guard<std::mutex> lk(gpu_mu);
         packed_t p = get_packed(ctx, w);
         if (!p.P || p.t != GEN9BLAS_HS) { if (p.P && p.temp) gen9blas_packed_free(p.P); return 0; }
-        rc = gen9blas_gemm_pb_f16w_ex(M, (const float *) x->data, (int) (x->nb[1] / sizeof(float)), p.P, (float *) out->data,
-                                      (int) (out->nb[1] / sizeof(float)), (const float *) bias->data, gelu, R, ldr, &nonfinite);
+        auto pit = ctx->pa_map.find(x);
+        if (pit != ctx->pa_map.end() && pit->second.data == x->data) {
+            n_pa_used++;
+            rc = gen9blas_gemm_pa_f16w_ex(pit->second.pa, p.P, (float *) out->data, (int) (out->nb[1] / sizeof(float)),
+                                          (const float *) bias->data, gelu, R, ldr, &nonfinite);
+        } else
+            rc = gen9blas_gemm_pb_f16w_ex(M, (const float *) x->data, (int) (x->nb[1] / sizeof(float)), p.P, (float *) out->data,
+                                          (int) (out->nb[1] / sizeof(float)), (const float *) bias->data, gelu, R, ldr, &nonfinite);
         if (p.temp) gen9blas_packed_free(p.P);
     }
     (void) K;
@@ -891,6 +934,8 @@ static enum ggml_status gen9_graph_compute(ggml_backend_t backend, struct ggml_c
     ew_begin(ctx, cgraph);
     struct ew_guard { gen9_context * c; ~ew_guard() { ew_end(c); } } guard{ ctx };
     ctx->done.assign(cgraph->n_nodes, 0);
+    // pa_map is NOT cleared per split: whisper's norm1 output feeds K, V and Q in three different splits (the K / V
+    // copies into the cache run on the CPU in between); entries are checked against the tensor's data pointer
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) { n_noop++; continue; }

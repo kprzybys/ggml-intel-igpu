@@ -1,0 +1,42 @@
+# Whisper encoder: LayerNorm writes the packed FP16 GEMM input directly (norm -> pack fusion) -- model BEFORE the code
+# (2026-11-14 ~03:15)
+
+## Where the time is (gp, janko60, 3 encoder windows, after the epilogue fusion 89f7b68)
+pk_a3_f32v (F32 activations -> FP16 A3 tiles before each GEMM): 926 ms / 633 calls = 1.46 ms per call, 6.6 per layer:
+norm1 output is packed 3 times (Q, K, V), attention output once (out proj), norm2 output once (fc1), GELU output once
+(fc2). gen9blas_layer_norm: 225 ms / 208 calls (1.08 ms).
+
+## Change
+Kernel gen9blas_layer_norm_pack = gen9blas_layer_norm (same arithmetic, still writes the F32 output, needed by the
+FP16-overflow F32 redo) + every value rounded to FP16 (rte, as pk_a3_f32v) and stored at its place in the A3 tiles,
+padding rows/columns zeroed. Backend: the packed buffer is attached to the norm's output tensor; MUL_MATs whose input is
+that tensor (Q, K, V of norm1; fc1 of norm2) skip their own packing. GEMM inputs bit-identical -> outputs identical.
+
+## Prediction (per 30 s window, gp)
+Packs removed: 4 per layer x 32 = 128 x 1.46 ms = ~187 ms. Added: the norm writes 1500 x 1280 x 2 B more per call
+(64 calls x 3.8 MB = 245 MB, scattered 2-byte stores into tiles, say ~40-60 ms) -> net ~130-150 ms per window,
+~2.5 % of the encoder (5.05 s), ~1.5 % of a whole run.
+## Falsification
+Wrong if transcripts / outputs differ from GEN9_NORMPACK=0, or the saving is < 60 ms per window (interleaved A/B).
+
+## Measured (gp, 2026-11-14 ~04:40, Q8_0 model, janko60, with the epilogue fusion)
+Unit test bench/epi_test: norm -> pack -> GEMM (+bias, +GELU), partial 16-row band, K = 1000: Y and C bit-identical.
+First whisper run: only 1 of 4 consumers per norm used the packed input (205 / 205): the norm1 output feeds K, V and Q
+in three different splits (the K / V copies into the cache run on the CPU in between) and the map was cleared per split.
+Fix: the map lives across splits, entries checked against the tensor's data pointer, erased when their buffer is reused.
+After the fix (GEN9_INFO): LayerNorm writing the packed input 205, MUL_MATs using it 405. Interleaved, 3 rounds:
+  r1 NORMPACK=1 exit 0 enc_ms_per_window 4936.42 total_ms 21340.32
+  r1 NORMPACK=0 exit 0 enc_ms_per_window 5008.01 total_ms 21569.47
+  r2 NORMPACK=0 exit 0 enc_ms_per_window 4994.56 total_ms 21572.08
+  r2 NORMPACK=1 exit 0 enc_ms_per_window 4905.64 total_ms 21311.33
+  r3 NORMPACK=1 exit 0 enc_ms_per_window 4920.75 total_ms 21430.81
+  r3 NORMPACK=0 exit 0 enc_ms_per_window 5001.57 total_ms 21476.48
+  gen9: LayerNorm writing the packed GEMM input 205; MUL_MATs using it (no own packing) 405
+  r1 transcripts identical
+  r2 transcripts identical
+  r3 transcripts identical
+Encoder median 5002 -> 4921 ms per window (-81 ms, -1.6 %); whole run 21.57 -> 21.34 s (-1.1 %); transcripts identical.
+## Against the prediction
+Predicted -130..-150 ms per window, measured -81 ms: above the 60 ms falsification bound, below the estimate. The
+norm's scattered 2-byte stores into the tiles cost ~105 ms per window instead of the assumed 40-60 ms. A tile-wise
+store (the norm work-group handling 16 rows) would recover part of it; not worth it at ~1 % of a run.
