@@ -53,7 +53,7 @@ static std::atomic<double> t_dequant_s{0}, t_deq_alloc_s{0}, t_deq_cpu_s{0}, t_d
 static std::atomic<long> n_fa_asked{0}, n_fa_off{0}, n_fa_decl_type{0}, n_fa_decl_param{0}, n_fa_decl_shape{0}, n_fa_decl_layout{0},
                          n_fa_decl_nq{0}, n_fa_decl_mask{0}, n_fa_decl_gpu{0};
 static std::atomic<long> n_fa_gpu{0}, n_fa_launch{0}, n_fa_rows{0}, n_fa_cpu_mask{0}, n_fa_cpu_rows{0}, n_fa_cpu_lib{0}, n_fa_cpu_err{0};
-static std::atomic<long> n_fa_f32kv{0}, n_mm_forced_f32{0};   // FLASH_ATTN_EXT with F32 K/V converted to FP16 (NeMo)
+static std::atomic<long> n_fa_f32kv{0}, n_mm_forced_f32{0}, n_ew_im2col{0};   // FLASH_ATTN_EXT with F32 K/V converted to FP16 (NeMo)
 static std::atomic<long> n_fa_tail{0}, n_fa_cpu_tail{0};   // n_k not a multiple of 16: rounded up on the GPU / V tail not finite
 static std::atomic<long> n_fa_blk{0}, n_fa_blk_runs{0}, n_fa_blk_gather{0}, n_fa_cpu_blk{0};   // general masks (fa_mask_runs)
 static std::atomic<double> t_fa_gpu_s{0}, t_fa_mask_s{0}, t_fa_cpu_s{0}, fa_flop{0};
@@ -101,6 +101,7 @@ static void gen9_report(void) {
             n_fa_decl_type.load(), n_fa_decl_param.load(), n_fa_decl_shape.load(), n_fa_decl_layout.load(), n_fa_decl_nq.load(),
             n_fa_decl_mask.load(), n_fa_decl_gpu.load());
     if (n_mm_forced_f32) fprintf(stderr, "gen9: MUL_MAT forced to F32 (GEN9_MM_F32=1) %ld\n", n_mm_forced_f32.load());
+    fprintf(stderr, "gen9: IM2COL on the GPU %ld\n", n_ew_im2col.load());
     fprintf(stderr, "gen9: FLASH_ATTN_EXT with F32 K/V (converted to FP16 in the staging buffer) on the GPU %ld\n", n_fa_f32kv.load());
     fprintf(stderr, "gen9: FLASH_ATTN_EXT run on the GPU %ld (%ld launches, %ld with kv_rows), %.3f s, %.1f GFLOP (%.1f GFLOPS incl. "
             "pinning/submit/wait); mask analysis %.3f s; computed by ggml-cpu inside GEN9: mask not causal/full %ld, kv_rows not "
@@ -904,7 +905,7 @@ static bool gen9_try_multi(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
 // GEN9_EWOPS=0 turns them off (supports_op declines), GEN9_EW_SYNC=1 forces the wait after each op (diagnostics).
 static bool ew_off(void) { static const bool v = [] { const char * e = getenv("GEN9_EWOPS"); return e && !strcmp(e, "0"); }(); return v; }
 static bool ew_force_sync(void) { static const bool v = getenv("GEN9_EW_SYNC") != nullptr; return v; }
-static bool is_ew_op(enum ggml_op o) { return o == GGML_OP_RMS_NORM || o == GGML_OP_NORM || o == GGML_OP_ADD || o == GGML_OP_MUL || o == GGML_OP_ROPE || o == GGML_OP_UNARY; }
+static bool is_ew_op(enum ggml_op o) { return o == GGML_OP_RMS_NORM || o == GGML_OP_NORM || o == GGML_OP_ADD || o == GGML_OP_MUL || o == GGML_OP_ROPE || o == GGML_OP_UNARY || o == GGML_OP_IM2COL; }
 
 static void ew_flush(gen9_context * ctx) {
     if (!ctx->ew_pending) return;
@@ -995,10 +996,40 @@ static int gen9_layer_norm(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
     return used;
 }
 
+// ggml IM2COL (conv_1d / conv_2d front end) as ggml-cpu: F32 input with contiguous rows, F32 or F16 output.
+static int ew_min_rows(void);
+static bool im2col_ok(const struct ggml_tensor * op) {
+    const struct ggml_tensor * k = op->src[0], * x = op->src[1];
+    const bool is2 = ggml_get_op_params_i32(op, 6) == 1;
+    if (!k || !x || x->type != GGML_TYPE_F32 || (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16) || !ggml_is_contiguous(op) ||
+        x->nb[0] != 4 || (is2 && x->nb[1] != (size_t) x->ne[0] * 4)) return false;
+    const int64_t N = is2 ? x->ne[3] : x->ne[2], IC = is2 ? x->ne[2] : x->ne[1], KK = (is2 ? k->ne[1] : 1) * k->ne[0];
+    const int64_t OH = is2 ? op->ne[2] : 1, OW = op->ne[1];
+    return (is2 || x->ne[3] == 1) && IC * KK <= INT_MAX && N * OH <= INT_MAX && OW <= INT_MAX && (size_t) (is2 ? x->nb[3] : x->nb[2]) % 4 == 0 &&
+           (size_t) (is2 ? x->nb[2] : x->nb[1]) % 4 == 0 && N * OH * OW >= ew_min_rows();
+}
+static bool gen9_im2col(gen9_context * ctx, struct ggml_tensor * node) {
+    const struct ggml_tensor * k = node->src[0], * x = node->src[1];
+    const int32_t * pp = (const int32_t *) node->op_params;
+    const bool is2 = pp[6] == 1;
+    const int N = (int) (is2 ? x->ne[3] : x->ne[2]), IC = (int) (is2 ? x->ne[2] : x->ne[1]), IH = is2 ? (int) x->ne[1] : 1, IW = (int) x->ne[0];
+    const int KH = is2 ? (int) k->ne[1] : 1, KW = (int) k->ne[0], OH = is2 ? (int) node->ne[2] : 1, OW = (int) node->ne[1];
+    const long ofs0 = (long) ((is2 ? x->nb[3] : x->nb[2]) / 4), ofs1 = (long) ((is2 ? x->nb[2] : x->nb[1]) / 4);
+    int rc;
+    { std::lock_guard<std::mutex> lk(gpu_mu);
+      rc = gen9blas_im2col(N, IC, IH, IW, (const float *) x->data, ofs0, ofs1, KH, KW, OH, OW, pp[0], pp[1], pp[2], pp[3], pp[4], pp[5],
+                           node->data, node->type == GGML_TYPE_F16, ctx->ew_sync); }
+    if (!ew_after(ctx, rc, "IM2COL")) return false;
+    n_ew_im2col++;
+    return true;
+}
+
 static bool gen9_gelu(gen9_context * ctx, struct ggml_tensor * node) {
     int rc;
     { std::lock_guard<std::mutex> lk(gpu_mu);
-      rc = ggml_get_unary_op(node) == GGML_UNARY_OP_GELU_ERF
+      rc = ggml_get_unary_op(node) == GGML_UNARY_OP_RELU
+          ? gen9blas_relu((size_t) ggml_nelements(node), (const float *) node->src[0]->data, (float *) node->data, ctx->ew_sync)
+          : ggml_get_unary_op(node) == GGML_UNARY_OP_GELU_ERF
           ? gen9blas_gelu_erf((size_t) ggml_nelements(node), (const float *) node->src[0]->data, (float *) node->data, ctx->ew_sync)
           : gen9blas_gelu((size_t) ggml_nelements(node), (const float *) node->src[0]->data, (float *) node->data, ctx->ew_sync); }
     if (!ew_after(ctx, rc, "GELU")) return false;
@@ -1213,6 +1244,11 @@ static enum ggml_status gen9_graph_compute(ggml_backend_t backend, struct ggml_c
                 if (!gen9_gelu(ctx, node)) return GGML_STATUS_FAILED;
                 pk = PR_GELU;
                 break;
+            case GGML_OP_IM2COL:
+                if (ctx->ew_cpu) { cpu_node(ctx, cgraph, i); n_ew_cpu_nodes++; pk = PR_EWCPU; break; }
+                if (!gen9_im2col(ctx, node)) return GGML_STATUS_FAILED;
+                pk = PR_GELU;
+                break;
             case GGML_OP_FLASH_ATTN_EXT:
                 gen9_flash_attn(ctx, cgraph, i);
                 pk = PR_FA;
@@ -1383,7 +1419,7 @@ static bool gen9_supports_ew(const struct ggml_tensor * op) {
     bool ok = false;
     static const char * skip = getenv("GEN9_EW_SKIP");   // diagnostics: comma list of rms,add,mul,rope left to the CPU
     const char * nm = op->op == GGML_OP_RMS_NORM ? "rms" : op->op == GGML_OP_ADD ? "add" : op->op == GGML_OP_MUL ? "mul" :
-                      op->op == GGML_OP_NORM ? "lnorm" : op->op == GGML_OP_UNARY ? "gelu" : "rope";
+                      op->op == GGML_OP_NORM ? "lnorm" : op->op == GGML_OP_UNARY ? "gelu" : op->op == GGML_OP_IM2COL ? "im2col" : "rope";
     if (!ew_off() && !(skip && strstr(skip, nm))) switch (op->op) {
         case GGML_OP_RMS_NORM: {
             float eps; memcpy(&eps, op->op_params, sizeof eps);
@@ -1395,8 +1431,12 @@ static bool gen9_supports_ew(const struct ggml_tensor * op) {
             ok = f32_rows(op->src[0]) && f32_rows(op) && ggml_are_same_shape(op->src[0], op) && eps >= 0.0f && ggml_nrows(op) >= ew_min_rows();
             break;
         }
+        case GGML_OP_IM2COL:
+            ok = im2col_ok(op);
+            break;
         case GGML_OP_UNARY:
-            ok = (ggml_get_unary_op(op) == GGML_UNARY_OP_GELU || ggml_get_unary_op(op) == GGML_UNARY_OP_GELU_ERF) && f32_rows(op->src[0]) && f32_rows(op) &&
+            ok = (ggml_get_unary_op(op) == GGML_UNARY_OP_GELU || ggml_get_unary_op(op) == GGML_UNARY_OP_GELU_ERF ||
+                  ggml_get_unary_op(op) == GGML_UNARY_OP_RELU) && f32_rows(op->src[0]) && f32_rows(op) &&
                  ggml_are_same_shape(op->src[0], op) && ggml_nrows(op) >= ew_min_rows();
             break;
         case GGML_OP_ADD: case GGML_OP_MUL: {
@@ -1444,6 +1484,7 @@ static bool gen9_dev_supports_op(ggml_backend_dev_t, const struct ggml_tensor * 
         case GGML_OP_FLASH_ATTN_EXT:
             return gen9_supports_fa(op);
         case GGML_OP_RMS_NORM: case GGML_OP_ADD: case GGML_OP_MUL: case GGML_OP_ROPE: case GGML_OP_NORM: case GGML_OP_UNARY:
+        case GGML_OP_IM2COL:
             return gen9_supports_ew(op);
         case GGML_OP_GLU: {   // SWIGLU of two MUL_MAT results: computed inside a fused FFN block (gen9_try_ffn)
             n_glu_asked++;
