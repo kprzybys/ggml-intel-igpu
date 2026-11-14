@@ -52,6 +52,7 @@ static std::atomic<long> n_fa_asked{0}, n_fa_off{0}, n_fa_decl_type{0}, n_fa_dec
                          n_fa_decl_nq{0}, n_fa_decl_mask{0}, n_fa_decl_gpu{0};
 static std::atomic<long> n_fa_gpu{0}, n_fa_launch{0}, n_fa_rows{0}, n_fa_cpu_mask{0}, n_fa_cpu_rows{0}, n_fa_cpu_lib{0}, n_fa_cpu_err{0};
 static std::atomic<long> n_fa_tail{0}, n_fa_cpu_tail{0};   // n_k not a multiple of 16: rounded up on the GPU / V tail not finite
+static std::atomic<long> n_fa_blk{0}, n_fa_blk_runs{0}, n_fa_cpu_blk{0};   // block-diagonal masks (several sequences in a ubatch)
 static std::atomic<double> t_fa_gpu_s{0}, t_fa_mask_s{0}, t_fa_cpu_s{0}, fa_flop{0};
 
 static void gen9_report(void) {
@@ -92,6 +93,8 @@ static void gen9_report(void) {
             t_fa_mask_s.load(), n_fa_cpu_mask.load(), n_fa_cpu_rows.load(), n_fa_cpu_lib.load(), n_fa_cpu_err.load(), t_fa_cpu_s.load());
     fprintf(stderr, "gen9: FLASH_ATTN_EXT with n_k not a multiple of 16: rounded up on the GPU %ld, V tail not finite -> ggml-cpu %ld\n",
             n_fa_tail.load(), n_fa_cpu_tail.load());
+    fprintf(stderr, "gen9: FLASH_ATTN_EXT block-diagonal masks (several sequences in a ubatch): on the GPU %ld (%ld runs), "
+            "computed by ggml-cpu %ld\n", n_fa_blk.load(), n_fa_blk_runs.load(), n_fa_cpu_blk.load());
 }
 
 // ---------------- GPU (lazy: first use) ----------------
@@ -460,6 +463,34 @@ static bool fa_mask_prefix(const struct ggml_tensor * m, int64_t nq, int & vis0,
     return true;
 }
 
+// Block-diagonal mask (llama.cpp with several sequences in one ubatch, e.g. llama-server embeddings): every row t sees
+// one contiguous run of columns [lo_t, lo_t + n_t) (+0) and -inf elsewhere. Consecutive rows with the same lo and
+// n_t = n_t0 + d*(t - t0) (d 0 or 1) form a run that is exactly the single-sequence pattern over the columns from lo:
+// each run is computed as its own launch with Q/O offset by t0 rows and K/V by lo rows (no kernel change).
+struct fa_run { int t0, nq, lo, vis0, dvis; };
+static bool fa_mask_blocks(const struct ggml_tensor * m, int64_t nq, std::vector<fa_run> & runs) {
+    const int64_t nc = m->ne[0];
+    runs.clear();
+    int64_t plo = -1, pn = 0;
+    for (int64_t t = 0; t < nq; t++) {
+        const uint16_t * r = (const uint16_t *) ((const char *) m->data + t * m->nb[1]);
+        int64_t j = 0;
+        while (j < nc && r[j] == 0xFC00) j++;
+        const int64_t lo = j;
+        while (j < nc && r[j] == 0) j++;
+        const int64_t n = j - lo;
+        for (; j < nc; j++) if (r[j] != 0xFC00) return false;
+        if (n < 1) return false;
+        fa_run * c = runs.empty() ? nullptr : &runs.back();
+        const bool same = c && lo == plo && ((c->nq == 1 && (n == pn || n == pn + 1)) ||
+                                             (c->nq > 1 && n == pn + c->dvis));
+        if (same) { if (c->nq == 1) c->dvis = (int) (n - pn); c->nq++; }
+        else runs.push_back({ (int) t, 1, (int) lo, (int) n, 1 });
+        plo = lo; pn = n;
+    }
+    return true;
+}
+
 static void ew_flush(gen9_context * ctx);
 static void cpu_node(gen9_context * ctx, struct ggml_cgraph * cg, int i) {   // one node on ggml-cpu (inputs ready)
     ew_flush(ctx);   // inputs may come from queued elementwise ops
@@ -479,6 +510,51 @@ static void fa_on_cpu(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
     t_fa_cpu_s = t_fa_cpu_s + std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
 
+// One launch per run of a block-diagonal mask (fa_mask_blocks). Any run the library cannot take, or a kv_rows list that
+// is not the identity over a run's columns, or a non-finite V row inside a run's 16-row rounding -> the whole node on
+// ggml-cpu (it overwrites what earlier runs wrote).
+static void gen9_flash_attn_blocks(gen9_context * ctx, struct ggml_cgraph * cg, int i, const std::vector<fa_run> & runs) {
+    struct ggml_tensor * dst = cg->nodes[i];
+    const struct ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * rows = dst->src[5];
+    const int D = (int) q->ne[0], H = (int) q->ne[2], HKV = (int) k->ne[2];
+    const size_t row = (size_t) HKV * D * 2, qrow = (size_t) H * D * 4;
+    const int64_t ncols = rows ? rows->ne[0] : k->ne[1], behind = std::min(fa_rows_behind(k, row), fa_rows_behind(v, row));
+    auto t1 = std::chrono::steady_clock::now();
+    int launches = 0; double fl = 0;
+    for (const fa_run & r : runs) {
+        const int64_t vmax = std::min<int64_t>(r.vis0 + (int64_t) r.dvis * (r.nq - 1), ncols - r.lo);
+        const int64_t nk = (vmax + 15) / 16 * 16;
+        bool ok = r.lo + nk <= behind;
+        if (ok && rows) {
+            const int32_t * rr = (const int32_t *) rows->data;
+            for (int64_t c = r.lo; c < r.lo + vmax && ok; c++) ok = rr[c] == c;
+        }
+        for (int64_t j = r.lo + vmax; j < r.lo + nk && ok; j++) {   // p = 0 there, but 0 * Inf/NaN in V is NaN
+            const uint16_t * vr = (const uint16_t *) ((const char *) v->data + j * v->nb[1]);
+            for (int64_t x = 0; x < (int64_t) HKV * D; x++) if ((vr[x] & 0x7C00) == 0x7C00) { ok = false; break; }
+        }
+        int nl = 0, rc = 1;
+        if (ok) {
+            const char * kb = (const char *) k->data + (size_t) r.lo * row, * vb = (const char *) v->data + (size_t) r.lo * row;
+            const struct ggml_tensor * kr = k->view_src ? k->view_src : k, * vr = v->view_src ? v->view_src : v;
+            std::lock_guard<std::mutex> lk(gpu_mu);
+            rc = gen9blas_attn_f16kv(D, H, HKV, r.nq, (int) nk, (const float *) ((const char *) q->data + (size_t) r.t0 * qrow),
+                                     (const uint16_t *) kb, (size_t) ((const char *) kr->data + ggml_nbytes(kr) - kb),
+                                     (const uint16_t *) vb, (size_t) ((const char *) vr->data + ggml_nbytes(vr) - vb),
+                                     (float *) ((char *) dst->data + (size_t) r.t0 * qrow), fa_param(dst, 0), r.vis0, r.dvis, &nl);
+        }
+        if (rc) {
+            if (rc < 0) { n_fa_cpu_err++; fprintf(stderr, "gen9: attention on the GPU failed (%s); ggml-cpu\n", gen9blas_attn_error()); }
+            n_fa_cpu_blk++; fa_on_cpu(ctx, cg, i); return;
+        }
+        launches += nl;
+        for (int t = 0; t < r.nq; t++) fl += 4.0 * H * D * std::min<int64_t>(r.vis0 + (int64_t) r.dvis * t, nk);
+    }
+    n_fa_gpu++; n_fa_blk++; n_fa_blk_runs += (long) runs.size(); n_fa_launch += launches; fa_flop = fa_flop + fl;
+    if (rows) n_fa_rows++;
+    t_fa_gpu_s = t_fa_gpu_s + std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
+}
+
 static void gen9_flash_attn(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
     struct ggml_tensor * dst = cg->nodes[i];
     const struct ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * m = dst->src[3], * rows = dst->src[5];
@@ -486,8 +562,12 @@ static void gen9_flash_attn(gen9_context * ctx, struct ggml_cgraph * cg, int i) 
     int vis0 = (int) k->ne[1], dvis = 0;
     auto t0 = std::chrono::steady_clock::now();
     if (m && !fa_mask_prefix(m, nq, vis0, dvis)) {
+        std::vector<fa_run> runs;
+        const bool blk = fa_mask_blocks(m, nq, runs) && runs.size() > 1 && runs.size() * 8 <= (size_t) nq;
         t_fa_mask_s = t_fa_mask_s + std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        n_fa_cpu_mask++; fa_on_cpu(ctx, cg, i); return;
+        if (!blk) { n_fa_cpu_mask++; fa_on_cpu(ctx, cg, i); return; }
+        gen9_flash_attn_blocks(ctx, cg, i, runs);
+        return;
     }
     const int64_t vmax = std::min<int64_t>(vis0 + (int64_t) dvis * (nq - 1), rows ? rows->ne[0] : k->ne[1]);
     if (rows) {   // kv_rows: column c reads cache row rows[c]; identity over the visible columns = a plain view

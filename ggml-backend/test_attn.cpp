@@ -13,6 +13,8 @@
 //         whispernan (as whisper, V rows n_kv.. set to NaN: the GPU must not be used, the result must stay finite);
 //         the whisper shape with mode causal (64 20 20 512 0 1536) must be computed by ggml-cpu ("library declined"):
 //         with G 1 < RQ 4 a subgroup holds 4 tokens and the kernel takes the visible key count of the first one;
+//         seqs / seqsfull / seqsrows: four sequences in one ubatch (block-diagonal mask, causal or full; seqsrows with
+//         an identity kv_rows list), computed as one launch per sequence (fa_mask_blocks in ggml-gen9.cpp);
 //         Qwen2.5-7B (128 28 4, G 7, ROWVIS binary): causal at any n_q incl. odd ones; KCL_USERPTR_MB=1 forces the
 //         ggml-cpu fallback ("library declined": the K/V region cannot be pinned); depth 16000 / kv_size 16896 splits
 //         each node into several launches (GEN9_INFO)
@@ -33,7 +35,7 @@
 #include <vector>
 
 int main(int argc, char ** argv) {
-    if (argc < 8) { fprintf(stderr, "usage: %s lib D H HKV n_q depth kv_size [causal|full|rows|hole|nonpad|whisper|whispernan] [qrange]\n", argv[0]); return 2; }
+    if (argc < 8) { fprintf(stderr, "usage: %s lib D H HKV n_q depth kv_size [causal|full|rows|hole|nonpad|whisper|whispernan|seqs|seqsfull|seqsrows] [qrange]\n", argv[0]); return 2; }
     const int D = atoi(argv[2]), H = atoi(argv[3]), HKV = atoi(argv[4]), nq = atoi(argv[5]), depth = atoi(argv[6]), kv_size = atoi(argv[7]);
     const std::string mode = argc > 8 ? argv[8] : "causal";
     const float qrange = argc > 9 ? atof(argv[9]) : 1.0f;
@@ -52,7 +54,7 @@ int main(int argc, char ** argv) {
     ggml_tensor * kc = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, (int64_t) HKV * D, kv_size);
     ggml_tensor * vc = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, (int64_t) HKV * D, kv_size);
     ggml_tensor * qcur = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, H, nq);
-    const bool rows_mode = mode == "rows";
+    const bool rows_mode = mode == "rows" || mode == "seqsrows";
     ggml_tensor * rows = rows_mode ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, 1) : nullptr;
     ggml_tensor * mask = mode == "full" || whisper ? nullptr : ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, nq);
     // views as in llama_kv_cache::get_k / get_v (flash attention: V not transposed) and build_attn_mha
@@ -91,9 +93,19 @@ int main(int argc, char ** argv) {
     if (rows) for (int c = 0; c < n_kv; c++) ((int32_t *) rows->data)[c] = c < depth + nq ? c : -1;
     if (mask) {
         ggml_fp16_t z = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
+        // seqs*: 4 sequences of unequal length in one ubatch (llama-server embeddings), cells contiguous per
+        // sequence from depth; token at position p of sequence s sees cells [depth + start_s, depth + start_s + p]
+        // (seqsfull: the whole sequence, no causal limit)
+        const bool seqs = mode.rfind("seqs", 0) == 0;
+        int st[5] = { 0, nq * 2 / 5, nq * 13 / 20, nq * 17 / 20, nq };
         for (int t = 0; t < nq; t++)
             for (int c = 0; c < n_kv; c++) {
                 bool vis = c <= depth + t;
+                if (seqs) {
+                    int sq = 0; while (t >= st[sq + 1]) sq++;
+                    const int lo = depth + st[sq], hi = mode == "seqsfull" ? depth + st[sq + 1] : depth + t + 1;
+                    vis = c >= lo && c < hi;
+                }
                 if (mode == "hole" && c == 3) vis = false;
                 ((ggml_fp16_t *) mask->data)[(size_t) t * n_kv + c] = vis ? z : ninf;
             }
