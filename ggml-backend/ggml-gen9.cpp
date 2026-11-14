@@ -55,6 +55,15 @@ static std::atomic<long> n_fa_gpu{0}, n_fa_launch{0}, n_fa_rows{0}, n_fa_cpu_mas
 static std::atomic<long> n_fa_tail{0}, n_fa_cpu_tail{0};   // n_k not a multiple of 16: rounded up on the GPU / V tail not finite
 static std::atomic<long> n_fa_blk{0}, n_fa_blk_runs{0}, n_fa_blk_gather{0}, n_fa_cpu_blk{0};   // general masks (fa_mask_runs)
 static std::atomic<double> t_fa_gpu_s{0}, t_fa_mask_s{0}, t_fa_cpu_s{0}, fa_flop{0};
+// GEN9_PROF=1: wall time per graph_compute branch, with a wait after every elementwise op (as GEN9_EW_SYNC). GEMM and
+// attention shares are right; elementwise ops carry their own wait (~0.2 ms each), which a normal run hides, so their
+// share is overstated and the total is slower: compare PROF runs only with PROF runs (kcl's KCL_PHASES=1 for submit/wait).
+enum { PR_FFN, PR_QKV, PR_EPI, PR_MM, PR_GLU, PR_RMS, PR_BINOP, PR_ROPE, PR_NORM, PR_GELU, PR_FA, PR_EWCPU, PR_N };
+static const char * pr_name[PR_N] = { "FFN fused", "Q/K/V group", "MUL_MAT+epilogue", "MUL_MAT", "GLU alone", "RMS_NORM(+MUL)",
+                                      "ADD/MUL", "ROPE", "NORM", "GELU", "FLASH_ATTN", "elementwise on ggml-cpu" };
+static std::atomic<double> pr_t[PR_N], pr_flop[PR_N], pr_graph_s{0};
+static std::atomic<long> pr_n[PR_N];
+static bool prof_on(void) { static const bool v = getenv("GEN9_PROF") && atoi(getenv("GEN9_PROF")) != 0; return v; }
 
 static void gen9_report(void) {
     fprintf(stderr, "gen9: MUL_MAT groups on one input (Q/K/V) %ld covering %ld MUL_MATs; candidates refused for memory overlap %ld; "
@@ -99,6 +108,19 @@ static void gen9_report(void) {
     fprintf(stderr, "gen9: FLASH_ATTN_EXT general masks (several sequences, wrapped cache, kv_rows not identity): on the GPU %ld "
             "(%ld runs, %ld with K/V gathered), computed by ggml-cpu %ld\n", n_fa_blk.load(), n_fa_blk_runs.load(),
             n_fa_blk_gather.load(), n_fa_cpu_blk.load());
+    if (prof_on()) {
+        double sum = 0; for (int k = 0; k < PR_N; k++) sum += pr_t[k].load();
+        fprintf(stderr, "gen9: PROF graph_compute %.3f s, of it in the branches below %.3f s (rest: loop, no-op nodes)\n",
+                pr_graph_s.load(), sum);
+        for (int k = 0; k < PR_N; k++) {
+            if (!pr_n[k].load()) continue;
+            const double t = pr_t[k].load(), f = pr_flop[k].load();
+            fprintf(stderr, "gen9: PROF %-24s %7ld calls %9.3f s %5.1f %%", pr_name[k], pr_n[k].load(), t,
+                    pr_graph_s.load() > 0 ? 100 * t / pr_graph_s.load() : 0.0);
+            if (f > 0) fprintf(stderr, "  %9.1f GFLOP %6.1f GFLOPS", f * 1e-9, t > 0 ? f * 1e-9 / t : 0.0);
+            fprintf(stderr, "\n");
+        }
+    }
 }
 
 // ---------------- GPU (lazy: first use) ----------------
@@ -491,19 +513,33 @@ static bool fa_mask_runs(const struct ggml_tensor * m, int64_t nq, std::vector<f
     auto row = [&](int64_t t) { return (const uint16_t *) ((const char *) m->data + t * m->nb[1]); };
     for (int64_t t = 0; t < nq; t++) {
         const uint16_t * r = row(t), * p = t > 0 ? row(t - 1) : nullptr;
-        int64_t nz = 0, added = -1, ndiff = 0;
+        fa_run * cur = runs.empty() ? nullptr : &runs.back();
+        if (cur) {   // fast path: compare with the previous row 8 bytes at a time; the previous row was validated already, so
+                     // only changed columns need a value check. Exactly one change -inf -> 0 extends a dvis 1 run, none a dvis 0 run.
+            int64_t added = -1, ndiff = 0, c = 0;
+            for (; c + 4 <= nc && ndiff < 2; c += 4) {
+                if (c + 16 <= nc) {   // 32 bytes per step while equal
+                    uint64_t x = 0;
+                    for (int w = 0; w < 4; w++) { uint64_t a, b; memcpy(&a, r + c + 4 * w, 8); memcpy(&b, p + c + 4 * w, 8); x |= a ^ b; }
+                    if (!x) { c += 12; continue; }
+                }
+                uint64_t a, b; memcpy(&a, r + c, 8); memcpy(&b, p + c, 8);
+                if (a == b) continue;
+                for (int64_t e = c; e < c + 4; e++) if (r[e] != p[e]) { ndiff++; added = (r[e] == 0 && p[e] == 0xFC00) ? e : -2; }
+            }
+            for (; c < nc && ndiff < 2; c++) if (r[c] != p[c]) { ndiff++; added = (r[c] == 0 && p[c] == 0xFC00) ? c : -2; }
+            if (ndiff == 0 && (cur->nq == 1 || cur->dvis == 0)) { cur->dvis = 0; cur->nq++; continue; }
+            if (ndiff == 1 && added >= 0 && (cur->nq == 1 || cur->dvis == 1)) {
+                cur->dvis = 1; cur->col.push_back((int32_t) added); cur->nq++; continue;
+            }
+        }
+        int64_t nz = 0;   // new run: full scan with value check
         for (int64_t c = 0; c < nc; c++) {
             const uint16_t x = r[c];
             if (x != 0 && x != 0xFC00) return false;
             if (x == 0) nz++;
-            if (p && x != p[c]) { ndiff++; added = (x == 0 && p[c] == 0xFC00) ? c : -2; }
         }
         if (nz < 1) return false;
-        fa_run * cur = runs.empty() ? nullptr : &runs.back();
-        if (cur && ndiff == 0 && (cur->nq == 1 || cur->dvis == 0)) { cur->dvis = 0; cur->nq++; continue; }
-        if (cur && ndiff == 1 && added >= 0 && (cur->nq == 1 || cur->dvis == 1)) {
-            cur->dvis = 1; cur->col.push_back((int32_t) added); cur->nq++; continue;
-        }
         fa_run n{ (int) t, 1, (int) nz, 1, {} };
         n.col.reserve(nz + 64);
         for (int64_t c = 0; c < nc; c++) if (r[c] == 0) n.col.push_back((int32_t) c);
@@ -533,8 +569,10 @@ static void fa_on_cpu(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
 
 // One launch per run of fa_mask_runs. A run whose key order maps to consecutive cache rows reads K/V in place (Q/O
 // offset by t0 rows, K/V by the first row); otherwise its K/V rows are gathered into a reused, page-aligned staging
-// buffer (pinned once by kcl's userptr cache) padded with zero rows to a multiple of 16. Any run the library cannot
-// take -> the whole node on ggml-cpu (it overwrites what earlier runs wrote).
+// buffer padded with zero rows to a multiple of 16. Any run the library cannot
+// take -> the whole node on ggml-cpu (it overwrites what earlier runs wrote). kcl reuses a pinned object only for the
+// exact same page range, so the varying ranges here (K/V from cr[0] to the tensor's end, staging nk rows) are pinned
+// again; KCL_USERPTR_MB=2048 measured +1 % (results/attn-qwen3-prof-gp-2026-11-14.txt): left as is for now.
 static void gen9_flash_attn_runs(gen9_context * ctx, struct ggml_cgraph * cg, int i, const std::vector<fa_run> & runs) {
     static char * stage = nullptr; static size_t stage_bytes = 0;   // [K rows | V rows], used under gpu_mu
     struct ggml_tensor * dst = cg->nodes[i];
@@ -875,7 +913,7 @@ static bool gen9_rope(gen9_context * ctx, struct ggml_tensor * node) {
 
 // Start of a split: when it holds elementwise ops, register the buffers its nodes write as spans (else: wait per op).
 static void ew_begin(gen9_context * ctx, struct ggml_cgraph * cg) {
-    ctx->ew_sync = ew_force_sync(); ctx->ew_pending = false; ctx->ew_cpu = false;
+    ctx->ew_sync = ew_force_sync() || prof_on(); ctx->ew_pending = false; ctx->ew_cpu = false;
     bool any = false, waits = false;
     std::set<ggml_backend_buffer_t> bufs;
     for (int i = 0; i < cg->n_nodes; i++) {
@@ -969,6 +1007,8 @@ static int gen9_try_epi(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
 static enum ggml_status gen9_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     gen9_context * ctx = (gen9_context *) backend->context;
     n_graphs++;
+    const auto pg0 = std::chrono::steady_clock::now();
+    struct pr_guard { std::chrono::steady_clock::time_point t; ~pr_guard() { if (prof_on()) pr_graph_s = pr_graph_s + std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count(); } } pguard{ pg0 };
     ew_begin(ctx, cgraph);
     struct ew_guard { gen9_context * c; ~ew_guard() { ew_end(c); } } guard{ ctx };
     ctx->done.assign(cgraph->n_nodes, 0);
@@ -978,55 +1018,77 @@ static enum ggml_status gen9_graph_compute(ggml_backend_t backend, struct ggml_c
         struct ggml_tensor * node = cgraph->nodes[i];
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) { n_noop++; continue; }
         if (ctx->done[i]) continue;
+        const bool prof = prof_on(); const int i0 = i; int pk = -1;
+        std::chrono::steady_clock::time_point pt0;
+        std::vector<char> done0;
+        if (prof) { pt0 = std::chrono::steady_clock::now(); if (node->op == GGML_OP_MUL_MAT) done0 = ctx->done; }
         switch (node->op) {
             case GGML_OP_NONE: case GGML_OP_RESHAPE: case GGML_OP_VIEW: case GGML_OP_PERMUTE: case GGML_OP_TRANSPOSE:
                 n_noop++;
                 break;
             case GGML_OP_MUL_MAT:
-                if (gen9_try_ffn(ctx, cgraph, i)) { i += 3; break; }
-                if (gen9_try_multi(ctx, cgraph, i)) break;
+                if (gen9_try_ffn(ctx, cgraph, i)) { i += 3; pk = PR_FFN; break; }
+                if (gen9_try_multi(ctx, cgraph, i)) { pk = PR_QKV; break; }
                 {
                     const int used = gen9_try_epi(ctx, cgraph, i);
                     if (used < 0) return GGML_STATUS_FAILED;
-                    if (used > 0) { i += used - 1; break; }
+                    if (used > 0) { i += used - 1; pk = PR_EPI; break; }
                 }
                 if (!gen9_mul_mat(ctx, node)) return GGML_STATUS_FAILED;
+                pk = PR_MM;
                 break;
             case GGML_OP_GLU:
                 ew_flush(ctx);
                 gen9_glu_alone(node);
+                pk = PR_GLU;
                 break;
             case GGML_OP_RMS_NORM: {
-                if (ctx->ew_cpu) { cpu_node(ctx, cgraph, i); n_ew_cpu_nodes++; break; }
+                if (ctx->ew_cpu) { cpu_node(ctx, cgraph, i); n_ew_cpu_nodes++; pk = PR_EWCPU; break; }
                 const int used = gen9_rms_norm(ctx, cgraph, i);
                 if (!used) return GGML_STATUS_FAILED;
-                i += used - 1;
+                i += used - 1; pk = PR_RMS;
                 break;
             }
             case GGML_OP_ADD: case GGML_OP_MUL:
-                if (ctx->ew_cpu) { cpu_node(ctx, cgraph, i); n_ew_cpu_nodes++; break; }
+                if (ctx->ew_cpu) { cpu_node(ctx, cgraph, i); n_ew_cpu_nodes++; pk = PR_EWCPU; break; }
                 if (!gen9_binop(ctx, node)) return GGML_STATUS_FAILED;
+                pk = PR_BINOP;
                 break;
             case GGML_OP_ROPE:
-                if (ctx->ew_cpu) { cpu_node(ctx, cgraph, i); n_ew_cpu_nodes++; break; }
+                if (ctx->ew_cpu) { cpu_node(ctx, cgraph, i); n_ew_cpu_nodes++; pk = PR_EWCPU; break; }
                 if (!gen9_rope(ctx, node)) return GGML_STATUS_FAILED;
+                pk = PR_ROPE;
                 break;
             case GGML_OP_NORM: {
-                if (ctx->ew_cpu) { cpu_node(ctx, cgraph, i); n_ew_cpu_nodes++; break; }
+                if (ctx->ew_cpu) { cpu_node(ctx, cgraph, i); n_ew_cpu_nodes++; pk = PR_EWCPU; break; }
                 const int used = gen9_layer_norm(ctx, cgraph, i);
                 if (!used) return GGML_STATUS_FAILED;
-                i += used - 1;
+                i += used - 1; pk = PR_NORM;
                 break;
             }
             case GGML_OP_UNARY:
-                if (ctx->ew_cpu) { cpu_node(ctx, cgraph, i); n_ew_cpu_nodes++; break; }
+                if (ctx->ew_cpu) { cpu_node(ctx, cgraph, i); n_ew_cpu_nodes++; pk = PR_EWCPU; break; }
                 if (!gen9_gelu(ctx, node)) return GGML_STATUS_FAILED;
+                pk = PR_GELU;
                 break;
             case GGML_OP_FLASH_ATTN_EXT:
                 gen9_flash_attn(ctx, cgraph, i);
+                pk = PR_FA;
                 break;
             default:
                 GGML_ABORT("gen9: unsupported op %s reached graph_compute", ggml_op_desc(node));
+        }
+        if (prof && pk >= 0) {
+            if (pk != PR_FA && pk != PR_EWCPU) ew_flush(ctx);   // ew_sync waits already; GEMM paths wait in the library
+            const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - pt0).count();
+            double fl = 0;
+            for (int j = 0; j < cgraph->n_nodes; j++) {   // MUL_MATs computed by this branch (range or marked done)
+                const struct ggml_tensor * n = cgraph->nodes[j];
+                if (n->op != GGML_OP_MUL_MAT || !((j >= i0 && j <= i) || (!done0.empty() && !done0[j] && ctx->done[j]))) continue;
+                fl += 2.0 * (double) n->src[0]->ne[0] * (double) n->ne[0] * (double) n->ne[1] * (double) n->ne[2] * (double) n->ne[3];
+            }
+            if (pk == PR_FA) fl = 0;
+            pr_t[pk] = pr_t[pk] + dt; pr_flop[pk] = pr_flop[pk] + fl; pr_n[pk]++;
         }
     }
     return GGML_STATUS_SUCCESS;

@@ -1,0 +1,118 @@
+# Qwen3-Embedding-0.6B Q8_0, batched embeddings: profile + A/B of the faster FA mask analysis, gp (UHD 620), 2026-11-14
+# llama-server --embedding --pooling last -t 4 -c 8192 -b 2048 -ub 512 -fa on -ngl 0 (GEN9 backend,
+# GEN9_ATTN=1), 64 texts of ~1500 chars (PL + EN) in one request, 26727 tokens. GPU-only runs; the CPU baseline
+# (403/362 tok/s) is in results/attn-qwen3-2026-11-14.txt and was not re-run (no heavy CPU runs per iteration).
+# Build on gp: lib/kernels.c sha256 482ba04da08b (= kp), IGC 17537. head = 8c7e1ac backend, new = + faster
+# fa_mask_runs + GEN9_PROF (this commit). Script: gp ~/q3-34/q3gp/prof.sh; raw output below.
+
+## 1. A/B faster mask analysis (ABBA)
+  head  488 / 489 tok/s   mask analysis 3.04 / 2.99 s per server run
+  new   516 / 516 tok/s   mask analysis 0.31 / 0.31 s
+  -> +5.6 % end to end, analysis 9.7x faster in the server (synthetic 4.7x); same runs and launches (3052 runs,
+  3304 launches), so the GPU work and the embeddings are identical. CPU unit test: 20000 random masks, 0 mismatches;
+  test_attn on tc: 7 mask modes NMSE <= 9e-14 (results/attn-qwen3-short-tc-2026-11-14.txt).
+
+## 2. Where the time goes (GEN9_PROF=1, 499 tok/s: the per-op waits slow it down)
+  graph_compute 57.3 s
+  FFN fused (gate+up+SwiGLU+down)  42.6 %   626 GFLOPS
+  MUL_MAT (O projection etc.)      20.6 %   571 GFLOPS
+  Q/K/V group                      10.8 %   554 GFLOPS
+  FLASH_ATTN                       17.2 %   (9.3 s in a normal run, 199 GFLOPS incl. pinning/submit/wait)
+  RMS_NORM(+MUL) 5.0 %, ROPE 2.0 %, ADD 1.6 %  <- overstated: each carries a wait a normal run does not have
+  -> GEMMs are 74 % of the time at 554-626 GFLOPS (~70-78 % of the FP16 peak at the run's clock) [MEAS / EST peak];
+  attention 17-18 %; elementwise ops below ~5 % in a normal run.
+
+## 3. kcl phases (KCL_PHASES=1, 514 tok/s)
+  EnqueueNDRange 47574 x 2.2 us; execbuf 11678 x 165 us CPU (1.9 s, includes userptr pinning); GEM_WAIT 11678 x
+  4.46 ms (= GPU time); 9.3 objects per execbuf.
+  KCL_USERPTR_MB=2048: 521 tok/s (+1 %), attention 9.30 -> 8.93 s -> the varying pinned ranges of the general-mask
+  path (fable review) cost ~0.4 s here, not more [MEAS].
+
+## 4. -ub sweep (new)
+  -ub 512  516 tok/s;  -ub 1024  488 tok/s;  -ub 2048  476 tok/s  -> keep 512 (bigger ubatches are slower here;
+  attention time unchanged at ~9.3 s, mask analysis grows to 1.0 / 1.4 s).
+  (prof.out prints "mask analysis 2.990 s" after these two runs: a script bug, it grepped the head log.)
+
+## Consequences for the plan
+- Faster mask analysis: done (+5.6 %).
+- Stable pinning ranges: worth <= ~1 % -> low priority. One kcl operation per node / array kernel: attention
+  overhead beyond the kernel is now small (199 GFLOPS vs ~225 synthetic at this length) -> not worth days.
+- The remaining lever is GEMM (74 %), already at ~70-78 % of peak; the last-layer-only-for-last-token trick
+  (llama.cpp patch, ~3 % est.) cuts GEMM work instead of speeding it up.
+
+## Raw
+# 10:50:11 load 0.33 0.12 0.41 ub 512 head
+batch n=64: 54.75 s, 1.17 chunks/s, 488 tok/s (26727 tokens)
+mask analysis 3.035 s
+# 10:51:13 load 1.00 0.40 0.50 ub 512 new
+batch n=64: 51.84 s, 1.23 chunks/s, 516 tok/s (26727 tokens)
+mask analysis 0.309 s
+# 10:52:11 load 1.48 0.62 0.56 ub 512 new
+batch n=64: 51.83 s, 1.23 chunks/s, 516 tok/s (26727 tokens)
+mask analysis 0.311 s
+# 10:53:09 load 1.96 0.92 0.67 ub 512 head
+batch n=64: 54.67 s, 1.17 chunks/s, 489 tok/s (26727 tokens)
+mask analysis 2.990 s
+# 10:54:10 load 2.29 1.22 0.79 ub 512 PROF new
+batch n=64: 53.55 s, 1.20 chunks/s, 499 tok/s (26727 tokens)
+gen9: PROF graph_compute 57.332 s, of it in the branches below 57.292 s (rest: loop, no-op nodes)
+gen9: PROF FFN fused                   1624 calls    24.412 s  42.6 %    15294.3 GFLOP  626.5 GFLOPS
+gen9: PROF Q/K/V group                 1680 calls     6.215 s  10.8 %     3445.8 GFLOP  554.4 GFLOPS
+gen9: PROF MUL_MAT                     3192 calls    11.826 s  20.6 %     6750.4 GFLOP  570.8 GFLOPS
+gen9: PROF RMS_NORM(+MUL)              6554 calls     2.876 s   5.0 %
+gen9: PROF ADD/MUL                     3248 calls     0.941 s   1.6 %
+gen9: PROF ROPE                        3248 calls     1.123 s   2.0 %
+gen9: PROF FLASH_ATTN                  1624 calls     9.845 s  17.2 %
+gen9: PROF elementwise on ggml-cpu      224 calls     0.053 s   0.1 %
+# 10:55:10 load 2.65 1.52 0.92 ub 512 KCL_PHASES+PROFILE_KERNELS new
+batch n=64: 52.05 s, 1.23 chunks/s, 514 tok/s (26727 tokens)
+kcl phase EnqueueNDRange        47574 x  wall     2.22 us  CPU     2.21 us (per call)
+kcl phase execbuf (ioctl)       11678 x  wall   164.54 us  CPU   164.59 us (per call)
+kcl phase GEM_WAIT (ioctl)      11678 x  wall  4461.96 us  CPU    22.01 us (per call)
+kcl phase userptr               67234 x  wall     0.74 us  CPU     0.68 us (per call)
+kcl phase objects per execbuf: 9.3
+# 10:56:09 load 2.04 1.56 0.97 ub 512 KCL_USERPTR_MB=2048 new
+batch n=64: 51.31 s, 1.25 chunks/s, 521 tok/s (26727 tokens)
+# 10:57:06 load 1.70 1.58 1.02 ub 1024 new
+batch n=64: 54.75 s, 1.17 chunks/s, 488 tok/s (26727 tokens)
+mask analysis 2.990 s
+# 10:58:08 load 1.94 1.67 1.09 ub 2048 new
+batch n=64: 56.10 s, 1.14 chunks/s, 476 tok/s (26727 tokens)
+mask analysis 2.990 s
+== prof_ab_head.log
+gen9: elementwise ops on the GPU: RMS_NORM 6554 (with MUL fused 6554), ADD 3248, MUL 0, ROPE 3248; splits run with a wait per op (span not registered or GEN9_EW_SYNC) 0; supports_op asked 25130, declined 3390
+gen9: FFN blocks fused 1624 (recomputed unfused after FP16 overflow: 0); SWIGLU alone 0; supports_op GLU asked 1736, declined 0
+gen9: FLASH_ATTN_EXT run on the GPU 1624 (3304 launches, 1624 with kv_rows), 9.359 s, 1849.2 GFLOP (197.6 GFLOPS incl. pinning/submit/wait); mask analysis 2.990 s; computed by ggml-cpu inside GEN9: mask not causal/full 0
+gen9: FLASH_ATTN_EXT general masks (several sequences, wrapped cache, kv_rows not identity): on the GPU 1372 (3052 runs, 1820 with K/V gathered), computed by ggml-cpu 0
+== prof_ab_new.log
+gen9: elementwise ops on the GPU: RMS_NORM 6554 (with MUL fused 6554), ADD 3248, MUL 0, ROPE 3248; splits run with a wait per op (span not registered or GEN9_EW_SYNC) 0; supports_op asked 25130, declined 3390
+gen9: FFN blocks fused 1624 (recomputed unfused after FP16 overflow: 0); SWIGLU alone 0; supports_op GLU asked 1736, declined 0
+gen9: FLASH_ATTN_EXT run on the GPU 1624 (3304 launches, 1624 with kv_rows), 9.295 s, 1849.2 GFLOP (198.9 GFLOPS incl. pinning/submit/wait); mask analysis 0.311 s; computed by ggml-cpu inside GEN9: mask not causal/full 0
+gen9: FLASH_ATTN_EXT general masks (several sequences, wrapped cache, kv_rows not identity): on the GPU 1372 (3052 runs, 1820 with K/V gathered), computed by ggml-cpu 0
+== prof_phases512.log
+gen9: elementwise ops on the GPU: RMS_NORM 6554 (with MUL fused 6554), ADD 3248, MUL 0, ROPE 3248; splits run with a wait per op (span not registered or GEN9_EW_SYNC) 0; supports_op asked 25130, declined 3390
+gen9: FFN blocks fused 1624 (recomputed unfused after FP16 overflow: 0); SWIGLU alone 0; supports_op GLU asked 1736, declined 0
+gen9: FLASH_ATTN_EXT run on the GPU 1624 (3304 launches, 1624 with kv_rows), 9.322 s, 1849.2 GFLOP (198.4 GFLOPS incl. pinning/submit/wait); mask analysis 0.302 s; computed by ggml-cpu inside GEN9: mask not causal/full 0
+gen9: FLASH_ATTN_EXT general masks (several sequences, wrapped cache, kv_rows not identity): on the GPU 1372 (3052 runs, 1820 with K/V gathered), computed by ggml-cpu 0
+== prof_prof512.log
+gen9: elementwise ops on the GPU: RMS_NORM 6554 (with MUL fused 6554), ADD 3248, MUL 0, ROPE 3248; splits run with a wait per op (span not registered or GEN9_EW_SYNC) 0; supports_op asked 25130, declined 3390
+gen9: FFN blocks fused 1624 (recomputed unfused after FP16 overflow: 0); SWIGLU alone 0; supports_op GLU asked 1736, declined 0
+gen9: FLASH_ATTN_EXT run on the GPU 1624 (3304 launches, 1624 with kv_rows), 9.468 s, 1849.2 GFLOP (195.3 GFLOPS incl. pinning/submit/wait); mask analysis 0.313 s; computed by ggml-cpu inside GEN9: mask not causal/full 0
+gen9: FLASH_ATTN_EXT general masks (several sequences, wrapped cache, kv_rows not identity): on the GPU 1372 (3052 runs, 1820 with K/V gathered), computed by ggml-cpu 0
+== prof_ub1024.log
+gen9: elementwise ops on the GPU: RMS_NORM 3390 (with MUL fused 3390), ADD 1680, MUL 0, ROPE 1680; splits run with a wait per op (span not registered or GEN9_EW_SYNC) 0; supports_op asked 15666, declined 3390
+gen9: FFN blocks fused 840 (recomputed unfused after FP16 overflow: 0); SWIGLU alone 0; supports_op GLU asked 952, declined 0
+gen9: FLASH_ATTN_EXT run on the GPU 840 (2380 launches, 840 with kv_rows), 9.283 s, 1849.2 GFLOP (199.2 GFLOPS incl. pinning/submit/wait); mask analysis 1.002 s; computed by ggml-cpu inside GEN9: mask not causal/full 0, 
+gen9: FLASH_ATTN_EXT general masks (several sequences, wrapped cache, kv_rows not identity): on the GPU 840 (2380 runs, 1092 with K/V gathered), computed by ggml-cpu 0
+== prof_ub2048.log
+gen9: elementwise ops on the GPU: RMS_NORM 2034 (with MUL fused 2034), ADD 1008, MUL 0, ROPE 1008; splits run with a wait per op (span not registered or GEN9_EW_SYNC) 0; supports_op asked 11610, declined 3390
+gen9: FFN blocks fused 504 (recomputed unfused after FP16 overflow: 0); SWIGLU alone 0; supports_op GLU asked 616, declined 0
+gen9: FLASH_ATTN_EXT run on the GPU 504 (1932 launches, 504 with kv_rows), 9.332 s, 1849.2 GFLOP (198.1 GFLOPS incl. pinning/submit/wait); mask analysis 1.407 s; computed by ggml-cpu inside GEN9: mask not causal/full 0, 
+gen9: FLASH_ATTN_EXT general masks (several sequences, wrapped cache, kv_rows not identity): on the GPU 504 (1932 runs, 280 with K/V gathered), computed by ggml-cpu 0
+== prof_up2048.log
+gen9: elementwise ops on the GPU: RMS_NORM 6554 (with MUL fused 6554), ADD 3248, MUL 0, ROPE 3248; splits run with a wait per op (span not registered or GEN9_EW_SYNC) 0; supports_op asked 25130, declined 3390
+gen9: FFN blocks fused 1624 (recomputed unfused after FP16 overflow: 0); SWIGLU alone 0; supports_op GLU asked 1736, declined 0
+gen9: FLASH_ATTN_EXT run on the GPU 1624 (3304 launches, 1624 with kv_rows), 8.929 s, 1849.2 GFLOP (207.1 GFLOPS incl. pinning/submit/wait); mask analysis 0.301 s; computed by ggml-cpu inside GEN9: mask not causal/full 0
+gen9: FLASH_ATTN_EXT general masks (several sequences, wrapped cache, kv_rows not identity): on the GPU 1372 (3052 runs, 1820 with K/V gathered), computed by ggml-cpu 0
+# 10:59:09 load 1.16 1.51 1.07 end
+PDONE

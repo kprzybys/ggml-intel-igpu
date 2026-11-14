@@ -1,0 +1,45 @@
+# Qwen3 attention (D 128, H 16, H_kv 8) at embedding-chunk lengths, synthetic, tc (HD 530, i5-6500), 2026-11-14 10:25
+# Build: working tree = HEAD 8c7e1ac + faster fa_mask_runs (word compare) + GEN9_PROF (uncommitted at the
+# time), lib/kernels.c sha256 482ba04da08b (same as kp). Tree copied kp -> the 32-thread desktop -> tc (testuser ~/g34), 136 files
+# sha256-checked. nice 19; mumudvb running (~28 % CPU), so CPU times are noisy (e.g. full n=128).
+# Tool: ggml-backend/test_attn (one FLASH_ATTN_EXT node, GEN9 vs ggml-cpu, best of 3), depth 0, kv_size 4096.
+# GFLOPS = visible keys only: causal 4*H*D*n(n+1)/2, full 4*H*D*n*n_kv (n_kv = n rounded up to 256).
+
+## 1. Correctness of the faster mask analysis on the GPU (n_q 512)
+causal   NMSE 4.5e-14   GEN9 4.96 ms  ggml-cpu 10.27 ms
+seqs     NMSE 2.6e-14   12 runs                       2.83 / 6.13 ms
+seqsfull NMSE 7.5e-14   12 runs                       3.76 / 8.64 ms
+seqsrows NMSE 2.6e-14   12 runs, kv_rows              2.89 / 5.91 ms
+wrap     NMSE 8.9e-14   6 runs, 3 gathered            6.01 / 11.69 ms
+perm     NMSE 4.4e-14   3 runs, 3 gathered            5.13 / 10.51 ms
+hole     NMSE 4.3e-14   6 runs, 3 gathered            5.68 / 10.27 ms
+-> all OK (bound 5e-4), nothing fell back to ggml-cpu.
+CPU-only unit test of the analysis (scratchpad masktest.cpp, old vs new function): 20000 random masks (sequences,
+growing/random columns, invalid values, empty rows), 0 mismatches; 512 x 2048 causal+wrap mask 0.89 -> 0.19 ms (4.7x).
+
+## 2. Length sweep (one sequence per node)
+causal  n=   32  GPU    0.64 ms (   6.8 GFLOPS)  CPU    0.22 ms ( 19.7)  GPU/CPU 0.3x
+causal  n=   64  GPU    0.65 ms (  26.2 GFLOPS)  CPU    0.33 ms ( 51.6)  GPU/CPU 0.5x
+causal  n=  128  GPU    1.04 ms (  65.0 GFLOPS)  CPU    0.97 ms ( 69.7)  GPU/CPU 0.9x
+causal  n=  256  GPU    1.71 ms ( 157.6 GFLOPS)  CPU    2.86 ms ( 94.2)  GPU/CPU 1.7x
+causal  n=  384  GPU    3.09 ms ( 196.0 GFLOPS)  CPU    6.25 ms ( 96.9)  GPU/CPU 2.0x
+causal  n=  512  GPU    4.76 ms ( 226.0 GFLOPS)  CPU   10.28 ms (104.7)  GPU/CPU 2.2x
+causal  n= 1024  GPU   16.54 ms ( 259.9 GFLOPS)  CPU   37.56 ms (114.5)  GPU/CPU 2.3x
+causal  n= 2048  GPU   59.24 ms ( 290.1 GFLOPS)  CPU  164.94 ms (104.2)  GPU/CPU 2.8x
+full    n=   32  GPU    0.99 ms (  67.8 GFLOPS)  CPU    2.40 ms ( 28.0)  GPU/CPU 2.4x
+full    n=   64  GPU    1.21 ms ( 110.9 GFLOPS)  CPU    1.00 ms (134.2)  GPU/CPU 0.8x
+full    n=  128  GPU    1.91 ms ( 140.5 GFLOPS)  CPU    9.51 ms ( 28.2)  GPU/CPU 5.0x   (CPU outlier: mumudvb)
+full    n=  256  GPU    2.74 ms ( 195.9 GFLOPS)  CPU    4.15 ms (129.4)  GPU/CPU 1.5x
+full    n=  384  GPU    6.63 ms ( 242.9 GFLOPS)  CPU   11.62 ms (138.6)  GPU/CPU 1.8x
+full    n=  512  GPU    8.44 ms ( 254.4 GFLOPS)  CPU   15.80 ms (135.9)  GPU/CPU 1.9x
+full    n= 1024  GPU   31.24 ms ( 275.0 GFLOPS)  CPU   62.22 ms (138.1)  GPU/CPU 2.0x
+full    n= 2048  GPU  113.27 ms ( 303.3 GFLOPS)  CPU  304.92 ms (112.7)  GPU/CPU 2.7x
+
+## Reading
+- Fixed cost per node ~0.6 ms (n 32 and 64 take the same time): pinning + submit + wait. Below n ~ 150 the CPU is
+  faster; the library's n_q < 32 cut-off is too low for short texts [MEAS].
+- Typical document chunk (~430 tokens, causal): ~200-225 GFLOPS, 2.0-2.2x the CPU; long prompts reach 290-300.
+- In the batched embedding run on gp (-ub 512): 5740 launches for 3556 nodes; at ~0.6 ms fixed cost that is ~3 s of
+  the 16.9 s attention time [EST]. One launch per node for all runs (plan step 2) removes the repeated fixed cost and
+  fills the GPU better; larger -ub (more texts per node) works in the same direction without kernel changes -> the gp
+  -ub 512/1024/2048 sweep decides whether step 2 is worth its cost.
