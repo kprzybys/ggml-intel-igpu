@@ -41,3 +41,11 @@ Interleaved (3 rounds, order alternating):
   encoder median 5535 -> 5053 ms per window (-0.48 s, -8.7 %); whole run 27.61 -> 26.22 s (-5.0 %).
 ## Against the prediction
 Predicted -0.46 s per window (8 % of the encoder, ~5 % of a run); measured -0.48 s (8.7 %), -5.0 % of the run. Holds.
+
+## Q8_0 model (2026-11-14 ~03:05, gp, janko60; fusion extended to quantized weights packed as FP16, 89f7b68)
+Q8_0 EPI=0: encode 16779 ms / 3, decode 13.35 ms/token, total 23.83 s
+Q8_0 EPI=1: encode 15181 ms / 3 (fused 520, + GELU 100, + residual 204), decode 13.35, total 21.69 s; transcripts
+            identical to EPI=0
+F16  EPI=1: encode 15287 ms / 3, decode 23.33, total 26.38 s
+-> Q8_0 + fusion -21 % vs F16 without fusion (27.6 s); the two levers add up (decoder on the CPU, encoder on the GPU).
+Production bundle on gp: 89f7b68 (clean worktree), selftest OK with the Q8_0 model.
