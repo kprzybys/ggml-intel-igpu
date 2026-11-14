@@ -450,11 +450,11 @@ static int64_t fa_rows_behind(const struct ggml_tensor * t, size_t row) {
 // F32 K/V (NeMo-Speech.cpp's RoPE encoder: K = RoPE output, V = a view of the fused QKV projection, both permuted):
 // no mask, no kv_rows; any K/V row and head strides with contiguous D. gen9_flash_attn_f32kv converts them to FP16 in
 // the kernel's layout ([key][head][d], rows padded with zeros to a multiple of 16) in the staging buffer. Q and the
-// output in llama.cpp's layouts, as for F16 K/V. Opt-in (GEN9_ATTN_F32KV=1): on gp (UHD 620) Nemotron 3 Diarization got
-// slower with it, 120 windows 177.8 -> 208.6 s, 1 h 111 -> 134 s (the single-threaded FP16 conversion under gpu_mu and
-// ~85 GFLOPS on the GPU vs ggml-cpu's multithreaded F32 attention); results equal to the CPU path.
+// output in llama.cpp's layouts, as for F16 K/V. On by default; GEN9_ATTN_F32KV=0 turns it off. With the conversion on
+// the CPU (one thread, under gpu_mu) it was slower than ggml-cpu (gp: 1 h 111 -> 134 s); on the GPU (gen9blas_cvt_f16_heads)
+// and with n_q not divisible by 4 handled (NeMo's chunks of 265 / 530 rows were declined before), 1 h 99 -> 81 s.
 static bool fa_f32kv_ok(const struct ggml_tensor * op) {
-    static const bool off = [] { const char * e = getenv("GEN9_ATTN_F32KV"); return !e || strcmp(e, "1") != 0; }();
+    static const bool off = [] { const char * e = getenv("GEN9_ATTN_F32KV"); return e && !strcmp(e, "0"); }();
     const struct ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2];
     if (off || q->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 || op->src[3] || op->src[4] || op->src[5] ||
         fa_param(op, 1) != 0.0f || fa_param(op, 2) != 0.0f) { n_fa_decl_type++; return false; }
@@ -687,27 +687,50 @@ static void gen9_flash_attn_f32kv(gen9_context * ctx, struct ggml_cgraph * cg, i
         }
         if (stage) {
             ggml_fp16_t * ks = (ggml_fp16_t *) stage, * vs = (ggml_fp16_t *) (stage + (size_t) nk * row);
+            // conversion on the GPU (gen9blas_cvt_f16_heads, saturated: no Inf), queued before the attention, which waits.
+            // The staging buffer is a kcl span so the conversion's writes and the attention's reads use one GPU object
+            // (else: wait after the conversion). Rows nv..nk keep older contents: always finite (zeroed at allocation or
+            // saturated FP16 from an earlier call), so masked keys get p = 0 and 0 * V stays 0.
             bool fin = true;
-            for (int j = 0; j < nv; j++)
-                for (int h = 0; h < HKV; h++) {
-                    const float * kr = (const float *) ((const char *) k->data + j * k->nb[1] + h * k->nb[2]);
-                    const float * vr = (const float *) ((const char *) v->data + j * v->nb[1] + h * v->nb[2]);
-                    ggml_fp32_to_fp16_row(kr, ks + ((size_t) j * HKV + h) * D, D);
-                    ggml_fp32_to_fp16_row(vr, vs + ((size_t) j * HKV + h) * D, D);
-                }
-            for (size_t x = 0; x < (size_t) nv * HKV * D && fin; x++)   // FP16 range: |x| > 65504 -> Inf
-                fin = (ks[x] & 0x7C00) != 0x7C00 && (vs[x] & 0x7C00) != 0x7C00;
-            memset(ks + (size_t) nv * HKV * D, 0, (size_t) (nk - nv) * row);
-            memset(vs + (size_t) nv * HKV * D, 0, (size_t) (nk - nv) * row);
+            const bool span = gen9blas_span(stage, stage_bytes, 1) == 0;
+            if (gen9blas_cvt_f16_heads(nv, HKV, D, (const float *) k->data, (long) (k->nb[1] / 4), (long) (k->nb[2] / 4),
+                                       (uint16_t *) ks, !span) ||
+                gen9blas_cvt_f16_heads(nv, HKV, D, (const float *) v->data, (long) (v->nb[1] / 4), (long) (v->nb[2] / 4),
+                                       (uint16_t *) vs, !span)) {
+                fprintf(stderr, "gen9: cvt_f16_heads failed: %s\n", gen9blas_error()); fin = false;
+            }
+            // the kernel takes n_q * G divisible by its RQ rows (4 for G 1): n_q = 265 / 530 / 750 in NeMo's chunks. Main part
+            // (n_q rounded down to 4) in place; the last 4 query rows again through a small staging copy, of which the
+            // rows past the main part are copied back (no mask, dvis 0: every row sees the same keys, rows independent)
+            const int nq4 = nq / 4 * 4, qrow = H * D;
+            const size_t kb = (size_t) nk * row + 4096;
             if (fin)
-                rc = gen9blas_attn_f16kv(D, H, HKV, nq, nk, (const float *) q->data, (const uint16_t *) ks, (size_t) nk * row + 4096,
-                                         (const uint16_t *) vs, (size_t) nk * row + 4096, (float *) dst->data, fa_param(dst, 0), nv, 0,
-                                         &launches);
+                rc = gen9blas_attn_f16kv(D, H, HKV, nq4, nk, (const float *) q->data, (const uint16_t *) ks, kb,
+                                         (const uint16_t *) vs, kb, (float *) dst->data, fa_param(dst, 0), nv, 0, &launches);
+            if (fin && !rc && nq4 < nq) {
+                static float * qt = nullptr; static float * ot = nullptr;
+                if (!qt && (posix_memalign((void **) &qt, 4096, (size_t) 4 * 64 * 1024 * 4) || posix_memalign((void **) &ot, 4096, (size_t) 4 * 64 * 1024 * 4))) qt = ot = nullptr;
+                if (!qt || !ot || (size_t) qrow > 64 * 1024) rc = 1;
+                else {
+                    memcpy(qt, (const float *) q->data + (size_t) (nq - 4) * qrow, (size_t) 4 * qrow * 4);
+                    int l2 = 0;
+                    rc = gen9blas_attn_f16kv(D, H, HKV, 4, nk, qt, (const uint16_t *) ks, kb, (const uint16_t *) vs, kb, ot,
+                                             fa_param(dst, 0), nv, 0, &l2);
+                    launches += l2;
+                    if (!rc) memcpy((float *) dst->data + (size_t) nq4 * qrow, ot + (size_t) (4 - (nq - nq4)) * qrow,
+                                    (size_t) (nq - nq4) * qrow * 4);
+                }
+            }
         }
     }
     if (rc) {
         if (rc < 0) { n_fa_cpu_err++; fprintf(stderr, "gen9: attention on the GPU failed (%s); ggml-cpu\n", gen9blas_attn_error()); }
-        else n_fa_cpu_lib++;
+        else {
+            n_fa_cpu_lib++;
+            static std::set<std::pair<int, int>> seen;   // GEN9_INFO: each declined (n_q, n_k) once
+            if (getenv("GEN9_INFO") && seen.insert({nq, nv}).second)
+                fprintf(stderr, "gen9: F32-K/V attention declined by the library: D %d H %d HKV %d n_q %d n_k %d\n", D, H, HKV, nq, nv);
+        }
         fa_on_cpu(ctx, cg, i); return;
     }
     n_fa_gpu++; n_fa_f32kv++; n_fa_launch += launches; fa_flop = fa_flop + 4.0 * H * D * (double) nv * nq;
