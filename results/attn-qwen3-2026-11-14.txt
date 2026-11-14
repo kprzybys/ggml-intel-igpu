@@ -1,0 +1,32 @@
+# Attention binary for the Qwen3 shape (Qwen3-Embedding-0.6B, Qwen3-0.6B, Qwen3-1.7B): D 128, H 16, H_kv 8, G 2.
+# 2026-11-14 02:47-02:55, second laptop UHD 620 (i5-8265U), kcl + userptr (bench/attn_kcl), binaries built on that
+# laptop with ocloc 24.35 legacy and IGC 1.0.17537.24 taken from the first laptop (LD_LIBRARY_PATH; the distro IGC
+# 1.0.17791.18 spills): all 16 existing attention binaries came out byte-identical to asm/attn_sha256.txt
+# (make attn-check, ATTN_OCLOC_ANY=1 because that ocloc reports its version as 24.35.030872).
+# Shape from the GGUF (Qwen3-Embedding-0.6B-Q8_0): block_count 28, head_count 16, head_count_kv 8, key/value_length 128,
+# pooling_type 3 (last token). G 2 with RQ 2: both rows of a subgroup are one token -> no ROWVIS, sched4.
+
+## Generator (asm/attn_gen.py sched4, -DD=128 -DG=2 -DHKV=8 -DRQ=2 -DNK=2 -DQTOK -DCAUSAL=1)
+IGC loop 1260 lines, mad 1024, bank conflicts 512 -> new loop 1503 lines (whl), bank conflicts 0; 52 registers free
+for the loop; loopcheck and check_generated pass (no scratch). sha256 skl 8ad3b41b..., whl 956e82f9...
+
+## Correctness vs FP64 (STEP=1: every output row; LAYERS=2)
+causal d0 (n_q 512, n_k 512, VIS0 1)          err 2.58e-6 / 1.70e-6
+causal d3584 (n_q 512, n_k 4096, VIS0 3585)   err 4.06e-6 / 3.60e-6
+n_q 75, n_k 128 (odd n_q)                     err 1.82e-6 / 1.76e-6
+RAMP=1 QSIGMA=0.1, n_q 512 n_k 1024 VIS0 513  err 3.60e-5 / 3.97e-5   (rescale every block; old binaries 2.8-8.5e-5)
+RAMP=-1 same                                  err 6.51e-5 / 4.32e-5   (rescale never after block 0)
+poison binary (one S mad negated), d3584      err 8.27e-1             -> the GPU runs the generated ISA
+good binary restored                          err 2.66e-6
+
+## Rate, causal d3584 (n_q 512, n_k 4096), LAYERS=28 PASSES=5 STEP=0, 2 alternating rounds
+Qwen3 (16/8/128)       attn 51.95 / 53.04 ms/layer = 310.1 / 303.7 GFLOPS; k_kt 2.31 / 2.33 ms; incl. kt + submit 295.5 / 289.6
+Qwen2.5-1.5B (12/2/128) attn 37.93 / 37.97 ms/layer = 318.6 / 318.2 GFLOPS; k_kt 0.44 ms
+-> Qwen3 runs 3-4 % lower per GFLOP; k_kt is 4x larger (8 KV heads vs 2) and ~4 % of the layer.
+Short shapes: d0 n_q 512: 282 GFLOPS (3.81 ms/layer); n_q 75 n_k 128: 130 GFLOPS (too little work to fill the GPU).
+
+## Not measured yet
+End to end (llama.cpp with the GEN9 backend, Qwen3-Embedding-0.6B in llama-server --embedding, and Qwen3 LLM prefill).
+Expected share of attention in embedding chunks of ~300-500 tokens: ~5-6 % of the FLOP [EST: 4*(n/2)*D*H*layers per
+token vs ~0.88 GFLOP of weights per token], so the embedding gain from this kernel is small; long-context LLM prefill
+(Qwen3-0.6B/1.7B) is where it pays, as for Qwen2.5 (docs/attention-gpu.md sections 11 and 13).
