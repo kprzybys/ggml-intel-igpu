@@ -921,6 +921,10 @@ static void ew_begin(gen9_context * ctx, struct ggml_cgraph * cg) {
         if (!(n->flags & GGML_TENSOR_FLAG_COMPUTE)) continue;
         any |= is_ew_op(n->op);
         waits |= n->op == GGML_OP_MUL_MAT || n->op == GGML_OP_FLASH_ATTN_EXT;
+        // only nodes that write: a RESHAPE/VIEW/PERMUTE/TRANSPOSE/NONE node of a weight lives in the weights' buffer,
+        // which NeMo-Speech.cpp maps read-only from the GGUF without marking it WEIGHTS -> a writable span on it made
+        // every execbuffer fail with EFAULT ("Bad address")
+        if (ggml_op_is_empty(n->op)) continue;
         ggml_backend_buffer_t b = n->view_src ? n->view_src->buffer : n->buffer;
         if (b && b->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) bufs.insert(b);
     }
