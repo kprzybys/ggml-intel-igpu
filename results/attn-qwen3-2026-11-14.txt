@@ -91,3 +91,42 @@ gen9: FLASH_ATTN_EXT run on the GPU 308 (308 launches, 0 with kv_rows), 9.653 s,
 # 03:23:15 load 2.76 2.83 1.89 gpu 1067 MHz end
 QDONE
 
+
+
+## General FA masks (a60baa5 + a3d52dd), second laptop UHD 620, 2026-11-14 03:51-03:59
+What llama-server actually builds for several texts per request (dumped with a debug print): rows that see two
+intervals, e.g. cells [500, 511] (the sequence's start, written at the end of the ring cache by the previous ubatch)
+plus [0, t]; kv_rows lists the cells. The backend now takes any mask whose rows each add one visible column (or keep
+the same ones): key order = first row's columns, then each new column; K/V rows are gathered into a reused pinned
+staging buffer when they are not consecutive cache rows. test_attn: seqs/seqsfull/seqsrows/wrap/perm/hole NMSE <= 1.7e-13.
+
+Qwen3-Embedding-0.6B, same setup as above, GEN9_ATTN 0, 1, 1, 0:
+                                   ATTN=0            ATTN=1            change
+  64 texts in one request          403 / 362 tok/s   489 / 489 tok/s   +21 ... +35 %  (was ~0 before a3d52dd)
+  32 texts, one per request        385 / 357 tok/s   496 / 495 tok/s   +29 ... +39 %
+  per server run: 3556 FA nodes on the GPU (1904 through the general path, 4088 runs, 2464 with K/V gathered),
+  0 on ggml-cpu; mask analysis 4.1 s per run (~3 % of it); cosine GPU vs CPU attention >= 0.999990.
+
+Raw log:
+# 03:51:18 GEN9_ATTN=0
+batch n=64: 66.34 s, 0.96 chunks/s, 403 tok/s (26727 tokens)
+single n=32: 45.70 s, 0.70 chunks/s, 385 tok/s (17595 tokens)
+gen9: FLASH_ATTN_EXT run on the GPU 0 (0 launches, 0 with kv_rows), 0.000 s, 0.0 GFLOP (0.0 GFLOPS incl. pinning/submit/wait); mask analysis 0.000 s; computed by ggml-cpu inside GEN9: mask not causal/
+gen9: FLASH_ATTN_EXT general masks (several sequences, wrapped cache, kv_rows not identity): on the GPU 0 (0 runs, 0 with K/V gathered), computed by ggml-cpu 0
+# 03:53:46 GEN9_ATTN=1
+batch n=64: 54.62 s, 1.17 chunks/s, 489 tok/s (26727 tokens)
+single n=32: 35.50 s, 0.90 chunks/s, 496 tok/s (17595 tokens)
+gen9: FLASH_ATTN_EXT run on the GPU 3556 (5740 launches, 3556 with kv_rows), 16.912 s, 3631.9 GFLOP (214.8 GFLOPS incl. pinning/submit/wait); mask analysis 4.158 s; computed by ggml-cpu inside GEN9: m
+gen9: FLASH_ATTN_EXT general masks (several sequences, wrapped cache, kv_rows not identity): on the GPU 1904 (4088 runs, 2464 with K/V gathered), computed by ggml-cpu 0
+# 03:55:45 GEN9_ATTN=1
+batch n=64: 54.71 s, 1.17 chunks/s, 489 tok/s (26727 tokens)
+single n=32: 35.53 s, 0.90 chunks/s, 495 tok/s (17595 tokens)
+gen9: FLASH_ATTN_EXT run on the GPU 3556 (5740 launches, 3556 with kv_rows), 16.861 s, 3631.9 GFLOP (215.4 GFLOPS incl. pinning/submit/wait); mask analysis 4.145 s; computed by ggml-cpu inside GEN9: m
+gen9: FLASH_ATTN_EXT general masks (several sequences, wrapped cache, kv_rows not identity): on the GPU 1904 (4088 runs, 2464 with K/V gathered), computed by ggml-cpu 0
+# 03:57:44 GEN9_ATTN=0
+batch n=64: 73.75 s, 0.87 chunks/s, 362 tok/s (26727 tokens)
+single n=32: 49.27 s, 0.65 chunks/s, 357 tok/s (17595 tokens)
+gen9: FLASH_ATTN_EXT run on the GPU 0 (0 launches, 0 with kv_rows), 0.000 s, 0.0 GFLOP (0.0 GFLOPS incl. pinning/submit/wait); mask analysis 0.000 s; computed by ggml-cpu inside GEN9: mask not causal/
+gen9: FLASH_ATTN_EXT general masks (several sequences, wrapped cache, kv_rows not identity): on the GPU 0 (0 runs, 0 with K/V gathered), computed by ggml-cpu 0
+cosine batched embeddings, GPU vs CPU attention: min 0.999990 mean 0.999996
+Q2DONE
