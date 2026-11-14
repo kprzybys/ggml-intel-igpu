@@ -53,6 +53,7 @@ static std::atomic<double> t_dequant_s{0}, t_deq_alloc_s{0}, t_deq_cpu_s{0}, t_d
 static std::atomic<long> n_fa_asked{0}, n_fa_off{0}, n_fa_decl_type{0}, n_fa_decl_param{0}, n_fa_decl_shape{0}, n_fa_decl_layout{0},
                          n_fa_decl_nq{0}, n_fa_decl_mask{0}, n_fa_decl_gpu{0};
 static std::atomic<long> n_fa_gpu{0}, n_fa_launch{0}, n_fa_rows{0}, n_fa_cpu_mask{0}, n_fa_cpu_rows{0}, n_fa_cpu_lib{0}, n_fa_cpu_err{0};
+static std::atomic<long> n_fa_f16gather{0};   // FLASH_ATTN_EXT with F16 K/V gathered from another layout (fa_f16_gather_off)
 static std::atomic<long> n_fa_f32kv{0}, n_mm_forced_f32{0}, n_ew_im2col{0};   // FLASH_ATTN_EXT with F32 K/V converted to FP16 (NeMo)
 static std::atomic<long> n_fa_tail{0}, n_fa_cpu_tail{0};   // n_k not a multiple of 16: rounded up on the GPU / V tail not finite
 static std::atomic<long> n_fa_blk{0}, n_fa_blk_runs{0}, n_fa_blk_gather{0}, n_fa_cpu_blk{0};   // general masks (fa_mask_runs)
@@ -102,7 +103,7 @@ static void gen9_report(void) {
             n_fa_decl_mask.load(), n_fa_decl_gpu.load());
     if (n_mm_forced_f32) fprintf(stderr, "gen9: MUL_MAT forced to F32 (GEN9_MM_F32=1) %ld\n", n_mm_forced_f32.load());
     fprintf(stderr, "gen9: IM2COL on the GPU %ld\n", n_ew_im2col.load());
-    fprintf(stderr, "gen9: FLASH_ATTN_EXT with F32 K/V (converted to FP16 in the staging buffer) on the GPU %ld\n", n_fa_f32kv.load());
+    fprintf(stderr, "gen9: FLASH_ATTN_EXT with F32 K/V (converted to FP16 in the staging buffer) on the GPU %ld; F16 K/V gathered from another layout %ld\n", n_fa_f32kv.load(), n_fa_f16gather.load());
     fprintf(stderr, "gen9: FLASH_ATTN_EXT run on the GPU %ld (%ld launches, %ld with kv_rows), %.3f s, %.1f GFLOP (%.1f GFLOPS incl. "
             "pinning/submit/wait); mask analysis %.3f s; computed by ggml-cpu inside GEN9: mask not causal/full %ld, kv_rows not "
             "identity %ld, library declined %ld, GPU error %ld (%.3f s)\n", n_fa_gpu.load(), n_fa_launch.load(), n_fa_rows.load(),
@@ -487,9 +488,15 @@ static int64_t fa_rows_behind(const struct ggml_tensor * t, size_t row) {
 // output in llama.cpp's layouts, as for F16 K/V. On by default; GEN9_ATTN_F32KV=0 turns it off. With the conversion on
 // the CPU (one thread, under gpu_mu) it was slower than ggml-cpu (gp: 1 h 111 -> 134 s); on the GPU (gen9blas_cvt_f16_heads)
 // and with n_q not divisible by 4 handled (NeMo's chunks of 265 / 530 rows were declined before), 1 h 99 -> 81 s.
+// F16 K/V in another layout than llama.cpp's KV cache (mtmd's vision encoders: K/V cast to F16 from permuted views,
+// [head][key][d]; PaddleOCR-VL): same staging path, the rows gathered by the CPU (memcpy of D halves per key and head;
+// ~20 MB per layer for PaddleOCR-VL, a few ms against ~0.5 s of attention). GEN9_ATTN_F16GATHER=0 turns it off.
+static bool fa_f16_gather_off(void) { static const bool v = [] { const char * e = getenv("GEN9_ATTN_F16GATHER"); return e && !strcmp(e, "0"); }(); return v; }
+
 static bool fa_f32kv_ok(const struct ggml_tensor * op) {
-    static const bool off = [] { const char * e = getenv("GEN9_ATTN_F32KV"); return e && !strcmp(e, "0"); }();
+    static const bool off32 = [] { const char * e = getenv("GEN9_ATTN_F32KV"); return e && !strcmp(e, "0"); }();
     const struct ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2];
+    const bool off = k->type == GGML_TYPE_F16 ? fa_f16_gather_off() : off32;
     if (off || q->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 || op->src[3] || op->src[4] || op->src[5] ||
         fa_param(op, 1) != 0.0f || fa_param(op, 2) != 0.0f) { n_fa_decl_type++; return false; }
     const int64_t D = q->ne[0], nq = q->ne[1], H = q->ne[2], nk = k->ne[1], HKV = k->ne[2];
@@ -498,7 +505,8 @@ static bool fa_f32kv_ok(const struct ggml_tensor * op) {
         if (!gpu_ok()) n_fa_decl_gpu++; else n_fa_decl_shape++;
         return false;
     }
-    if (q->nb[0] != 4 || q->nb[1] != (size_t) (H * D * 4) || q->nb[2] != (size_t) (D * 4) || k->nb[0] != 4 || v->nb[0] != 4 ||
+    const size_t es = k->type == GGML_TYPE_F16 ? 2 : 4;
+    if (q->nb[0] != 4 || q->nb[1] != (size_t) (H * D * 4) || q->nb[2] != (size_t) (D * 4) || k->nb[0] != es || v->nb[0] != es ||
         !ggml_is_contiguous(op) || op->ne[0] != D || op->ne[1] != H || op->ne[2] != nq || op->ne[3] != 1) { n_fa_decl_layout++; return false; }
     if (nq < 32) { n_fa_decl_nq++; return false; }
     return true;
@@ -518,6 +526,9 @@ static bool gen9_supports_fa(const struct ggml_tensor * op) {
         return false;
     }
     const size_t row = (size_t) (HKV * D * 2);
+    if (!m && !rows && k->nb[0] == 2 && v->nb[0] == 2 &&
+        (k->nb[1] != row || k->nb[2] != (size_t) (D * 2) || v->nb[1] != row || v->nb[2] != (size_t) (D * 2)))
+        return fa_f32kv_ok(op);   // F16 K/V in another layout: gathered into the staging buffer
     if (nk % 16) {   // only without a mask (a mask has n_k columns) and with the rounded-up rows behind both views
         const int64_t nk16 = (nk + 15) / 16 * 16;
         if (m || rows || fa_rows_behind(k, row) < nk16 || fa_rows_behind(v, row) < nk16) { n_fa_decl_shape++; return false; }
@@ -727,7 +738,16 @@ static void gen9_flash_attn_f32kv(gen9_context * ctx, struct ggml_cgraph * cg, i
             // saturated FP16 from an earlier call), so masked keys get p = 0 and 0 * V stays 0.
             bool fin = true;
             const bool span = gen9blas_span(stage, stage_bytes, 1) == 0;
-            if (gen9blas_cvt_f16_heads(nv, HKV, D, (const float *) k->data, (long) (k->nb[1] / 4), (long) (k->nb[2] / 4),
+            if (k->type == GGML_TYPE_F16) {   // gather [key][head][d] rows on the CPU (see fa_f16_gather_off)
+                for (int t = 0; t < nv; t++)
+                    for (int h = 0; h < HKV; h++) {
+                        memcpy(ks + ((size_t) t * HKV + h) * D, (const char *) k->data + t * k->nb[1] + h * k->nb[2], (size_t) D * 2);
+                        memcpy(vs + ((size_t) t * HKV + h) * D, (const char *) v->data + t * v->nb[1] + h * v->nb[2], (size_t) D * 2);
+                    }
+                for (int64_t x = 0; x < (int64_t) nv * HKV * D && fin; x++)   // the kernel needs finite K/V (no Inf/NaN)
+                    if ((ks[x] & 0x7C00) == 0x7C00 || (vs[x] & 0x7C00) == 0x7C00) fin = false;
+                if (!fin) { rc = 1; }
+            } else if (gen9blas_cvt_f16_heads(nv, HKV, D, (const float *) k->data, (long) (k->nb[1] / 4), (long) (k->nb[2] / 4),
                                        (uint16_t *) ks, !span) ||
                 gen9blas_cvt_f16_heads(nv, HKV, D, (const float *) v->data, (long) (v->nb[1] / 4), (long) (v->nb[2] / 4),
                                        (uint16_t *) vs, !span)) {
@@ -767,7 +787,7 @@ static void gen9_flash_attn_f32kv(gen9_context * ctx, struct ggml_cgraph * cg, i
         }
         fa_on_cpu(ctx, cg, i); return;
     }
-    n_fa_gpu++; n_fa_f32kv++; n_fa_launch += launches; fa_flop = fa_flop + 4.0 * H * D * (double) nv * nq;
+    n_fa_gpu++; if (k->type == GGML_TYPE_F16) n_fa_f16gather++; else n_fa_f32kv++; n_fa_launch += launches; fa_flop = fa_flop + 4.0 * H * D * (double) nv * nq;
     t_fa_gpu_s = t_fa_gpu_s + std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
 }
 
@@ -776,6 +796,12 @@ static void gen9_flash_attn(gen9_context * ctx, struct ggml_cgraph * cg, int i) 
     if (dst->src[1]->type == GGML_TYPE_F32) { gen9_flash_attn_f32kv(ctx, cg, i); return; }
     const struct ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * m = dst->src[3], * rows = dst->src[5];
     const int D = (int) q->ne[0], nq = (int) q->ne[1], H = (int) q->ne[2], HKV = (int) k->ne[2];
+    {   // F16 K/V outside the KV-cache layout (accepted in gen9_supports_fa only without mask / kv_rows): staging path
+        const size_t row = (size_t) HKV * D * 2;
+        if (!m && !rows && (k->nb[1] != row || k->nb[2] != (size_t) D * 2 || v->nb[1] != row || v->nb[2] != (size_t) D * 2)) {
+            gen9_flash_attn_f32kv(ctx, cg, i); return;
+        }
+    }
     int vis0 = (int) k->ne[1], dvis = 0;
     auto t0 = std::chrono::steady_clock::now();
     if (m && !fa_mask_prefix(m, nq, vis0, dvis)) {
