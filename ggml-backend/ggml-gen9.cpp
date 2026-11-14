@@ -53,7 +53,7 @@ static std::atomic<double> t_dequant_s{0}, t_deq_alloc_s{0}, t_deq_cpu_s{0}, t_d
 static std::atomic<long> n_fa_asked{0}, n_fa_off{0}, n_fa_decl_type{0}, n_fa_decl_param{0}, n_fa_decl_shape{0}, n_fa_decl_layout{0},
                          n_fa_decl_nq{0}, n_fa_decl_mask{0}, n_fa_decl_gpu{0};
 static std::atomic<long> n_fa_gpu{0}, n_fa_launch{0}, n_fa_rows{0}, n_fa_cpu_mask{0}, n_fa_cpu_rows{0}, n_fa_cpu_lib{0}, n_fa_cpu_err{0};
-static std::atomic<long> n_fa_f32kv{0};   // FLASH_ATTN_EXT with F32 K/V converted to FP16 (NeMo)
+static std::atomic<long> n_fa_f32kv{0}, n_mm_forced_f32{0};   // FLASH_ATTN_EXT with F32 K/V converted to FP16 (NeMo)
 static std::atomic<long> n_fa_tail{0}, n_fa_cpu_tail{0};   // n_k not a multiple of 16: rounded up on the GPU / V tail not finite
 static std::atomic<long> n_fa_blk{0}, n_fa_blk_runs{0}, n_fa_blk_gather{0}, n_fa_cpu_blk{0};   // general masks (fa_mask_runs)
 static std::atomic<double> t_fa_gpu_s{0}, t_fa_mask_s{0}, t_fa_cpu_s{0}, fa_flop{0};
@@ -100,6 +100,7 @@ static void gen9_report(void) {
             "shape/no binary %ld, layout %ld, n_q<32 %ld, mask/kv_rows shape %ld, no GPU %ld\n", n_fa_asked.load(), n_fa_off.load(),
             n_fa_decl_type.load(), n_fa_decl_param.load(), n_fa_decl_shape.load(), n_fa_decl_layout.load(), n_fa_decl_nq.load(),
             n_fa_decl_mask.load(), n_fa_decl_gpu.load());
+    if (n_mm_forced_f32) fprintf(stderr, "gen9: MUL_MAT forced to F32 (GEN9_MM_F32=1) %ld\n", n_mm_forced_f32.load());
     fprintf(stderr, "gen9: FLASH_ATTN_EXT with F32 K/V (converted to FP16 in the staging buffer) on the GPU %ld\n", n_fa_f32kv.load());
     fprintf(stderr, "gen9: FLASH_ATTN_EXT run on the GPU %ld (%ld launches, %ld with kv_rows), %.3f s, %.1f GFLOP (%.1f GFLOPS incl. "
             "pinning/submit/wait); mask analysis %.3f s; computed by ggml-cpu inside GEN9: mask not causal/full %ld, kv_rows not "
@@ -841,6 +842,7 @@ static bool overlaps(const struct ggml_tensor * a, const struct ggml_tensor * b)
     const char * a0 = (const char *) a->data, * b0 = (const char *) b->data;
     return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
 }
+static bool mm_f32_forced(void) { static const bool v = [] { const char * e = getenv("GEN9_MM_F32"); return e && !strcmp(e, "1"); }(); return v; }
 static void mm_f32_recompute(struct ggml_tensor * dst) {   // F32 weights for one MUL_MAT after FP16 overflow
     const struct ggml_tensor * w = dst->src[0], * x = dst->src[1];
     const int K = (int) w->ne[0], N = (int) w->ne[1], M = (int) x->ne[1];
@@ -1161,6 +1163,12 @@ static enum ggml_status gen9_graph_compute(ggml_backend_t backend, struct ggml_c
                 n_noop++;
                 break;
             case GGML_OP_MUL_MAT:
+                // GEN9_MM_F32=1 (diagnostics): weight MUL_MATs with F32 activations in full F32 (weights dequantized to F32
+                // per call, SGEMM) instead of the FP16 paths -- to measure what FP16 costs in accuracy; slow
+                if (mm_f32_forced() && node->src[1]->type == GGML_TYPE_F32 && node->src[0]->type != GGML_TYPE_F32 &&
+                    ggml_is_contiguous(node->src[1]) && node->src[1]->ne[2] == 1 && node->src[1]->ne[3] == 1) {
+                    ew_flush(ctx); mm_f32_recompute(node); n_mm_forced_f32++; pk = PR_MM; break;
+                }
                 if (gen9_try_ffn(ctx, cgraph, i)) { i += 3; pk = PR_FFN; break; }
                 if (gen9_try_multi(ctx, cgraph, i)) { pk = PR_QKV; break; }
                 {
