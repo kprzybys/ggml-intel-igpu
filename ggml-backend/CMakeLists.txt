@@ -6,6 +6,9 @@
 #   whisper.cpp's ggml (no ggml_rope_get_truncate): -DGEN9_GGML_NO_ROPE_TRUNCATE=ON
 cmake_minimum_required(VERSION 3.21)
 project(ggml-gen9 VERSION 0.2.0 LANGUAGES CXX)
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)   # default: optimized build (as the library)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
+endif()
 include(GNUInstallDirs)
 
 set(GGML_SOURCE_DIR "$ENV{HOME}/src/llama.cpp" CACHE PATH "llama.cpp or whisper.cpp source tree (ggml/include, ggml/src)")
