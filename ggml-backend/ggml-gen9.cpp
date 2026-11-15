@@ -54,7 +54,10 @@ static std::atomic<double> t_dequant_s{0}, t_deq_alloc_s{0}, t_deq_cpu_s{0}, t_d
 static std::atomic<long> n_fa_asked{0}, n_fa_off{0}, n_fa_decl_type{0}, n_fa_decl_param{0}, n_fa_decl_shape{0}, n_fa_decl_layout{0},
                          n_fa_decl_nq{0}, n_fa_decl_mask{0}, n_fa_decl_gpu{0};
 static std::atomic<long> n_fa_gpu{0}, n_fa_launch{0}, n_fa_rows{0}, n_fa_cpu_mask{0}, n_fa_cpu_rows{0}, n_fa_cpu_lib{0}, n_fa_cpu_err{0};
-static std::atomic<long> n_fa_f16gather{0}, n_ew_setrows{0};   // FLASH_ATTN_EXT with F16 K/V gathered from another layout (fa_f16_gather_off)
+static std::atomic<long> n_fa_streams{0}, n_fa_streams_cpu{0}, n_fa_verify{0};
+static double fa_verify_max = 0;
+static std::atomic<long> n_fa_f16gather{0}, n_ew_setrows{0}, n_nw_splits{0}, n_nw_overflow{0};
+static bool mm_nowait_on(void) { static const bool v = [] { const char * e = getenv("GEN9_MM_NOWAIT"); return e && !strcmp(e, "1"); }(); return v; }   // FLASH_ATTN_EXT with F16 K/V gathered from another layout (fa_f16_gather_off)
 static std::atomic<long> n_fa_f32kv{0}, n_mm_forced_f32{0}, n_ew_im2col{0};   // FLASH_ATTN_EXT with F32 K/V converted to FP16 (NeMo)
 static std::atomic<long> n_fa_tail{0}, n_fa_cpu_tail{0};   // n_k not a multiple of 16: rounded up on the GPU / V tail not finite
 static std::atomic<long> n_fa_blk{0}, n_fa_blk_runs{0}, n_fa_blk_gather{0}, n_fa_cpu_blk{0};   // general masks (fa_mask_runs)
@@ -70,6 +73,8 @@ static std::atomic<long> pr_n[PR_N];
 static bool prof_on(void) { static const bool v = getenv("GEN9_PROF") && atoi(getenv("GEN9_PROF")) != 0; return v; }
 
 static void gen9_report(void) {
+    fprintf(stderr, "gen9: FLASH_ATTN_EXT with KV streams on the GPU %ld, back to ggml-cpu %ld; GEN9_ATTN_VERIFY nodes %ld, max NMSE %.3e\n", n_fa_streams.load(), n_fa_streams_cpu.load(), n_fa_verify.load(), fa_verify_max);
+    fprintf(stderr, "gen9: no-wait splits (GEN9_MM_NOWAIT) %ld, failed on FP16 overflow %ld\n", n_nw_splits.load(), n_nw_overflow.load());
     fprintf(stderr, "gen9: MUL_MAT groups on one input (Q/K/V) %ld covering %ld MUL_MATs; candidates refused for memory overlap %ld; "
             "outputs recomputed in F32 after FP16 overflow %ld\n", n_multi_groups.load(), n_multi_mm.load(), n_multi_overlap.load(),
             n_multi_fallback.load());
@@ -157,7 +162,8 @@ struct packed_t { gen9blas_packed * P; int t; bool temp = false; };   // temp: n
 struct gen9_context {
     std::map<wkey, packed_t> cache;
     size_t cached_bytes = 0;
-    bool ew_sync = false, ew_pending = false, ew_cpu = false;   // ew_cpu: split without a waiting GPU call: elementwise ops on ggml-cpu
+    bool ew_sync = false, ew_pending = false, ew_cpu = false;
+    bool nw = false;   // this split runs its products in gen9blas no-wait mode (GEN9_MM_NOWAIT=1, all MUL_MATs with M <= 16)   // ew_cpu: split without a waiting GPU call: elementwise ops on ggml-cpu
     std::vector<char> done;   // per graph_compute: nodes already computed by a MUL_MAT group   // per graph_compute: wait after each elementwise op / ops queued, not waited for
     ggml_backend_t cpu = nullptr;   // ggml-cpu for FLASH_ATTN_EXT nodes whose mask turns out not to be supported (created on first use)
     // packed GEMM inputs written by LayerNorm (gen9blas_layer_norm_pack), per graph_compute; two buffers in turn: reusing
@@ -336,7 +342,7 @@ static packed_t get_packed(gen9_context * ctx, const struct ggml_tensor * w) {
     return r;
 }
 
-static void release(const packed_t & p) { if (p.temp && p.P) gen9blas_packed_free(p.P); }
+static void release(const packed_t & p) { if (p.temp && p.P) { gen9blas_flush(); gen9blas_packed_free(p.P); } }   // flush: no-wait work may still read it
 
 // dst[M x N] = src1[M x K] . src0^T with src0 stored N x K row-major: gemm(A = src1, B = src0 transposed).
 // F32 weights: SGEMM. F16 and quantized weights: accurate FP16 GEMM (gemm_pb_f16w); a call whose result overflows FP16 is
@@ -392,7 +398,7 @@ static bool gen9_mul_mat(gen9_context * ctx, struct ggml_tensor * dst) {
             rc = gen9blas_gemm(GEN9BLAS_S, 0, 1, M, N, K, 1.0, x_f32(), ldf, wf.data(), K, 0.0, dst->data, ldc);
         }
     }
-    if (temp) gen9blas_packed_free(p.P);
+    if (temp) { if (ctx->nw) gen9blas_flush(); gen9blas_packed_free(p.P); }   // no-wait: the GPU may still read it
     if (rc) { fprintf(stderr, "gen9: MUL_MAT %s failed: %s\n", w->name, gen9blas_error()); return false; }
     return true;
 }
@@ -525,6 +531,26 @@ static void fa_shape_info(const struct ggml_tensor * op, const char * why) {
     if (seen.insert(b).second) fprintf(stderr, "%s\n", b);
 }
 
+// KV streams (llama-server -np N, ggml ne[3] = streams): F16 K/V in llama.cpp's per-stream cache layout, one F16 mask per
+// stream (or one for all), no kv_rows; any n_q (decoding: 1 per stream). gen9blas_attn_f16kv_streams. GEN9_ATTN_STREAMS=0 off.
+static bool fa_streams_ok(const struct ggml_tensor * op) {
+    static const bool off = [] { const char * e = getenv("GEN9_ATTN_STREAMS"); return e && !strcmp(e, "0"); }();
+    const struct ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2], * m = op->src[3];
+    const int64_t D = q->ne[0], nq = q->ne[1], H = q->ne[2], ns = q->ne[3], nk = k->ne[1], HKV = k->ne[2];
+    const size_t row = (size_t) (HKV * D * 2);
+    const bool ok = !off && k->ne[3] == ns && v->ne[3] == ns && k->ne[0] == D && v->ne[0] == D && v->ne[1] == nk && v->ne[2] == HKV &&
+        HKV > 0 && H % HKV == 0 && nk <= INT_MAX && nk % 16 == 0 && !op->src[5] && gpu_ok() &&
+        gen9blas_attn_streams_supported((int) D, (int) H, (int) HKV) &&
+        q->nb[0] == 4 && q->nb[1] == (size_t) (H * D * 4) && q->nb[2] == (size_t) (D * 4) && q->nb[3] % 16 == 0 &&
+        k->nb[0] == 2 && k->nb[1] == row && k->nb[2] == (size_t) (D * 2) && k->nb[3] % 16 == 0 &&
+        v->nb[0] == 2 && v->nb[1] == row && v->nb[2] == (size_t) (D * 2) && v->nb[3] % 16 == 0 &&
+        ggml_is_contiguous(op) && op->ne[0] == D && op->ne[1] == H && op->ne[2] == nq && op->ne[3] == ns && op->nb[3] == q->nb[3] &&
+        m && m->type == GGML_TYPE_F16 && m->nb[0] == 2 && m->ne[0] == nk && m->ne[1] >= nq && m->ne[2] == 1 &&
+        (m->ne[3] == ns || m->ne[3] == 1);
+    if (!ok) { n_fa_decl_shape++; fa_shape_info(op, "streams"); }
+    return ok;
+}
+
 static bool gen9_supports_fa(const struct ggml_tensor * op) {
     n_fa_asked++;
     if (!attn_on()) { n_fa_off++; return false; }
@@ -533,6 +559,7 @@ static bool gen9_supports_fa(const struct ggml_tensor * op) {
     if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 || op->type != GGML_TYPE_F32) { n_fa_decl_type++; return false; }
     if (op->src[4] || fa_param(op, 1) != 0.0f || fa_param(op, 2) != 0.0f) { n_fa_decl_param++; return false; }
     const int64_t D = q->ne[0], nq = q->ne[1], H = q->ne[2], nk = k->ne[1], HKV = k->ne[2];
+    if (q->ne[3] > 1 || k->ne[3] > 1) return fa_streams_ok(op);
     if (k->ne[0] != D || v->ne[0] != D || v->ne[1] != nk || v->ne[2] != HKV || q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 ||
         HKV <= 0 || H % HKV || nk > INT_MAX || !gpu_ok() || !gen9blas_attn_supported((int) D, (int) H, (int) HKV)) {
         if (!gpu_ok()) n_fa_decl_gpu++; else n_fa_decl_shape++;
@@ -561,8 +588,11 @@ static bool gen9_supports_fa(const struct ggml_tensor * op) {
 
 // Mask rows 0..nq-1: row t must be ncols values, the first n_t equal to +0 and the rest -inf, with n_t = n_0 + dvis*t,
 // dvis 0 or 1, n_0 >= 1. Word-wise compare (+0 = 0x0000, -inf = 0xFC00 in F16).
+static bool fa_mask_prefix_at(const void * mdata, size_t nb1, int64_t nc, int64_t nq, int & vis0, int & dvis);
 static bool fa_mask_prefix(const struct ggml_tensor * m, int64_t nq, int & vis0, int & dvis) {
-    const int64_t nc = m->ne[0];
+    return fa_mask_prefix_at(m->data, m->nb[1], m->ne[0], nq, vis0, dvis);
+}
+static bool fa_mask_prefix_at(const void * mdata, size_t nb1, int64_t nc, int64_t nq, int & vis0, int & dvis) {
     auto ok_row = [&](const uint16_t * r, int64_t n) {
         int64_t j = 0;
         for (; j + 4 <= n; j += 4) { uint64_t w; memcpy(&w, r + j, 8); if (w) return false; }
@@ -572,7 +602,7 @@ static bool fa_mask_prefix(const struct ggml_tensor * m, int64_t nq, int & vis0,
         for (; j < nc; j++) if (r[j] != 0xFC00) return false;
         return true;
     };
-    auto row = [&](int64_t t) { return (const uint16_t *) ((const char *) m->data + t * m->nb[1]); };
+    auto row = [&](int64_t t) { return (const uint16_t *) ((const char *) mdata + t * nb1); };
     int64_t n0 = 0;
     while (n0 < nc && row(0)[n0] == 0) n0++;
     if (n0 < 1 || !ok_row(row(0), n0)) return false;
@@ -805,8 +835,63 @@ static void gen9_flash_attn_f32kv(gen9_context * ctx, struct ggml_cgraph * cg, i
     t_fa_gpu_s = t_fa_gpu_s + std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
 }
 
+static void gen9_flash_attn_streams(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
+    struct ggml_tensor * dst = cg->nodes[i];
+    const struct ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * m = dst->src[3];
+    const int D = (int) q->ne[0], nq = (int) q->ne[1], H = (int) q->ne[2], ns = (int) q->ne[3], HKV = (int) k->ne[2], nk = (int) k->ne[1];
+    auto t0 = std::chrono::steady_clock::now();
+    std::vector<int> vis(ns);
+    int dv = -1;
+    for (int st = 0; st < ns; st++) {
+        int v0, d;
+        const char * mb = (const char *) m->data + (m->ne[3] > 1 ? (size_t) st * m->nb[3] : 0);
+        if (!fa_mask_prefix_at(mb, m->nb[1], m->ne[0], nq, v0, d)) { n_fa_streams_cpu++; n_fa_cpu_mask++; fa_on_cpu(ctx, cg, i); return; }
+        if (nq == 1) d = 0;
+        if (dv < 0) dv = d; else if (dv != d) { n_fa_streams_cpu++; n_fa_cpu_mask++; fa_on_cpu(ctx, cg, i); return; }
+        vis[st] = v0;
+    }
+    int vmax = 0;
+    for (int st = 0; st < ns; st++) vmax = std::max(vmax, vis[st] + dv * (nq - 1));
+    const int nkl = std::min(nk, (vmax + 15) / 16 * 16);
+    auto t1 = std::chrono::steady_clock::now();
+    t_fa_mask_s = t_fa_mask_s + std::chrono::duration<double>(t1 - t0).count();
+    auto reg_bytes = [](const struct ggml_tensor * t) {
+        const struct ggml_tensor * b = t->view_src ? t->view_src : t;
+        return (size_t) ((const char *) b->data + ggml_nbytes(b) - (const char *) t->data);
+    };
+    int launches = 0, rc;
+    {
+        std::lock_guard<std::mutex> lk(gpu_mu);
+        rc = gen9blas_attn_f16kv_streams(D, H, HKV, ns, nq, nkl, (const float *) q->data, (long) (q->nb[3] / 4),
+                                         (const uint16_t *) k->data, (long) (k->nb[3] / 2), reg_bytes(k), (const uint16_t *) v->data,
+                                         (long) (v->nb[3] / 2), reg_bytes(v), (float *) dst->data, fa_param(dst, 0), vis.data(), dv, &launches);
+    }
+    if (rc) {
+        if (rc < 0) { n_fa_cpu_err++; fprintf(stderr, "gen9: stream attention on the GPU failed (%s); ggml-cpu\n", gen9blas_attn_error()); }
+        else n_fa_cpu_lib++;
+        n_fa_streams_cpu++; fa_on_cpu(ctx, cg, i); return;
+    }
+    static const bool verify = getenv("GEN9_ATTN_VERIFY") != nullptr;   // diagnostics: GPU result vs ggml-cpu on the same node
+    if (verify) {
+        const size_t n = ggml_nelements(dst);
+        std::vector<float> g((const float *) dst->data, (const float *) dst->data + n);
+        fa_on_cpu(ctx, cg, i);
+        const float * c = (const float *) dst->data;
+        double se = 0, sr = 0;
+        for (size_t x = 0; x < n; x++) { const double e = (double) g[x] - c[x]; se += e * e; sr += (double) c[x] * c[x]; }
+        const double nmse = sr > 0 ? se / sr : se;
+        if (nmse > fa_verify_max) fa_verify_max = nmse;
+        n_fa_verify++;
+    }
+    double fl = 0;
+    for (int st = 0; st < ns; st++) for (int t = 0; t < nq; t++) fl += 4.0 * H * D * std::min(vis[st] + dv * t, nkl);
+    n_fa_gpu++; n_fa_streams++; n_fa_launch += launches; fa_flop = fa_flop + fl;
+    t_fa_gpu_s = t_fa_gpu_s + std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
+}
+
 static void gen9_flash_attn(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
     struct ggml_tensor * dst = cg->nodes[i];
+    if (dst->src[0]->ne[3] > 1) { gen9_flash_attn_streams(ctx, cg, i); return; }
     if (dst->src[1]->type == GGML_TYPE_F32) { gen9_flash_attn_f32kv(ctx, cg, i); return; }
     const struct ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * m = dst->src[3], * rows = dst->src[5];
     const int D = (int) q->ne[0], nq = (int) q->ne[1], H = (int) q->ne[2], HKV = (int) k->ne[2];
@@ -1164,11 +1249,11 @@ static void ew_begin(gen9_context * ctx, struct ggml_cgraph * cg) {
     // No call in this split waits for the GPU anyway: queued ops would cost a wait of their own at the end of the split
     // (~0.2 ms), more than ggml-cpu needs for them at these sizes (whisper's decoder prompt was 6 % slower).
     if (any && !waits && !getenv("GEN9_EW_LONE_GPU")) { ctx->ew_cpu = true; n_ew_cpu_splits++; return; }
-    if (!any || ctx->ew_sync) return;
+    if ((!any && !ctx->nw) || ctx->ew_sync) { if (ctx->ew_sync) ctx->nw = false; return; }
     std::lock_guard<std::mutex> lk(gpu_mu);
     for (ggml_backend_buffer_t b : bufs)
         if (gen9blas_span(ggml_backend_buffer_get_base(b), ggml_backend_buffer_get_size(b), 1)) { ctx->ew_sync = true; break; }
-    if (ctx->ew_sync) { gen9blas_span_clear(); n_ew_sync_graphs++; }
+    if (ctx->ew_sync) { gen9blas_span_clear(); n_ew_sync_graphs++; ctx->nw = false; }
 }
 static void ew_end(gen9_context * ctx) {
     ew_flush(ctx);
@@ -1229,7 +1314,7 @@ static int gen9_try_epi(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
         } else
             rc = gen9blas_gemm_pb_f16w_ex(M, (const float *) x->data, (int) (x->nb[1] / sizeof(float)), p.P, (float *) out->data,
                                           (int) (out->nb[1] / sizeof(float)), (const float *) bias->data, gelu, R, ldr, &nonfinite);
-        if (p.temp) gen9blas_packed_free(p.P);
+        if (p.temp) { gen9blas_flush(); gen9blas_packed_free(p.P); }
     }
     (void) K;
     if (rc) { fprintf(stderr, "gen9: fused MUL_MAT %s failed: %s\n", w->name, gen9blas_error()); return 0; }
@@ -1246,8 +1331,22 @@ static enum ggml_status gen9_graph_compute(ggml_backend_t backend, struct ggml_c
     n_graphs++;
     const auto pg0 = std::chrono::steady_clock::now();
     struct pr_guard { std::chrono::steady_clock::time_point t; ~pr_guard() { if (prof_on()) pr_graph_s = pr_graph_s + std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count(); } } pguard{ pg0 };
+    // GEN9_MM_NOWAIT=1: a split whose products all have M <= 16 (several sequences decoded together) queues them without
+    // waiting; one wait at the end, then the FP16-overflow flags: any overflow fails the graph (the caller retries without)
+    ctx->nw = false;
+    if (mm_nowait_on()) {
+        bool mm = false, small = true;
+        for (int j = 0; j < cgraph->n_nodes; j++) {
+            const struct ggml_tensor * n = cgraph->nodes[j];
+            if (n->op != GGML_OP_MUL_MAT || !(n->flags & GGML_TENSOR_FLAG_COMPUTE)) continue;
+            mm = true; small &= n->src[1]->ne[1] <= 16;
+        }
+        ctx->nw = mm && small;
+    }
     ew_begin(ctx, cgraph);
     struct ew_guard { gen9_context * c; ~ew_guard() { ew_end(c); } } guard{ ctx };
+    struct nw_guard { gen9_context * c; ~nw_guard() { if (c->nw) { std::lock_guard<std::mutex> lk(gpu_mu); gen9blas_flush(); gen9blas_nowait_check(); gen9blas_nowait(0); c->nw = false; } } } nwg{ ctx };
+    if (ctx->nw) { std::lock_guard<std::mutex> lk(gpu_mu); gen9blas_nowait(1); n_nw_splits++; }
     ctx->done.assign(cgraph->n_nodes, 0);
     // pa_map is NOT cleared per split: whisper's norm1 output feeds K, V and Q in three different splits (the K / V
     // copies into the cache run on the CPU in between); entries are checked against the tensor's data pointer
@@ -1270,6 +1369,7 @@ static enum ggml_status gen9_graph_compute(ggml_backend_t backend, struct ggml_c
                     ggml_is_contiguous(node->src[1]) && node->src[1]->ne[2] == 1 && node->src[1]->ne[3] == 1) {
                     ew_flush(ctx); mm_f32_recompute(node); n_mm_forced_f32++; pk = PR_MM; break;
                 }
+                if (ctx->nw) ctx->ew_pending = true;   // no-wait products: a CPU node or the split end must flush first
                 if (gen9_try_ffn(ctx, cgraph, i)) { i += 3; pk = PR_FFN; break; }
                 if (gen9_try_multi(ctx, cgraph, i)) { pk = PR_QKV; break; }
                 {
@@ -1343,6 +1443,14 @@ static enum ggml_status gen9_graph_compute(ggml_backend_t backend, struct ggml_c
             if (pk == PR_FA) fl = 0;
             pr_t[pk] = pr_t[pk] + dt; pr_flop[pk] = pr_flop[pk] + fl; pr_n[pk]++;
         }
+    }
+    if (ctx->nw) {
+        std::lock_guard<std::mutex> lk(gpu_mu);
+        if (gen9blas_flush()) { fprintf(stderr, "gen9: flush failed: %s\n", gen9blas_error()); return GGML_STATUS_FAILED; }
+        ctx->ew_pending = false;
+        const int bad = gen9blas_nowait_check();
+        gen9blas_nowait(0); ctx->nw = false;
+        if (bad) { n_nw_overflow++; fprintf(stderr, "gen9: %d no-wait products overflowed FP16; graph failed (rerun without GEN9_MM_NOWAIT)\n", bad); return GGML_STATUS_FAILED; }
     }
     return GGML_STATUS_SUCCESS;
 }
