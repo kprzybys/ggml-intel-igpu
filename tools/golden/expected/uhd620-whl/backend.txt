@@ -1,0 +1,8 @@
+[ADD] MUL_MAT_VEC_FUSION(type=nvfp4,glu_op=2,m=2,n=32,k=256,use_id=0,n_mats=16,n_used=8,b=0,with_bias=1,with_gate=0,with_lane_scale=1,batch_dims=[1,1],skip=0): FAIL
+[ADD] MUL_MAT_VEC_FUSION(type=nvfp4,glu_op=2,m=4,n=32,k=256,use_id=0,n_mats=16,n_used=8,b=0,with_bias=1,with_gate=0,with_lane_scale=1,batch_dims=[1,1],skip=0): FAIL
+[ADD] MUL_MAT_VEC_FUSION(type=nvfp4,glu_op=2,m=8,n=32,k=256,use_id=0,n_mats=16,n_used=8,b=0,with_bias=1,with_gate=0,with_lane_scale=1,batch_dims=[1,1],skip=0): FAIL
+  1804/1807 tests passed
+  Backend GEN9: FAIL
+FAIL
+qwen2.5-1.5b-instruct-q4_k_m.gguf: [1]22.0392 [2]28.4151 [3]20.5341 [4]14.7460 
+Llama-3.2-1B-Instruct-Q4_K_M.gguf: [1]32.6461 [2]48.0903 [3]39.6481 [4]41.0093 
