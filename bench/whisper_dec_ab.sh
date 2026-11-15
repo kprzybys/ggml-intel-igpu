@@ -2,10 +2,10 @@
 # whisper_dec_ab.sh -- decoder of whisper on the GPU (M = 1 MUL_MAT) vs CPU, no code change: GEN9_MIN_BATCH 8 vs 1.
 # Model and falsification criteria: results/whisper-decoder-gpu-model-2026-11-13.txt. Runs on gp with a separate run's
 # whisper-cli build (read-only use) and the GEN9 backend .so given as $1. Alternating A B A B, separate processes.
-# Usage (on gp): bash whisper_dec_ab.sh <libggml-gen9-*.so> [wav=~/data/fleurs-pl/pl60.wav] [seconds=60]
+# Usage (env WHISPER, MODEL, OUT override the defaults): bash whisper_dec_ab.sh <libggml-gen9-*.so> [wav=~/data/fleurs-pl/pl60.wav] [seconds=60]
 set -u
 SO=$1; SRC=${2:-$HOME/data/fleurs-pl/pl60.wav}; SECS=${3:-60}
-W=$HOME/src/whisper.cpp; M=$HOME/models/whisper/ggml-large-v3-turbo.bin; D=$HOME/dec-5b
+W=${WHISPER:-$HOME/src/whisper.cpp}; M=${MODEL:-$HOME/models/whisper/ggml-large-v3-turbo.bin}; D=${OUT:-$PWD/dec-ab}
 mkdir -p "$D"
 for f in /sys/class/drm/card*/engine/*/preempt_timeout_ms; do
     v=$(cat "$f"); echo "# $f = $v"; [ "$v" = 640 ] || { echo "ABORT: $f is $v"; exit 2; }

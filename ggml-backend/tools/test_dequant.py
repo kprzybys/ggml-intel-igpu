@@ -17,7 +17,7 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "lib"))
 import gen9blas  # noqa: E402
 
-GG = ctypes.CDLL(sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/src/llama.cpp/build-cpu/bin/libggml-base.so"))
+GG = ctypes.CDLL(sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.environ.get("LLAMA_BUILD", os.path.expanduser("~/src/llama.cpp/build-cpu")), "bin", "libggml-base.so"))
 L = gen9blas._lib
 _i, _p = ctypes.c_int, ctypes.c_void_p
 L.gen9blas_pack_b_q.argtypes = [_i, _i, _i, _p, ctypes.c_size_t, ctypes.POINTER(_i)]
