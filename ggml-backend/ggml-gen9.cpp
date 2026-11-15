@@ -57,6 +57,7 @@ static std::atomic<long> n_fa_gpu{0}, n_fa_launch{0}, n_fa_rows{0}, n_fa_cpu_mas
 static std::atomic<long> n_fa_streams{0}, n_fa_streams_cpu{0}, n_fa_verify{0};
 static double fa_verify_max = 0;
 static std::atomic<long> n_fa_f16gather{0}, n_ew_setrows{0}, n_nw_splits{0}, n_nw_overflow{0};
+static bool mrope_on(void) { static const bool v = [] { const char * e = getenv("GEN9_EW_MROPE"); return e && !strcmp(e, "1"); }(); return v; }   // opt-in
 static bool mm_nowait_on(void) { static const bool v = [] { const char * e = getenv("GEN9_MM_NOWAIT"); return e && !strcmp(e, "1"); }(); return v; }   // FLASH_ATTN_EXT with F16 K/V gathered from another layout (fa_f16_gather_off)
 static std::atomic<long> n_fa_f32kv{0}, n_mm_forced_f32{0}, n_ew_im2col{0};   // FLASH_ATTN_EXT with F32 K/V converted to FP16 (NeMo)
 static std::atomic<long> n_fa_tail{0}, n_fa_cpu_tail{0};   // n_k not a multiple of 16: rounded up on the GPU / V tail not finite
@@ -532,9 +533,10 @@ static void fa_shape_info(const struct ggml_tensor * op, const char * why) {
 }
 
 // KV streams (llama-server -np N, ggml ne[3] = streams): F16 K/V in llama.cpp's per-stream cache layout, one F16 mask per
-// stream (or one for all), no kv_rows; any n_q (decoding: 1 per stream). gen9blas_attn_f16kv_streams. GEN9_ATTN_STREAMS=0 off.
+// stream (or one for all), no kv_rows; any n_q (decoding: 1 per stream). gen9blas_attn_f16kv_streams. Opt-in: GEN9_ATTN_STREAMS=1
+// (no measured gain on whole PaddleOCR-VL pages yet: kp-docsearch docs/plan-paddle-gen9.md).
 static bool fa_streams_ok(const struct ggml_tensor * op) {
-    static const bool off = [] { const char * e = getenv("GEN9_ATTN_STREAMS"); return e && !strcmp(e, "0"); }();
+    static const bool off = [] { const char * e = getenv("GEN9_ATTN_STREAMS"); return !(e && !strcmp(e, "1")); }();   // opt-in
     const struct ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2], * m = op->src[3];
     const int64_t D = q->ne[0], nq = q->ne[1], H = q->ne[2], ns = q->ne[3], nk = k->ne[1], HKV = k->ne[2];
     const size_t row = (size_t) (HKV * D * 2);
@@ -689,6 +691,7 @@ static void fa_on_cpu(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
 // exact same page range, so the varying ranges here (K/V from cr[0] to the tensor's end, staging nk rows) are pinned
 // again; KCL_USERPTR_MB=2048 measured +1 % (results/attn-qwen3-prof-gp-2026-11-14.txt): left as is for now.
 static void gen9_flash_attn_runs(gen9_context * ctx, struct ggml_cgraph * cg, int i, const std::vector<fa_run> & runs) {
+    ew_flush(ctx);   // K/V rows are read on the CPU below: queued GPU writes (SET_ROWS into the cache) must land first
     static char * stage = nullptr; static size_t stage_bytes = 0;   // [K rows | V rows], used under gpu_mu
     struct ggml_tensor * dst = cg->nodes[i];
     const struct ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * rows = dst->src[5];
@@ -758,6 +761,7 @@ static void gen9_flash_attn_runs(gen9_context * ctx, struct ggml_cgraph * cg, in
 }
 
 static void gen9_flash_attn_f32kv(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
+    if (cg->nodes[i]->src[1]->type == GGML_TYPE_F16) ew_flush(ctx);   // F16 K/V gathered on the CPU (queued SET_ROWS first)
     static char * stage = nullptr; static size_t stage_bytes = 0;   // [K rows | V rows | pad], used under gpu_mu
     struct ggml_tensor * dst = cg->nodes[i];
     const struct ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2];
@@ -790,7 +794,10 @@ static void gen9_flash_attn_f32kv(gen9_context * ctx, struct ggml_cgraph * cg, i
                     }
                 for (int64_t x = 0; x < (int64_t) nv * HKV * D && fin; x++)   // the kernel needs finite K/V (no Inf/NaN)
                     if ((ks[x] & 0x7C00) == 0x7C00 || (vs[x] & 0x7C00) == 0x7C00) fin = false;
-                if (!fin) { rc = 1; }
+                if (!fin) {   // keep the staging invariant (rows nv..nk of a later call must be finite): clear what was copied
+                    rc = 1;
+                    memset(ks, 0, (size_t) nv * HKV * D * 2); memset(vs, 0, (size_t) nv * HKV * D * 2);
+                }
             } else if (gen9blas_cvt_f16_heads(nv, HKV, D, (const float *) k->data, (long) (k->nb[1] / 4), (long) (k->nb[2] / 4),
                                        (uint16_t *) ks, !span) ||
                 gen9blas_cvt_f16_heads(nv, HKV, D, (const float *) v->data, (long) (v->nb[1] / 4), (long) (v->nb[2] / 4),
@@ -926,6 +933,7 @@ static void gen9_flash_attn(gen9_context * ctx, struct ggml_cgraph * cg, int i) 
     int nk = (int) std::min<int64_t>((vmax + 15) / 16 * 16, k->ne[1]);   // key rows the kernel reads (multiple of 16)
     if (nk % 16) {   // n_k itself not a multiple of 16 (no mask, checked in supports_op): read the rows behind the view
         nk = (nk + 15) / 16 * 16;
+        ew_flush(ctx);     // the V rows below are read on the CPU (queued SET_ROWS first)
         bool fin = true;   // keys >= vis0 get p = 0, but 0 * Inf/NaN in V is NaN: their V rows must be finite
         for (int64_t j = vmax; j < nk && fin; j++) {
             const uint16_t * r = (const uint16_t *) ((const char *) v->data + j * v->nb[1]);
@@ -1013,7 +1021,7 @@ static bool gen9_try_multi(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
     }
     if (rc < 0) { fprintf(stderr, "gen9: gemm_multi_f16w failed: %s\n", gen9blas_error()); return false; }
     if (rc > 0) return false;
-    ctx->ew_pending = false;   // the call waited for everything queued before it
+    if (!ctx->nw) ctx->ew_pending = false;   // the call waited for everything queued before it (not in no-wait mode)
     for (int g = 0; g < n; g++) {
         if (nf[g]) { n_multi_fallback++; mm_f32_recompute(cg->nodes[grp[g]]); }
         if (g) ctx->done[grp[g]] = 1;
@@ -1620,7 +1628,8 @@ static bool gen9_supports_ew(const struct ggml_tensor * op) {
             break;
         case GGML_OP_SET_ROWS: {   // F32 rows into an F16 tensor (llama.cpp's KV-cache writes), gen9blas_set_rows_f16
             const struct ggml_tensor * a = op->src[0], * ix = op->src[1];
-            ok = a->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F16 && gpu_ok() && gen9blas_set_rows_supported() &&
+            static const bool on = [] { const char * e = getenv("GEN9_EW_SETROWS"); return e && !strcmp(e, "1"); }();   // opt-in
+            ok = on && a->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F16 && gpu_ok() && gen9blas_set_rows_supported() &&
                  (ix->type == GGML_TYPE_I64 || ix->type == GGML_TYPE_I32) && a->nb[0] == 4 && op->nb[0] == 2 &&
                  a->nb[1] % 4 == 0 && a->nb[2] % 4 == 0 && a->nb[3] % 4 == 0 && op->nb[1] % 2 == 0 && op->nb[2] % 2 == 0 &&
                  op->nb[3] % 2 == 0 && op->ne[0] == a->ne[0] && op->ne[2] == a->ne[2] && op->ne[3] == a->ne[3] &&
@@ -1650,7 +1659,7 @@ static bool gen9_supports_ew(const struct ggml_tensor * op) {
             const int n_dims = pp[1], mode = pp[2], n_offs = pp[15];
             ok = x->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && ggml_is_contiguous(op) && ggml_are_same_shape(x, op) &&
                  (mode == GGML_ROPE_TYPE_NORMAL || mode == GGML_ROPE_TYPE_NEOX ||
-                  (mode == GGML_ROPE_TYPE_MROPE && gpu_ok() && gen9blas_rope_multi_supported())) && n_dims == x->ne[0] && n_offs == 0 &&
+                  (mode == GGML_ROPE_TYPE_MROPE && mrope_on() && gpu_ok() && gen9blas_rope_multi_supported())) && n_dims == x->ne[0] && n_offs == 0 &&
                  x->ne[3] == 1 && x->nb[0] == 4 && x->nb[1] % 4 == 0 && x->nb[2] % 4 == 0 &&
                  x->nb[1] >= (size_t) n_dims * 4 && x->nb[2] >= (x->ne[1] - 1) * x->nb[1] + (size_t) n_dims * 4 &&
                  fits_int(x->ne[1]) && fits_int(x->ne[2]) && n_dims % 2 == 0 &&
