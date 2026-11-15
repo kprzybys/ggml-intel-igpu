@@ -1,0 +1,24 @@
+Gate 4 of bench/whisper/PLAN-dekoder-gpu.md: GPU decoder inside whisper.cpp (dec/libgen9dec_kcl.so +
+dec/patch_whisper_dec.py, WHISPER_DEC_GPU=1), gp, 2026-11-15 01:40-02:45. Test tree ~/src/whisper-dec (gp), backend with
+a packed-weight cache shared by all backend instances (~/whisper-gpu-dec/lib, built from bundle source 6a72bc3 + that
+change; a build from the current source against the bundle's older libgen9blas made the encoder 4x slower).
+
+Correctness: janko60, one stream, greedy: transcript byte-identical to the CPU decoder; GPU decoder 37.6 ms/token
+(CPU 13.2) as the model predicted for one stream.
+
+Batching across streams (whisper-cli -p N) does not happen in practice on gp: per-step log (GEN9DEC_LOG=1, -p 4,
+janko60): almost every step had 1 request, "states decoding 1 encoding 3". The encoder is the GPU's bottleneck: the
+states queue for it (encoder mutex, 5 s per window), so their decode phases never coincide, and the GPU decoder
+competes with the encoder for the same GPU (encoder 5.0 -> 8.4 s per window). -> On gp the GPU decoder is
+counterproductive; the decoder belongs on the CPU while the GPU encodes.
+
+Other findings:
+- whisper -p N with the GEN9 backend ran out of memory (OOM kill): one packed-weight cache per backend instance (=
+  per state) -> fixed: cache shared by all instances (ggml-backend/ggml-gen9.cpp g_wcache, refcounted).
+- with -p and ggml-cpu OpenMP threads, 2 states x 4 threads spun at ~800 % CPU on 4 cores (OMP_WAIT_POLICY=PASSIVE
+  removes the spin; timing equal at -p 2 on janko60).
+- CPU decoder overlapping the GPU encoder, Janko (16.4 min), greedy, CPU decoder, GPU mel off:
+    sequential 309 s, WER 8.86 % | -p 2: 285 s (-8 %), WER 9.36 % | -p 4: 271 s (-12 %), WER 8.31 %
+  modest, because the encoder windows still run one after another on the GPU.
+Conclusion: GPU decoder (dec/) is correct and kept as an option; on this hardware the useful levers are encoder speed
+and fewer encoder windows (VAD, -mc), with the decoder on the CPU.
