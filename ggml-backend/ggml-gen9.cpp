@@ -359,7 +359,8 @@ static bool gen9_mul_mat(gen9_context * ctx, struct ggml_tensor * dst) {
     std::vector<float> xf;   // F32 copy of FP16 activations, only for the F32 paths
     auto x_f32 = [&]() -> const float * {
         if (!xh) return (const float *) x->data;
-        if (xf.empty()) { xf.resize((size_t) M * K); for (int r = 0; r < M; r++) ggml_fp16_to_fp32_row((const ggml_fp16_t *) x->data + (size_t) r * lda, xf.data() + (size_t) r * K, K); }
+        if (xf.empty()) { if (ctx->ew_pending) { gen9blas_flush(); ctx->ew_pending = false; }   // x read on the CPU; gpu_mu held
+            xf.resize((size_t) M * K); for (int r = 0; r < M; r++) ggml_fp16_to_fp32_row((const ggml_fp16_t *) x->data + (size_t) r * lda, xf.data() + (size_t) r * K, K); }
         return xf.data();
     };
     const int ldf = xh ? K : lda;
@@ -702,6 +703,14 @@ static void cpu_node(gen9_context * ctx, struct ggml_cgraph * cg, int i) {   // 
     one.grads = nullptr; one.grad_accs = nullptr; one.leafs = nullptr; one.uid = 0;
     GGML_ASSERT(ggml_backend_graph_compute(ctx->cpu, &one) == GGML_STATUS_SUCCESS);
 }
+// Mask (src[3]) and kv_rows (src[5]) are read on the CPU: wait for queued GPU work when either is computed by a node
+// (in llama.cpp 2cbe0ec both are leaf inputs; a mask made with ggml_cast would be a queued CPY since 2026-11-15).
+static void fa_cpu_inputs(gen9_context * ctx, const struct ggml_tensor * dst) {
+    for (int s : { 3, 5 }) {
+        const struct ggml_tensor * t = dst->src[s];
+        if (t && (t->view_src ? t->view_src : t)->op != GGML_OP_NONE) { ew_flush(ctx); return; }
+    }
+}
 static void fa_on_cpu(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
     auto t0 = std::chrono::steady_clock::now();
     cpu_node(ctx, cg, i);
@@ -786,8 +795,9 @@ static void gen9_flash_attn_runs(gen9_context * ctx, struct ggml_cgraph * cg, in
 
 // F16 K/V in another layout: gathered on the GPU (gen9blas_cpy_any, queued behind the ops that wrote K/V, no wait) unless
 // GEN9_ATTN_GPU_GATHER=0 (then on the CPU with a finiteness check, as before 2026-11-15). The GPU gather does not check
-// for Inf/NaN: with no mask every key is visible, so a non-finite K/V value makes ggml-cpu's result non-finite too; the
-// padding rows nv..nk (only when n_k % 16 != 0) are cleared on the CPU first, so masked keys always meet finite V.
+// for Inf/NaN. Not exact: an Inf in K can give a score of -Inf (p = 0) and a finite ggml-cpu row, while the kernel needs
+// finite K/V; needs |K| > 65504 after the F32 -> F16 cast, not seen in the encoders served (Paddle's K is normalised).
+// The padding rows nv..nk (only when n_k % 16 != 0) are cleared on the CPU first, so masked keys always meet finite V.
 static bool fa_gpu_gather(void) { static const bool v = [] { const char * e = getenv("GEN9_ATTN_GPU_GATHER"); return !(e && !strcmp(e, "0")); }(); return v; }
 static void gen9_flash_attn_f32kv(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
     const bool f16 = cg->nodes[i]->src[1]->type == GGML_TYPE_F16, gg = f16 && fa_gpu_gather() && gen9blas_cpy_supported();
@@ -804,6 +814,10 @@ static void gen9_flash_attn_f32kv(gen9_context * ctx, struct ggml_cgraph * cg, i
         std::lock_guard<std::mutex> lk(gpu_mu);
         const size_t need = 2 * (size_t) nk * row + 8192;   // + the kernel's read-ahead past the end of K^T (attn_gen.py: >= NK*D*16 B)
         if (need > stage_bytes) {
+            if (ctx->ew_pending) {   // a queued gather of an earlier call may still use the old buffer
+                if (gen9blas_flush()) fprintf(stderr, "gen9: flush failed: %s\n", gen9blas_error());
+                ctx->ew_pending = false;
+            }
             free(stage); stage = nullptr; stage_bytes = 0;
             const size_t sz = (need + (1u << 20) - 1) & ~(size_t) ((1u << 20) - 1);
             if (posix_memalign((void **) &stage, 4096, sz) == 0) { stage_bytes = sz; memset(stage, 0, sz); } else stage = nullptr;
@@ -824,6 +838,7 @@ static void gen9_flash_attn_f32kv(gen9_context * ctx, struct ggml_cgraph * cg, i
                 if (gen9blas_cpy_any(k->data, 1, kne, knb, ks, 1, kne, dnb, !span) || gen9blas_cpy_any(v->data, 1, vne, vnb, vs, 1, vne, dnb, !span)) {
                     fprintf(stderr, "gen9: K/V gather on the GPU failed: %s\n", gen9blas_error()); fin = false;
                 }
+                if (span) ctx->ew_pending = true;   // queued: a declined attention or the split end must still wait
             } else if (k->type == GGML_TYPE_F16) {   // gather [key][head][d] rows on the CPU (see fa_f16_gather_off)
                 for (int t = 0; t < nv; t++)
                     for (int h = 0; h < HKV; h++) {
@@ -885,6 +900,7 @@ static void gen9_flash_attn_streams(gen9_context * ctx, struct ggml_cgraph * cg,
     const struct ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * m = dst->src[3];
     const int D = (int) q->ne[0], nq = (int) q->ne[1], H = (int) q->ne[2], ns = (int) q->ne[3], HKV = (int) k->ne[2], nk = (int) k->ne[1];
     auto t0 = std::chrono::steady_clock::now();
+    fa_cpu_inputs(ctx, dst);   // the mask is analysed on the CPU
     std::vector<int> vis(ns);
     int dv = -1;
     for (int st = 0; st < ns; st++) {
@@ -978,6 +994,7 @@ static void gen9_flash_attn(gen9_context * ctx, struct ggml_cgraph * cg, int i) 
         }
     }
     int vis0 = (int) k->ne[1], dvis = 0;
+    fa_cpu_inputs(ctx, dst);   // mask and kv_rows are read on the CPU
     auto t0 = std::chrono::steady_clock::now();
     if (m && !fa_mask_prefix(m, nq, vis0, dvis)) {
         std::vector<fa_run> runs;
@@ -1345,7 +1362,8 @@ static void ew_begin(gen9_context * ctx, struct ggml_cgraph * cg) {
     for (int i = 0; i < cg->n_nodes; i++) {
         const struct ggml_tensor * n = cg->nodes[i];
         if (!(n->flags & GGML_TENSOR_FLAG_COMPUTE)) continue;
-        any |= is_ew_op(n->op);
+        // stream attention may run as the queued decoding kernel: its O must live in a span like an elementwise result
+        any |= is_ew_op(n->op) || (n->op == GGML_OP_FLASH_ATTN_EXT && n->src[0]->ne[3] > 1);
         waits |= n->op == GGML_OP_MUL_MAT || n->op == GGML_OP_FLASH_ATTN_EXT;
         // only nodes that write: a RESHAPE/VIEW/PERMUTE/TRANSPOSE/NONE node of a weight lives in the weights' buffer,
         // which NeMo-Speech.cpp maps read-only from the GGUF without marking it WEIGHTS -> a writable span on it made

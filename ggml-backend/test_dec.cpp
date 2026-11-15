@@ -5,7 +5,8 @@
 //
 // Usage: test_dec <libggml-gen9.so> <D> <H> <HKV> <ns> <n_q> <max_len> <kv_size> [mode]
 //   stream s sees len_s = max_len * (s + 1) / ns keys before its first token (different lengths per stream);
-//   mode: causal (default), hole (one stream has a masked cell inside its prefix: must fall back to ggml-cpu)
+//   mode: causal (default), hole (one stream has a masked cell inside its prefix: must fall back to ggml-cpu),
+//         shared (one mask [n_kv, n_q, 1, 1] broadcast to all streams, every stream sees max_len keys)
 // Output: supports_op, NMSE (bound 5e-4), max |gpu - cpu| / max |cpu|, best-of-5 times. GEN9_INFO=1: backend counters.
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -21,7 +22,7 @@
 #include <vector>
 
 int main(int argc, char ** argv) {
-    if (argc < 9) { fprintf(stderr, "usage: %s lib D H HKV ns n_q max_len kv_size [causal|hole]\n", argv[0]); return 2; }
+    if (argc < 9) { fprintf(stderr, "usage: %s lib D H HKV ns n_q max_len kv_size [causal|hole|shared]\n", argv[0]); return 2; }
     const int D = atoi(argv[2]), H = atoi(argv[3]), HKV = atoi(argv[4]), ns = atoi(argv[5]), nq = atoi(argv[6]);
     const int max_len = atoi(argv[7]), kv_size = atoi(argv[8]);
     const std::string mode = argc > 9 ? argv[9] : "causal";
@@ -37,7 +38,8 @@ int main(int argc, char ** argv) {
     ggml_tensor * kc = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, (int64_t) HKV * D, kv_size, ns);
     ggml_tensor * vc = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, (int64_t) HKV * D, kv_size, ns);
     ggml_tensor * qcur = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, H, nq, ns);
-    ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, nqp, 1, ns);
+    const int nsm = mode == "shared" ? 1 : ns;   // streams in the mask
+    ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, nqp, 1, nsm);
     ggml_tensor * k = ggml_view_4d(ctx, kc, D, HKV, n_kv, ns, D * 2, row, row * kv_size, 0);
     ggml_tensor * v = ggml_view_4d(ctx, vc, D, HKV, n_kv, ns, D * 2, row, row * kv_size, 0);
     ggml_tensor * q = ggml_permute(ctx, qcur, 0, 2, 1, 3);
@@ -58,14 +60,14 @@ int main(int argc, char ** argv) {
     for (int64_t i = 0; i < ggml_nelements(qcur); i++) ((float *) qcur->data)[i] = 2.0f * u(rng);
     const ggml_fp16_t z = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
     long keys = 0;
-    for (int s = 0; s < ns; s++) {
-        const int len = std::max(1, max_len * (s + 1) / ns);
+    for (int s = 0; s < nsm; s++) {
+        const int len = nsm == 1 ? max_len : std::max(1, max_len * (s + 1) / ns);
         for (int t = 0; t < nqp; t++)
             for (int c = 0; c < n_kv; c++) {
                 bool vis = t < nq && c < len + t;
                 if (mode == "hole" && s == ns / 2 && c == 3) vis = false;
                 ((ggml_fp16_t *) mask->data)[((size_t) s * nqp + t) * n_kv + c] = vis ? z : ninf;
-                if (vis) keys++;
+                if (vis) keys += ns / nsm;
             }
     }
     printf("D=%d H=%d HKV=%d ns=%d n_q=%d max_len=%d kv_size=%d n_kv=%d mode=%s: GEN9 supports_op %d\n", D, H, HKV, ns, nq, max_len,
