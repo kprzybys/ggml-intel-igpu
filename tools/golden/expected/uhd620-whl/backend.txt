@@ -1,8 +1,42 @@
 [ADD] MUL_MAT_VEC_FUSION(type=nvfp4,glu_op=2,m=2,n=32,k=256,use_id=0,n_mats=16,n_used=8,b=0,with_bias=1,with_gate=0,with_lane_scale=1,batch_dims=[1,1],skip=0): FAIL
 [ADD] MUL_MAT_VEC_FUSION(type=nvfp4,glu_op=2,m=4,n=32,k=256,use_id=0,n_mats=16,n_used=8,b=0,with_bias=1,with_gate=0,with_lane_scale=1,batch_dims=[1,1],skip=0): FAIL
 [ADD] MUL_MAT_VEC_FUSION(type=nvfp4,glu_op=2,m=8,n=32,k=256,use_id=0,n_mats=16,n_used=8,b=0,with_bias=1,with_gate=0,with_lane_scale=1,batch_dims=[1,1],skip=0): FAIL
-  1804/1807 tests passed
+  2064/2067 tests passed
   Backend GEN9: FAIL
 FAIL
 qwen2.5-1.5b-instruct-q4_k_m.gguf: [1]22.0392 [2]28.4151 [3]20.5341 [4]14.7460 
 Llama-3.2-1B-Instruct-Q4_K_M.gguf: [1]32.6461 [2]48.0903 [3]39.6481 [4]41.0093 
+vision rope:   node ROPE         node_0                   GEN9 supports_op 1
+vision rope: rope (60 x 84 patches): NMSE 0.000e+00 (bound 1e-07) max|err|/max|ref| 0.000e+00 bit-identical 1.0000 non-finite 0 -> OK
+vision cast:   node PERMUTE       (permuted)              GEN9 supports_op 1
+vision cast:   node CPY           (permuted) (copy)       GEN9 supports_op 1
+vision cast: cast (60 x 84 patches): NMSE 0.000e+00 (bound 1e-07) max|err|/max|ref| 0.000e+00 bit-identical 1.0000 non-finite 0 -> OK
+vision cont:   node PERMUTE       (permuted)              GEN9 supports_op 1
+vision cont:   node CONT          (permuted) (cont)       GEN9 supports_op 1
+vision cont: cont (60 x 84 patches): NMSE 0.000e+00 (bound 1e-07) max|err|/max|ref| 0.000e+00 bit-identical 1.0000 non-finite 0 -> OK
+vision upscale:   node RESHAPE       (reshaped)              GEN9 supports_op 1
+vision upscale:   node PERMUTE       (reshaped) (permuted)   GEN9 supports_op 1
+vision upscale:   node UPSCALE      node_2                   GEN9 supports_op 1
+vision upscale:   node PERMUTE       (permuted)              GEN9 supports_op 1
+vision upscale:   node CONT          (permuted) (cont)       GEN9 supports_op 1
+vision upscale: upscale (60 x 84 patches): NMSE 0.000e+00 (bound 1e-07) max|err|/max|ref| 0.000e+00 bit-identical 1.0000 non-finite 0 -> OK
+vision block:   node ROPE         node_0                   GEN9 supports_op 1
+vision block:   node PERMUTE       (permuted)              GEN9 supports_op 1
+vision block:   node ROPE         node_2                   GEN9 supports_op 1
+vision block:   node PERMUTE       (permuted)              GEN9 supports_op 1
+vision block:   node CPY           (permuted) (copy)       GEN9 supports_op 1
+vision block:   node PERMUTE       (permuted)              GEN9 supports_op 1
+vision block:   node CPY           (permuted) (copy)       GEN9 supports_op 1
+vision block:   node FLASH_ATTN_EXT node_7                   GEN9 supports_op 1
+vision block: block (60 x 84 patches): NMSE 1.367e-10 (bound 5e-04) max|err|/max|ref| 2.003e-04 bit-identical 0.0148 non-finite 0 -> OK
+dec 72 16 16 1 1 512 1024: D=72 H=16 HKV=16 ns=1 n_q=1 max_len=512 kv_size=1024 n_kv=768 mode=causal: GEN9 supports_op 0
+dec 128 16 2 4 1 300 1024: D=128 H=16 HKV=2 ns=4 n_q=1 max_len=300 kv_size=1024 n_kv=512 mode=causal: GEN9 supports_op 1
+dec 128 16 2 4 1 300 1024:   NMSE 1.008e-13 (bound 5e-4) max|err|/max|ref| 3.528e-07 non-finite 0 -> OK
+dec 128 16 2 4 7 300 1024: D=128 H=16 HKV=2 ns=4 n_q=7 max_len=300 kv_size=1024 n_kv=512 mode=causal: GEN9 supports_op 1
+dec 128 16 2 4 7 300 1024:   NMSE 1.056e-13 (bound 5e-4) max|err|/max|ref| 7.057e-07 non-finite 0 -> OK
+dec 128 24 8 3 7 200 512: D=128 H=24 HKV=8 ns=3 n_q=7 max_len=200 kv_size=512 n_kv=256 mode=causal: GEN9 supports_op 1
+dec 128 24 8 3 7 200 512:   NMSE 7.983e-14 (bound 5e-4) max|err|/max|ref| 4.976e-07 non-finite 0 -> OK
+dec 128 16 2 4 7 300 1024 shared: D=128 H=16 HKV=2 ns=4 n_q=7 max_len=300 kv_size=1024 n_kv=512 mode=shared: GEN9 supports_op 1
+dec 128 16 2 4 7 300 1024 shared:   NMSE 1.898e-13 (bound 5e-4) max|err|/max|ref| 6.966e-07 non-finite 0 -> OK
+dec 128 16 2 4 1 300 1024 hole: D=128 H=16 HKV=2 ns=4 n_q=1 max_len=300 kv_size=1024 n_kv=512 mode=hole: GEN9 supports_op 1
+dec 128 16 2 4 1 300 1024 hole:   NMSE 0.000e+00 (bound 5e-4) max|err|/max|ref| 0.000e+00 non-finite 0 -> OK
