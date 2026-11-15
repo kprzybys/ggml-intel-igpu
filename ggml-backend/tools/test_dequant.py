@@ -23,7 +23,7 @@ _i, _p = ctypes.c_int, ctypes.c_void_p
 L.gen9blas_pack_b_q.argtypes = [_i, _i, _i, _p, ctypes.c_size_t, ctypes.POINTER(_i)]
 L.gen9blas_pack_b_q.restype = _p
 L.gen9blas_gemm_pb_f16w.argtypes = [_i, _p, _i, _p, _p, _i, ctypes.POINTER(_i)]
-L.gen9blas_packed_free.argtypes = [_p]
+L.gen9blas_packed_b_free.argtypes = [_p]
 GG.ggml_fp32_to_fp16_row.argtypes = [_p, _p, ctypes.c_int64]
 gen9blas._init()
 rng = np.random.default_rng(11)
@@ -89,7 +89,7 @@ def case(qt, K, N, d_range=(0.001, 0.05), expect_oor=False):
         errors += diff != 0
     else:
         print(f"ok   {name}: out-of-range flag set as in the reference")
-    L.gen9blas_packed_free(P)
+    L.gen9blas_packed_b_free(P)
 
 
 for qt in (0, 1, 2):
@@ -105,9 +105,9 @@ for qt in (1, 2, 0):
     K, N = 1536, 8960
     W = blocks(qt, K, N, (0.001, 0.05))
     t0 = time.perf_counter(); P, _ = gpu_pack(qt, W, K, N); t1 = time.perf_counter()
-    L.gen9blas_packed_free(P)
+    L.gen9blas_packed_b_free(P)
     t2 = time.perf_counter(); P, _ = gpu_pack(qt, W, K, N); t3 = time.perf_counter()
-    L.gen9blas_packed_free(P)
+    L.gen9blas_packed_b_free(P)
     t4 = time.perf_counter(); ggml_ref(qt, W[:1024], K, 1024); t5 = time.perf_counter()
     print(f"     {Q[qt][0]} {N}x{K}: GPU dequant+pack {1e3 * (t1 - t0):.1f} / {1e3 * (t3 - t2):.1f} ms "
           f"({N * K * 2 / (t3 - t2) / 1e9:.1f} GB/s FP16 out); ggml CPU 1 thread {1e3 * (t5 - t4) * N / 1024:.0f} ms")

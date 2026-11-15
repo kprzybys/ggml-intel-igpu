@@ -3,7 +3,7 @@
 LLAMA ?= $(HOME)/src/llama.cpp
 LLAMA_BUILD ?= $(LLAMA)/build-cpu
 CXXFLAGS = -std=c++17 -O2 -Wall -Wno-unused-function -fPIC -DGGML_BACKEND_DL -DGGML_BACKEND_SHARED -DGGML_BACKEND_BUILD \
-           -I$(LLAMA)/ggml/include -I$(LLAMA)/ggml/src -I../lib -DGEN9_BENCH_DIR='"$(abspath ../lib/kernels)"'
+           -I$(LLAMA)/ggml/include -I$(LLAMA)/ggml/src -I../lib
 # ggml of whisper.cpp (no ggml_rope_get_truncate): make LLAMA=<whisper.cpp source tree> GEN9_DEFS=-DGEN9_GGML_NO_ROPE_TRUNCATE
 CXXFLAGS += $(GEN9_DEFS)
 

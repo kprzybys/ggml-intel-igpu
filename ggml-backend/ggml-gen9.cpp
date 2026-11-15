@@ -10,7 +10,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
 #include "ggml-impl.h"   // struct ggml_cgraph
-#include "gen9blas.h"
+#include "gen9blas_ml.h"
 
 #include <atomic>
 #include <cfloat>
@@ -30,9 +30,6 @@
 #include <vector>
 #include <unistd.h>
 
-#ifndef GEN9_BENCH_DIR
-#define GEN9_BENCH_DIR ""
-#endif
 
 // ---------------- routing counter (printed at exit with GEN9_INFO=1) ----------------
 
@@ -147,7 +144,7 @@ static bool gpu_ok(void) {
     static int state = -1;   // -1 not tried, 0 failed, 1 ready
     std::lock_guard<std::mutex> lk(gpu_mu);
     if (state < 0) {
-        state = gen9blas_init(GEN9_BENCH_DIR) == 0;
+        state = gen9blas_init() == 0;
         if (!state) fprintf(stderr, "gen9: GPU init failed (%s); declining everything\n", gen9blas_error());
     }
     return state == 1;
@@ -162,7 +159,7 @@ struct wkey {
 
 // The cache lives until the last backend instance is freed (llama.cpp frees it with the context, before the model
 // (design section 3.1): a data pointer cannot be reused for another weight while an entry exists.
-struct packed_t { gen9blas_packed * P; int t; bool temp = false; };   // temp: not cached, free after use   // t: GEN9BLAS_S (F32 GEMM) or GEN9BLAS_HS (accurate FP16 GEMM)
+struct packed_t { gen9blas_packed_b * P; int t; bool temp = false; };   // temp: not cached, free after use   // t: GEN9BLAS_S (F32 GEMM) or GEN9BLAS_HS (accurate FP16 GEMM)
 // Packed weights are shared by every backend instance of the process (whisper.cpp -p N: one instance per state, same
 // model): one cache, freed by the last instance. Guarded by gpu_mu like the rest of the library state.
 struct gen9_wcache { std::map<wkey, packed_t> map; size_t bytes = 0; int refs = 0; };
@@ -185,7 +182,7 @@ struct gen9_context {
         for (auto * pa : pa_pool) gen9blas_packed_a_free(pa);
         if (cpu) ggml_backend_free(cpu);
         std::lock_guard<std::mutex> lk(gpu_mu);
-        if (--g_wcache.refs == 0) { for (auto & kv : cache) gen9blas_packed_free(kv.second.P); cache.clear(); cached_bytes = 0; }
+        if (--g_wcache.refs == 0) { for (auto & kv : cache) gen9blas_packed_b_free(kv.second.P); cache.clear(); cached_bytes = 0; }
     }
 };
 
@@ -278,11 +275,11 @@ static packed_t pack_weight(const struct ggml_tensor * w) {
     const int qt = gpu_qtype(w->type);
     if (qt >= 0 && !getenv("GEN9_CPU_DEQ")) {   // dequantized on the GPU straight into the packed layout (bit-identical)
         int oor = 0;
-        gen9blas_packed * P = gen9blas_pack_b_q(qt, K, N, w->data, w->nb[1], &oor);
+        gen9blas_packed_b * P = gen9blas_pack_b_q(qt, K, N, w->data, w->nb[1], &oor);
         if (P && !oor && getenv("GEN9_DEQ_VERIFY")) {   // debug: same GEMM with the CPU-path packing must give the same bits
             std::vector<ggml_fp16_t> h((size_t) N * K);
             dequant_rows(w, h.data(), true);
-            gen9blas_packed * P2 = gen9blas_pack_b(GEN9BLAS_HS, 1, K, N, h.data(), K);
+            gen9blas_packed_b * P2 = gen9blas_pack_b(GEN9BLAS_HS, 1, K, N, h.data(), K);
             const int M = 32;
             std::vector<float> A((size_t) M * K), C1((size_t) M * N), C2((size_t) M * N);
             for (size_t i = 0; i < A.size(); i++) A[i] = (float) ((i * 2654435761u) % 2001) / 1000.0f - 1.0f;
@@ -294,7 +291,7 @@ static packed_t pack_weight(const struct ggml_tensor * w) {
             fprintf(stderr, "gen9: verify %-28s %s K=%d N=%d nb1=%zu data%%64=%zu: %zu of %zu differ (first col %zu)\n", w->name,
                     ggml_type_name(w->type), K, N, (size_t) w->nb[1], (size_t) ((uintptr_t) w->data % 64), bad, C1.size(),
                     first == (size_t) -1 ? 0 : first % N);
-            gen9blas_packed_free(P2);
+            gen9blas_packed_b_free(P2);
         }
         if (P && !oor) {
             n_dequant_gpu++;
@@ -302,7 +299,7 @@ static packed_t pack_weight(const struct ggml_tensor * w) {
             t_deq_gpu_s = t_deq_gpu_s + t; t_dequant_s = t_dequant_s + t;
             return { P, GEN9BLAS_HS };
         }
-        if (P) gen9blas_packed_free(P);   // beyond FP16: the CPU path below packs it as F32
+        if (P) gen9blas_packed_b_free(P);   // beyond FP16: the CPU path below packs it as F32
         else fprintf(stderr, "gen9: GPU dequantization of %s failed (%s); CPU path\n", w->name, gen9blas_error());
         t0 = now();
     }
@@ -352,7 +349,7 @@ static packed_t get_packed(gen9_context * ctx, const struct ggml_tensor * w) {
     return r;
 }
 
-static void release(const packed_t & p) { if (p.temp && p.P) { gen9blas_flush(); gen9blas_packed_free(p.P); } }   // flush: no-wait work may still read it
+static void release(const packed_t & p) { if (p.temp && p.P) { gen9blas_flush(); gen9blas_packed_b_free(p.P); } }   // flush: no-wait work may still read it
 
 // dst[M x N] = src1[M x K] . src0^T with src0 stored N x K row-major: gemm(A = src1, B = src0 transposed).
 // F32 weights: SGEMM. F16 and quantized weights: accurate FP16 GEMM (gemm_pb_f16w); a call whose result overflows FP16 is
@@ -391,7 +388,7 @@ static bool gen9_mul_mat(gen9_context * ctx, struct ggml_tensor * dst) {
         temp = true;
     }
     int rc;
-    if (p.t == GEN9BLAS_S) rc = gen9blas_gemm_pb(GEN9BLAS_S, 0, M, 1.0, x_f32(), ldf, p.P, 0.0, dst->data, ldc);
+    if (p.t == GEN9BLAS_S) rc = gen9blas_gemm_pb(0, M, 1.0, x_f32(), ldf, p.P, 0.0, dst->data, ldc);
     else {
         int nonfinite = 0;
         n_mm_f16++;
@@ -409,7 +406,7 @@ static bool gen9_mul_mat(gen9_context * ctx, struct ggml_tensor * dst) {
             rc = gen9blas_gemm(GEN9BLAS_S, 0, 1, M, N, K, 1.0, x_f32(), ldf, wf.data(), K, 0.0, dst->data, ldc);
         }
     }
-    if (temp) { if (ctx->nw) gen9blas_flush(); gen9blas_packed_free(p.P); }   // no-wait: the GPU may still read it
+    if (temp) { if (ctx->nw) gen9blas_flush(); gen9blas_packed_b_free(p.P); }   // no-wait: the GPU may still read it
     if (rc) { fprintf(stderr, "gen9: MUL_MAT %s failed: %s\n", w->name, gen9blas_error()); return false; }
     return true;
 }
@@ -464,7 +461,7 @@ static bool gen9_try_ffn(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
     const packed_t g = get_packed(ctx, gate->src[0]), u = get_packed(ctx, up->src[0]), d = get_packed(ctx, down->src[0]);
     struct rel3 { const packed_t & a, & b, & c; ~rel3() { release(a); release(b); release(c); } } rel{ g, u, d };
     if (!g.P || !u.P || !d.P || g.t != GEN9BLAS_HS || u.t != GEN9BLAS_HS || d.t != GEN9BLAS_HS) return false;
-    gen9blas_packed * Pg = g.P, * Pu = u.P, * Pd = d.P;
+    gen9blas_packed_b * Pg = g.P, * Pu = u.P, * Pd = d.P;
     int nonfinite = 0;
     const int M = (int) x->ne[1];
     if (gen9blas_ffn_f16w(M, (const float *) x->data, (int) (x->nb[1] / sizeof(float)), Pg, Pu, Pd, (float *) down->data,
@@ -556,7 +553,7 @@ static const int64_t FA_DEC_MAXQ = [] { const char * e = getenv("GEN9_ATTN_DEC_M
 static bool fa_dec_ok(const struct ggml_tensor * op) {
     const struct ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2], * m = op->src[3];
     const int64_t D = q->ne[0], nq = q->ne[1], H = q->ne[2], ns = q->ne[3], nk = k->ne[1], HKV = k->ne[2];
-    return fa_dec_on() && nq <= FA_DEC_MAXQ && D == 128 && HKV > 0 && H % HKV == 0 && gpu_ok() && gen9blas_attn_dec_supported((int) D, (int) (H / HKV)) &&
+    return fa_dec_on() && nq <= FA_DEC_MAXQ && D == 128 && HKV > 0 && H % HKV == 0 && gpu_ok() && gen9blas_attn_dec_supported((int) D, (int) H, (int) HKV) &&
         k->ne[3] == ns && v->ne[3] == ns && k->ne[0] == D && v->ne[0] == D && v->ne[1] == nk && v->ne[2] == HKV && nk <= INT_MAX && ns <= 64 &&
         !op->src[5] && q->nb[0] == 4 && q->nb[1] % 4 == 0 && q->nb[2] % 4 == 0 && q->nb[3] % 4 == 0 &&
         k->nb[0] == 2 && k->nb[1] % 16 == 0 && k->nb[2] % 16 == 0 && k->nb[3] % 2 == 0 &&
@@ -806,7 +803,7 @@ static void gen9_flash_attn_runs(gen9_context * ctx, struct ggml_cgraph * cg, in
 // The padding rows nv..nk (only when n_k % 16 != 0) are cleared on the CPU first, so masked keys always meet finite V.
 static bool fa_gpu_gather(void) { static const bool v = [] { const char * e = getenv("GEN9_ATTN_GPU_GATHER"); return !(e && !strcmp(e, "0")); }(); return v; }
 static void gen9_flash_attn_f32kv(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
-    const bool f16 = cg->nodes[i]->src[1]->type == GGML_TYPE_F16, gg = f16 && fa_gpu_gather() && gen9blas_cpy_supported();
+    const bool f16 = cg->nodes[i]->src[1]->type == GGML_TYPE_F16, gg = f16 && fa_gpu_gather() && gen9blas_has(GEN9BLAS_FEAT_CPY);
     if (f16 && !gg) ew_flush(ctx);   // F16 K/V gathered on the CPU (queued SET_ROWS / CPY first)
     static char * stage = nullptr; static size_t stage_bytes = 0;   // [K rows | V rows | pad], used under gpu_mu
     struct ggml_tensor * dst = cg->nodes[i];
@@ -841,7 +838,7 @@ static void gen9_flash_attn_f32kv(gen9_context * ctx, struct ggml_cgraph * cg, i
                 const long dnb[4] = { 2, (long) row, (long) D * 2, (long) nk * (long) row };
                 long kne[4], knb[4], vne[4], vnb[4];
                 gen9_shape(k, kne, knb); gen9_shape(v, vne, vnb);
-                if (gen9blas_cpy_any(k->data, 1, kne, knb, ks, 1, kne, dnb, !span) || gen9blas_cpy_any(v->data, 1, vne, vnb, vs, 1, vne, dnb, !span)) {
+                if (gen9blas_cpy_any(k->data, GEN9BLAS_H, kne, knb, ks, GEN9BLAS_H, kne, dnb, !span) || gen9blas_cpy_any(v->data, GEN9BLAS_H, vne, vnb, vs, GEN9BLAS_H, vne, dnb, !span)) {
                     fprintf(stderr, "gen9: K/V gather on the GPU failed: %s\n", gen9blas_error()); fin = false;
                 }
                 if (span) ctx->ew_pending = true;   // queued: a declined attention or the split end must still wait
@@ -1106,7 +1103,7 @@ static bool gen9_try_multi(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
         std::lock_guard<std::mutex> lk(gpu_mu);
         bool ok = true;
         for (int g = 0; g < n; g++) { P[g] = get_packed(ctx, cg->nodes[grp[g]]->src[0]); ok &= P[g].P && P[g].t == GEN9BLAS_HS; }
-        std::vector<const gen9blas_packed *> pp(n); std::vector<float *> C(n);
+        std::vector<const gen9blas_packed_b *> pp(n); std::vector<float *> C(n);
         for (int g = 0; g < n; g++) { pp[g] = P[g].P; C[g] = (float *) cg->nodes[grp[g]]->data; ldc[g] = (int) (cg->nodes[grp[g]]->nb[1] / 4); }
         rc = ok ? gen9blas_gemm_multi_f16w(M, (const float *) x->data, (int) (x->nb[1] / 4), n, pp.data(), C.data(), ldc.data(), nf.data()) : 1;
         for (int g = 0; g < n; g++) release(P[g]);
@@ -1204,9 +1201,9 @@ static int gen9_layer_norm(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
     // the GEMM input packed by the norm itself when a MUL_MAT with an FP16-packed weight reads this output (whisper:
     // Q, K, V after norm1, fc1 after norm2); GEN9_NORMPACK=0 turns it off
     gen9blas_packed_a * pa = nullptr;
-    if (!normpack_off() && gen9blas_norm_pack_supported() && norm_feeds_mm(cg, i + used, out, K)) {
+    if (!normpack_off() && gen9blas_has(GEN9BLAS_FEAT_NORM_PACK) && norm_feeds_mm(cg, i + used, out, K)) {
         const int s = ctx->pa_next++ & 1;
-        if (!ctx->pa_pool[s]) ctx->pa_pool[s] = gen9blas_packed_a_new();
+        if (!ctx->pa_pool[s]) ctx->pa_pool[s] = gen9blas_packed_a_create();
         pa = ctx->pa_pool[s];
         for (auto it = ctx->pa_map.begin(); it != ctx->pa_map.end();) it = it->second.pa == pa ? ctx->pa_map.erase(it) : std::next(it);
     }
@@ -1271,7 +1268,7 @@ static bool gen9_binop(gen9_context * ctx, struct ggml_tensor * node) {
     const int op = node->op == GGML_OP_MUL;
     int rc;
     { std::lock_guard<std::mutex> lk(gpu_mu);
-      rc = gen9blas_binop_rows2(op, M, K, (const float *) a->data, K, (const float *) b->data, ldb, bs0, (float *) node->data, K, ctx->ew_sync); }
+      rc = gen9blas_binop_rows(op, M, K, (const float *) a->data, K, (const float *) b->data, ldb, bs0, (float *) node->data, K, ctx->ew_sync); }
     if (!ew_after(ctx, rc, op ? "MUL" : "ADD")) return false;
     (op ? n_ew_mul : n_ew_add)++;
     return true;
@@ -1324,7 +1321,7 @@ static bool gen9_cpy(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
     gen9_shape(a, sne, snb); gen9_shape(node, dne, dnb);
     int rc;
     { std::lock_guard<std::mutex> lk(gpu_mu);
-      rc = gen9blas_cpy_any(a->data, a->type == GGML_TYPE_F16, sne, snb, node->data, node->type == GGML_TYPE_F16, dne, dnb, ctx->ew_sync); }
+      rc = gen9blas_cpy_any(a->data, a->type == GGML_TYPE_F16 ? GEN9BLAS_H : GEN9BLAS_S, sne, snb, node->data, node->type == GGML_TYPE_F16 ? GEN9BLAS_H : GEN9BLAS_S, dne, dnb, ctx->ew_sync); }
     if (!ew_after(ctx, rc, "CPY")) return false;
     n_ew_cpy++;
     return true;
@@ -1406,7 +1403,7 @@ static bool overlap(const struct ggml_tensor * a, const struct ggml_tensor * b) 
     return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
 }
 static int gen9_try_epi(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
-    if (epi_off() || !gen9blas_epilog_ext_supported()) return 0;
+    if (epi_off() || !gen9blas_has(GEN9BLAS_FEAT_EPILOG_EXT)) return 0;
     struct ggml_tensor * mm = cg->nodes[i];
     const struct ggml_tensor * w = mm->src[0], * x = mm->src[1];
     // F16 or a quantized weight with to_float (Q8_0 model): both are packed as FP16 (HS), the epilogue is the same
@@ -1437,7 +1434,7 @@ static int gen9_try_epi(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
     {
         std::lock_guard<std::mutex> lk(gpu_mu);
         packed_t p = get_packed(ctx, w);
-        if (!p.P || p.t != GEN9BLAS_HS) { if (p.P && p.temp) gen9blas_packed_free(p.P); return 0; }
+        if (!p.P || p.t != GEN9BLAS_HS) { if (p.P && p.temp) gen9blas_packed_b_free(p.P); return 0; }
         auto pit = ctx->pa_map.find(x);
         if (pit != ctx->pa_map.end() && pit->second.data == x->data) {
             n_pa_used++;
@@ -1446,7 +1443,7 @@ static int gen9_try_epi(gen9_context * ctx, struct ggml_cgraph * cg, int i) {
         } else
             rc = gen9blas_gemm_pb_f16w_ex(M, (const float *) x->data, (int) (x->nb[1] / sizeof(float)), p.P, (float *) out->data,
                                           (int) (out->nb[1] / sizeof(float)), (const float *) bias->data, gelu, R, ldr, &nonfinite);
-        if (p.temp) { gen9blas_flush(); gen9blas_packed_free(p.P); }
+        if (p.temp) { gen9blas_flush(); gen9blas_packed_b_free(p.P); }
     }
     (void) K;
     if (rc) { fprintf(stderr, "gen9: fused MUL_MAT %s failed: %s\n", w->name, gen9blas_error()); return 0; }
@@ -1477,8 +1474,8 @@ static enum ggml_status gen9_graph_compute(ggml_backend_t backend, struct ggml_c
     }
     ew_begin(ctx, cgraph);
     struct ew_guard { gen9_context * c; ~ew_guard() { ew_end(c); } } guard{ ctx };
-    struct nw_guard { gen9_context * c; ~nw_guard() { if (c->nw) { std::lock_guard<std::mutex> lk(gpu_mu); gen9blas_flush(); gen9blas_nowait_check(); gen9blas_nowait(0); c->nw = false; } } } nwg{ ctx };
-    if (ctx->nw) { std::lock_guard<std::mutex> lk(gpu_mu); gen9blas_nowait(1); n_nw_splits++; }
+    struct nw_guard { gen9_context * c; ~nw_guard() { if (c->nw) { std::lock_guard<std::mutex> lk(gpu_mu); gen9blas_flush(); gen9blas_nowait_pending(); gen9blas_set_nowait(0); c->nw = false; } } } nwg{ ctx };
+    if (ctx->nw) { std::lock_guard<std::mutex> lk(gpu_mu); gen9blas_set_nowait(1); n_nw_splits++; }
     ctx->done.assign(cgraph->n_nodes, 0);
     // pa_map is NOT cleared per split: whisper's norm1 output feeds K, V and Q in three different splits (the K / V
     // copies into the cache run on the CPU in between); entries are checked against the tensor's data pointer
@@ -1590,8 +1587,8 @@ static enum ggml_status gen9_graph_compute(ggml_backend_t backend, struct ggml_c
         std::lock_guard<std::mutex> lk(gpu_mu);
         if (gen9blas_flush()) { fprintf(stderr, "gen9: flush failed: %s\n", gen9blas_error()); return GGML_STATUS_FAILED; }
         ctx->ew_pending = false;
-        const int bad = gen9blas_nowait_check();
-        gen9blas_nowait(0); ctx->nw = false;
+        const int bad = gen9blas_nowait_pending();
+        gen9blas_set_nowait(0); ctx->nw = false;
         if (bad) { n_nw_overflow++; fprintf(stderr, "gen9: %d no-wait products overflowed FP16; graph failed (rerun without GEN9_MM_NOWAIT)\n", bad); return GGML_STATUS_FAILED; }
     }
     return GGML_STATUS_SUCCESS;
@@ -1769,7 +1766,7 @@ static bool gen9_supports_ew(const struct ggml_tensor * op) {
                 for (int k = 0; k < 4; k++) if (!fits_int(t->ne[k]) || t->nb[k] % es) return false;
                 return fits_int(t->ne[0] * t->ne[1]) && fits_int(t->ne[2] * t->ne[3]);
             };
-            ok = vision_ops_on() && t_ok(a) && t_ok(op) && ggml_nelements(a) == ggml_nelements(op) && gpu_ok() && gen9blas_cpy_supported() &&
+            ok = vision_ops_on() && t_ok(a) && t_ok(op) && ggml_nelements(a) == ggml_nelements(op) && gpu_ok() && gen9blas_has(GEN9BLAS_FEAT_CPY) &&
                  ggml_nrows(op) >= ew_min_rows();
             break;
         }
@@ -1779,13 +1776,13 @@ static bool gen9_supports_ew(const struct ggml_tensor * op) {
             ok = vision_ops_on() && a->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && ((mf & 0xFF) == 0 || (mf & 0xFF) == 1) &&
                  !(mf & ~0x3FF) && a->nb[0] % 4 == 0 && a->nb[1] % 4 == 0 && a->nb[2] % 4 == 0 && a->nb[3] % 4 == 0 &&
                  op->nb[0] % 4 == 0 && op->nb[1] % 4 == 0 && op->nb[2] % 4 == 0 && op->nb[3] % 4 == 0 &&
-                 fits_int(op->ne[0] * op->ne[1]) && fits_int(op->ne[2] * op->ne[3]) && gpu_ok() && gen9blas_cpy_supported();
+                 fits_int(op->ne[0] * op->ne[1]) && fits_int(op->ne[2] * op->ne[3]) && gpu_ok() && gen9blas_has(GEN9BLAS_FEAT_CPY);
             break;
         }
         case GGML_OP_SET_ROWS: {   // F32 rows into an F16 tensor (llama.cpp's KV-cache writes), gen9blas_set_rows_f16
             const struct ggml_tensor * a = op->src[0], * ix = op->src[1];
             static const bool on = [] { const char * e = getenv("GEN9_EW_SETROWS"); return e && !strcmp(e, "1"); }();   // opt-in
-            ok = on && a->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F16 && gpu_ok() && gen9blas_set_rows_supported() &&
+            ok = on && a->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F16 && gpu_ok() && gen9blas_has(GEN9BLAS_FEAT_SET_ROWS) &&
                  (ix->type == GGML_TYPE_I64 || ix->type == GGML_TYPE_I32) && a->nb[0] == 4 && op->nb[0] == 2 &&
                  a->nb[1] % 4 == 0 && a->nb[2] % 4 == 0 && a->nb[3] % 4 == 0 && op->nb[1] % 2 == 0 && op->nb[2] % 2 == 0 &&
                  op->nb[3] % 2 == 0 && op->ne[0] == a->ne[0] && op->ne[2] == a->ne[2] && op->ne[3] == a->ne[3] &&
@@ -1822,12 +1819,12 @@ static bool gen9_supports_ew(const struct ggml_tensor * op) {
                      fits_int(x->ne[1]) && fits_int(x->ne[2]) && n_dims % 2 == 0 &&
                      pos && pos->type == GGML_TYPE_I32 && ggml_is_contiguous(pos) && pos->ne[0] == 4 * x->ne[2] &&
                      (!ff || (ff->type == GGML_TYPE_F32 && ggml_is_contiguous(ff) && ff->ne[0] >= n_dims)) &&
-                     gpu_ok() && gen9blas_rope_multi_supported() && x->ne[2] >= ew_min_rows();
+                     gpu_ok() && gen9blas_has(GEN9BLAS_FEAT_ROPE_MULTI) && x->ne[2] >= ew_min_rows();
                 break;
             }
             ok = x->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && ggml_is_contiguous(op) && ggml_are_same_shape(x, op) &&
                  (mode == GGML_ROPE_TYPE_NORMAL || mode == GGML_ROPE_TYPE_NEOX ||
-                  (mode == GGML_ROPE_TYPE_MROPE && mrope_on() && gpu_ok() && gen9blas_rope_multi_supported())) && n_dims == x->ne[0] && n_offs == 0 &&
+                  (mode == GGML_ROPE_TYPE_MROPE && mrope_on() && gpu_ok() && gen9blas_has(GEN9BLAS_FEAT_ROPE_MULTI))) && n_dims == x->ne[0] && n_offs == 0 &&
                  x->ne[3] == 1 && x->nb[0] == 4 && x->nb[1] % 4 == 0 && x->nb[2] % 4 == 0 &&
                  x->nb[1] >= (size_t) n_dims * 4 && x->nb[2] >= (x->ne[1] - 1) * x->nb[1] + (size_t) n_dims * 4 &&
                  fits_int(x->ne[1]) && fits_int(x->ne[2]) && n_dims % 2 == 0 &&
