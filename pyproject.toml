@@ -1,0 +1,9 @@
+# ggml-intel-igpu: Python only for tools (ggml-backend/tools/test_dequant.py, bench/token_*.py). uv sync
+[project]
+name = "ggml-intel-igpu"
+version = "0.2.0"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+
+[tool.uv]
+package = false
