@@ -1,0 +1,25 @@
+Gate 3 of bench/whisper/PLAN-dekoder-gpu.md: one whole whisper-large-v3-turbo shaped decoder step on the GPU
+(dec/dec_proto.c + dec/dec.cl, kcl, one wait per step), S streams x B beams = R rows, context L = 150, random FP16
+weights (316 MB) and caches, gp (single-channel DDR4), 2026-11-15 01:30.
+Step = 4 x [LN+pack, QKV GEMM (fused, N 3840), q/k/v epilogue into the self cache, self-attention, pack, O GEMM + residual,
+LN+pack, cross-Q GEMM, cross-attention over the stream's 1500 encoder frames (beams of a stream share K/V), pack,
+cross-O GEMM + residual, LN+pack, fc1 GEMM + GELU, pack, fc2 GEMM + residual] + final LN + vocabulary GEMM: 87 kernels.
+Correctness vs a CPU reference (1 layer, vocabulary 2000, same half-rounded weights/caches): x max |diff| 2-3e-3 of
+~2.9, logits 3-4e-3, argmax agree 40/40 (S 8 B 5), 16/16 (S 16 B 1), 79/80 (S 16 B 5, near tie).
+
+Cross-attention first version (one work-group per stream x head, 34 KB SLM -> 1 group per subslice): 87 ms of 137 ms
+at S 8 B 5. Split-K over 6 frame chunks (+ log-sum-exp merge kernel, FlashDecoding-style): 35 ms.
+
+                         step       per row-token   per stream-step   CPU today (gp, Q8_0)
+  S  1 B 1               36.4 ms    36.4 ms                           13.4 ms/token greedy
+  S  8 B 1               69.9 ms     8.7 ms                           -> 1.5x
+  S 16 B 1              107.6 ms     6.7 ms                           -> 2.0x
+  S  1 B 5               37.9 ms                     37.9 ms          25 ms per beam-5 step
+  S  4 B 5               57.6 ms                     14.4 ms          -> 1.7x
+  S  8 B 5               84.8 ms                     10.6 ms          -> 2.4x
+  S 16 B 5              140.8 ms                      8.8 ms          -> 2.8x
+Profile S 8 B 5 (84 ms): cross-attention 35.4 (42 %), vocabulary GEMM 13.5, self-attention 11.5, fc1+fc2 11.8,
+QKV 4.6, other GEMMs 4.3, epilogues/LN/pack/merge 2.8 ms; wall = GPU sum + 1 ms (one wait).
+Gate 3 (>= 2x the CPU): passed for beam 5 with >= 8 streams (2.4-2.8x) and greedy with 16 streams (2.0x).
+Headroom: cross-attention is ~1.9x above its bandwidth floor (30.7 MB per stream and step at 13 GB/s = 2.4 ms ->
+19 ms at S 8), Q8_0 weights read directly would halve the weight part (~35 ms -> ~18 ms), kp has twice the bandwidth.
