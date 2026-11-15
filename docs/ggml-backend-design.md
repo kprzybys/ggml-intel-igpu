@@ -168,7 +168,7 @@ the F32 epilogue / direct write reduces a non-finite flag, and a call with a non
 | pack B transposed, F32 / F16 (`pkf_b_t`, `pk_b16_t`) | exist; **need banding** (section 4) |
 | pack A F32 -> F16 with overflow check | **new** (variant of `pk_a3`) |
 | F16 GEMM writing F32 C | **new** epilogue / direct write |
-| GEMV / skinny (M <= 16) on the packed layout | **new** (step 2). Layout: panels of 16 columns, for each k the 16 values contiguous (`PKF_IDX_B`, `bench/sgemm.cl:133`) [SRC]. [HYP] one subgroup per panel, lane = output column, Kp x 64 B streamed; N = 256 / 1536 give only 16 / 96 panels for 168 hardware threads, so K is split across subgroups and reduced |
+| GEMV / skinny (M <= 16) on the packed layout | **new** (step 2). Layout: panels of 16 columns, for each k the 16 values contiguous (`PKF_IDX_B`, `lib/kernels/sgemm.cl:133`) [SRC]. [HYP] one subgroup per panel, lane = output column, Kp x 64 B streamed; N = 256 / 1536 give only 16 / 96 panels for 168 hardware threads, so K is split across subgroups and reduced |
 
 ## 6. Model and predictions
 
