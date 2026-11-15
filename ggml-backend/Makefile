@@ -15,6 +15,9 @@ libggml-gen9.so: ggml-gen9.cpp ../lib/gen9blas.h ../lib/libgen9blas.so
 test_vision: test_vision.cpp
 	g++ -std=c++17 -O2 -Wall -I$(LLAMA)/ggml/include -o $@ $< -L$(LLAMA_BUILD)/bin -lggml -lggml-base -lggml-cpu -Wl,-rpath,$(LLAMA_BUILD)/bin
 
+test_dec: test_dec.cpp
+	g++ -std=c++17 -O2 -Wall -I$(LLAMA)/ggml/include -o $@ $< -L$(LLAMA_BUILD)/bin -lggml -lggml-base -lggml-cpu -Wl,-rpath,$(LLAMA_BUILD)/bin
+
 test_attn: test_attn.cpp
 	g++ -std=c++17 -O2 -Wall -I$(LLAMA)/ggml/include -o $@ $< -L$(LLAMA_BUILD)/bin -lggml -lggml-base -lggml-cpu -Wl,-rpath,$(LLAMA_BUILD)/bin
 

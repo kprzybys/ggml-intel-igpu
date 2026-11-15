@@ -54,7 +54,7 @@ static std::atomic<double> t_dequant_s{0}, t_deq_alloc_s{0}, t_deq_cpu_s{0}, t_d
 static std::atomic<long> n_fa_asked{0}, n_fa_off{0}, n_fa_decl_type{0}, n_fa_decl_param{0}, n_fa_decl_shape{0}, n_fa_decl_layout{0},
                          n_fa_decl_nq{0}, n_fa_decl_mask{0}, n_fa_decl_gpu{0};
 static std::atomic<long> n_fa_gpu{0}, n_fa_launch{0}, n_fa_rows{0}, n_fa_cpu_mask{0}, n_fa_cpu_rows{0}, n_fa_cpu_lib{0}, n_fa_cpu_err{0};
-static std::atomic<long> n_fa_streams{0}, n_fa_streams_cpu{0}, n_fa_verify{0};
+static std::atomic<long> n_fa_streams{0}, n_fa_streams_cpu{0}, n_fa_verify{0}, n_fa_dec{0};
 static double fa_verify_max = 0;
 static std::atomic<long> n_fa_f16gather{0}, n_ew_setrows{0}, n_nw_splits{0}, n_nw_overflow{0};
 // GEN9_EW_VISION=0: CPY/CONT/DUP, UPSCALE and ROPE mode VISION stay on ggml-cpu (mtmd vision encoders, PaddleOCR-VL)
@@ -76,7 +76,7 @@ static std::atomic<long> pr_n[PR_N];
 static bool prof_on(void) { static const bool v = getenv("GEN9_PROF") && atoi(getenv("GEN9_PROF")) != 0; return v; }
 
 static void gen9_report(void) {
-    fprintf(stderr, "gen9: FLASH_ATTN_EXT with KV streams on the GPU %ld, back to ggml-cpu %ld; GEN9_ATTN_VERIFY nodes %ld, max NMSE %.3e\n", n_fa_streams.load(), n_fa_streams_cpu.load(), n_fa_verify.load(), fa_verify_max);
+    fprintf(stderr, "gen9: FLASH_ATTN_EXT with KV streams on the GPU %ld (decoding kernel %ld), back to ggml-cpu %ld; GEN9_ATTN_VERIFY nodes %ld, max NMSE %.3e\n", n_fa_streams.load() + n_fa_dec.load(), n_fa_dec.load(), n_fa_streams_cpu.load(), n_fa_verify.load(), fa_verify_max);
     fprintf(stderr, "gen9: no-wait splits (GEN9_MM_NOWAIT) %ld, failed on FP16 overflow %ld\n", n_nw_splits.load(), n_nw_overflow.load());
     fprintf(stderr, "gen9: MUL_MAT groups on one input (Q/K/V) %ld covering %ld MUL_MATs; candidates refused for memory overlap %ld; "
             "outputs recomputed in F32 after FP16 overflow %ld\n", n_multi_groups.load(), n_multi_mm.load(), n_multi_overlap.load(),
@@ -542,8 +542,25 @@ static void fa_shape_info(const struct ggml_tensor * op, const char * why) {
 // KV streams (llama-server -np N, ggml ne[3] = streams): F16 K/V in llama.cpp's per-stream cache layout, one F16 mask per
 // stream (or one for all), no kv_rows; any n_q (decoding: 1 per stream). gen9blas_attn_f16kv_streams. Opt-in: GEN9_ATTN_STREAMS=1
 // (no measured gain on whole PaddleOCR-VL pages yet: kp-docsearch docs/plan-paddle-gen9.md).
+// Decoding (n_q <= 32 per stream, GEN9_ATTN_DEC_MAXQ; D 128, G <= 8; measured: n_q 32 2.4x ggml-cpu, 64 / 128 slower): gen9blas_attn_dec reads K/V in the cache layout in place (no transposed
+// copy), split over keys; on by default, GEN9_ATTN_DEC=0 turns it off. Larger n_q: the streams kernel above (opt-in).
+static bool fa_dec_on(void) { static const bool v = [] { const char * e = getenv("GEN9_ATTN_DEC"); return !(e && !strcmp(e, "0")); }(); return v; }
+static const int64_t FA_DEC_MAXQ = [] { const char * e = getenv("GEN9_ATTN_DEC_MAXQ"); return (int64_t) (e && atoi(e) > 0 ? atoi(e) : 32); }();
+static bool fa_dec_ok(const struct ggml_tensor * op) {
+    const struct ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2], * m = op->src[3];
+    const int64_t D = q->ne[0], nq = q->ne[1], H = q->ne[2], ns = q->ne[3], nk = k->ne[1], HKV = k->ne[2];
+    return fa_dec_on() && nq <= FA_DEC_MAXQ && D == 128 && HKV > 0 && H % HKV == 0 && gpu_ok() && gen9blas_attn_dec_supported((int) D, (int) (H / HKV)) &&
+        k->ne[3] == ns && v->ne[3] == ns && k->ne[0] == D && v->ne[0] == D && v->ne[1] == nk && v->ne[2] == HKV && nk <= INT_MAX && ns <= 64 &&
+        !op->src[5] && q->nb[0] == 4 && q->nb[1] % 4 == 0 && q->nb[2] % 4 == 0 && q->nb[3] % 4 == 0 &&
+        k->nb[0] == 2 && k->nb[1] % 16 == 0 && k->nb[2] % 16 == 0 && k->nb[3] % 2 == 0 &&
+        v->nb[0] == 2 && v->nb[1] % 16 == 0 && v->nb[2] % 16 == 0 && v->nb[3] % 2 == 0 &&
+        ggml_is_contiguous(op) && op->ne[0] == D && op->ne[1] == H && op->ne[2] == nq && op->ne[3] == ns &&
+        m && m->type == GGML_TYPE_F16 && m->nb[0] == 2 && m->ne[0] == nk && m->ne[1] >= nq && m->ne[2] == 1 &&
+        (m->ne[3] == ns || m->ne[3] == 1);
+}
 static bool fa_streams_ok(const struct ggml_tensor * op) {
     static const bool off = [] { const char * e = getenv("GEN9_ATTN_STREAMS"); return !(e && !strcmp(e, "1")); }();   // opt-in
+    if (fa_dec_ok(op)) return true;
     const struct ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2], * m = op->src[3];
     const int64_t D = q->ne[0], nq = q->ne[1], H = q->ne[2], ns = q->ne[3], nk = k->ne[1], HKV = k->ne[2];
     const size_t row = (size_t) (HKV * D * 2);
@@ -887,6 +904,37 @@ static void gen9_flash_attn_streams(gen9_context * ctx, struct ggml_cgraph * cg,
         const struct ggml_tensor * b = t->view_src ? t->view_src : t;
         return (size_t) ((const char *) b->data + ggml_nbytes(b) - (const char *) t->data);
     };
+    if (nq <= FA_DEC_MAXQ && fa_dec_ok(dst)) {   // decoding: queued like the elementwise ops (no wait here)
+        const int units = ns * nq * HKV;   // work-groups per chunk; aim at ~2 subgroups per hardware thread (24 EU x 7)
+        int chunk = (int) ((int64_t) nkl * units / 336 + 15) / 16 * 16;
+        chunk = std::max(64, std::min(512, chunk));
+        int rc;
+        { std::lock_guard<std::mutex> lk(gpu_mu);
+          rc = gen9blas_attn_dec(D, H, HKV, ns, nq, nkl, (const float *) q->data, (long) (q->nb[1] / 4), (long) (q->nb[2] / 4), (long) (q->nb[3] / 4),
+                                 (const uint16_t *) k->data, (long) (k->nb[1] / 2), (long) (k->nb[2] / 2), (long) (k->nb[3] / 2), reg_bytes(k),
+                                 (const uint16_t *) v->data, (long) (v->nb[1] / 2), (long) (v->nb[2] / 2), (long) (v->nb[3] / 2), reg_bytes(v),
+                                 (float *) dst->data, fa_param(dst, 0), vis.data(), dv, chunk, ctx->ew_sync); }
+        if (rc) { fprintf(stderr, "gen9: decoding attention failed (%s); ggml-cpu\n", gen9blas_error()); n_fa_cpu_err++; n_fa_streams_cpu++; fa_on_cpu(ctx, cg, i); return; }
+        ctx->ew_pending = !ctx->ew_sync;
+        static const bool verify = getenv("GEN9_ATTN_VERIFY") != nullptr;
+        if (verify) {
+            ew_flush(ctx);
+            const size_t n = ggml_nelements(dst);
+            std::vector<float> g((const float *) dst->data, (const float *) dst->data + n);
+            fa_on_cpu(ctx, cg, i);
+            const float * c = (const float *) dst->data;
+            double se = 0, sr = 0;
+            for (size_t x = 0; x < n; x++) { const double e = (double) g[x] - c[x]; se += e * e; sr += (double) c[x] * c[x]; }
+            const double nmse = sr > 0 ? se / sr : se;
+            if (nmse > fa_verify_max) fa_verify_max = nmse;
+            n_fa_verify++;
+        }
+        double fl = 0;
+        for (int st = 0; st < ns; st++) for (int t = 0; t < nq; t++) fl += 4.0 * H * D * std::min(vis[st] + dv * t, nkl);
+        n_fa_gpu++; n_fa_dec++; n_fa_launch += 2; fa_flop = fa_flop + fl;
+        t_fa_gpu_s = t_fa_gpu_s + std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
+        return;
+    }
     int launches = 0, rc;
     {
         std::lock_guard<std::mutex> lk(gpu_mu);
