@@ -118,9 +118,15 @@ int main(int argc, char ** argv) {
     }
     printf("D=%d H=%d HKV=%d n_q=%d depth=%d kv_size=%d n_kv=%d mode=%s qrange=%g: GEN9 supports_op %d\n", D, H, HKV, nq, depth,
            kv_size, n_kv, mode.c_str(), qrange, (int) ggml_backend_supports_op(gen9, og));
-    if (!ggml_backend_supports_op(gen9, og)) return 0;
     auto now = [] { return std::chrono::steady_clock::now(); };
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    if (!ggml_backend_supports_op(gen9, og)) {   // TEST_ATTN_CPU=1: time ggml-cpu alone (shapes without a GPU kernel yet)
+        if (!getenv("TEST_ATTN_CPU")) return 0;
+        double tc = 1e30;
+        for (int r = 0; r < 3; r++) { auto b = now(); ggml_backend_graph_compute(cpu, gc); tc = std::min(tc, ms(b, now())); }
+        printf("  best of 3: ggml-cpu %.2f ms\n", tc);
+        return 0;
+    }
     double tg = 1e30, tc = 1e30;
     for (int r = 0; r < 3; r++) {
         memset(og->data, 0xff, ggml_nbytes(og));   // NaN: anything not written shows up

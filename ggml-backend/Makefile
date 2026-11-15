@@ -12,6 +12,12 @@ libggml-gen9.so: ggml-gen9.cpp ../lib/gen9blas.h ../lib/libgen9blas.so
 	    -Wl,-rpath,$(LLAMA_BUILD)/bin -Wl,-rpath,$(abspath ../lib)
 
 # FLASH_ATTN_EXT through GEN9 vs ggml-cpu in llama.cpp's layouts (docs/attention-gpu.md section 11)
+test_vision: test_vision.cpp
+	g++ -std=c++17 -O2 -Wall -I$(LLAMA)/ggml/include -o $@ $< -L$(LLAMA_BUILD)/bin -lggml -lggml-base -lggml-cpu -Wl,-rpath,$(LLAMA_BUILD)/bin
+
+test_dec: test_dec.cpp
+	g++ -std=c++17 -O2 -Wall -I$(LLAMA)/ggml/include -o $@ $< -L$(LLAMA_BUILD)/bin -lggml -lggml-base -lggml-cpu -Wl,-rpath,$(LLAMA_BUILD)/bin
+
 test_attn: test_attn.cpp
 	g++ -std=c++17 -O2 -Wall -I$(LLAMA)/ggml/include -o $@ $< -L$(LLAMA_BUILD)/bin -lggml -lggml-base -lggml-cpu -Wl,-rpath,$(LLAMA_BUILD)/bin
 
