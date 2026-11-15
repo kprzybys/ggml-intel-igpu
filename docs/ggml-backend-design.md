@@ -98,7 +98,7 @@ Chosen for steps 1-2 (alternatives in section 3.3).
   LD_PRELOAD runs already read these weights through userptr with llama-bench's default mmap load [MEAS], so this works.
   Two library changes are needed: (a) a kcl call to release a userptr object after packing (today objects stay in the
   LRU, pinned, up to `KCL_USERPTR_MB`); (b) since userptr resolution is lazy and a failure only appears at kernel
-  argument / execbuf time (`kcl.c:519`), and `GEN9BLAS_NO_USERPTR` is read once (`gen9blas.c:278`), `pack_b` needs a
+  argument / execbuf time (`kcl.c:519`), and `GEN9BLAS_NO_USERPTR` is read once (`lib/src/core.c`, `get_obj`), `pack_b` needs a
   per-call "copy through the CPU" flag and retries with it on failure.
 
 ### 3.2 Memory
@@ -124,7 +124,7 @@ weights and the kernel can drop those pages. Step 1 measures F16 first, F32 as a
 ## 4. What gen9blas needs to expose
 
 The library already packs once and launches many times internally (`pack_dev`, `launch` with row bands below
-`GEN9BLAS_MAX_LAUNCH_MS` = 100 ms, `lib/gen9blas.c:404-486`) [SRC]; `roadmap.md` item 7 already notes that packed
+`GEN9BLAS_MAX_LAUNCH_MS` = 100 ms, `lib/src/gemm.c` `launch`; line numbers in the pre-split `lib/gen9blas.c` were 404-486) [SRC]; `roadmap.md` item 7 already notes that packed
 weights need an explicit API. Proposed (names provisional):
 
 ```c
@@ -141,7 +141,7 @@ ggml-blas makes (RowMajor, NoTrans, Trans; `ggml-blas.cpp:142`) [SRC], so `pack_
 weight. `gemm_pb` keeps activation packing (0.14 s per pass), 100 ms row bands, direct write into C when M and N are
 tile multiples, userptr for the activations and C.
 
-**Packing must be banded too (prerequisite of step 1).** `pack_dev` issues one launch (`lib/gen9blas.c:404-413`)
+**Packing must be banded too (prerequisite of step 1).** `pack_dev` issues one launch (`lib/src/gemm.c`)
 [SRC]. The measured packing rate is ~4 GB/s (1.26 s for ~5.1 GB of weights per pass) [MEAS], so packing
 `output.weight` (1536 x 151936 F32, 0.93 GB) would be one ~230 ms launch, 2.3x the 100 ms policy [HYP from the rate].
 `pack_b` splits the work into panel ranges of at most ~400 MB (~100 ms). Offsets inside kernels must be 64-bit for

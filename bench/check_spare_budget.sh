@@ -1,5 +1,5 @@
 #!/bin/sh
-# Do the spare packed buffers (lib/gen9blas.c packed_buf, GEN9BLAS_SPARE_MB) make the GEN9 backend hold more memory than
+# Do the spare packed buffers (lib/src/packed.c packed_buf, GEN9BLAS_SPARE_MB) make the GEN9 backend hold more memory than
 # GEN9_CACHE_MB + the spare cap? Risk from the 2026-11-13 review: a small weight that fits the cache budget takes a large
 # spare buffer (e.g. a 136 MB FFN buffer for a 3.7 MB k/v weight) and keeps it for good, so real memory exceeds the budget.
 # Runs llama-bench pp512 with a cache budget that leaves part of the weights packed per use, with the pool off and on,
