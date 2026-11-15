@@ -785,7 +785,7 @@ static void gen9_flash_attn_runs(gen9_context * ctx, struct ggml_cgraph * cg, in
                                          (float *) ((char *) dst->data + (size_t) r.t0 * qrow), fa_param(dst, 0), r.vis0, r.dvis, &nl);
         }
         if (rc) {
-            if (rc < 0) { n_fa_cpu_err++; fprintf(stderr, "gen9: attention on the GPU failed (%s); ggml-cpu\n", gen9blas_attn_error()); }
+            if (rc < 0) { n_fa_cpu_err++; fprintf(stderr, "gen9: attention on the GPU failed (%s); ggml-cpu\n", gen9blas_error()); }
             n_fa_cpu_blk++; fa_on_cpu(ctx, cg, i); return;
         }
         launches += nl;
@@ -885,7 +885,7 @@ static void gen9_flash_attn_f32kv(gen9_context * ctx, struct ggml_cgraph * cg, i
         }
     }
     if (rc) {
-        if (rc < 0) { n_fa_cpu_err++; fprintf(stderr, "gen9: attention on the GPU failed (%s); ggml-cpu\n", gen9blas_attn_error()); }
+        if (rc < 0) { n_fa_cpu_err++; fprintf(stderr, "gen9: attention on the GPU failed (%s); ggml-cpu\n", gen9blas_error()); }
         else {
             n_fa_cpu_lib++;
             static std::set<std::pair<int, int>> seen;   // GEN9_INFO: each declined (n_q, n_k) once
@@ -962,7 +962,7 @@ static void gen9_flash_attn_streams(gen9_context * ctx, struct ggml_cgraph * cg,
                                          (long) (v->nb[3] / 2), reg_bytes(v), (float *) dst->data, fa_param(dst, 0), vis.data(), dv, &launches);
     }
     if (rc) {
-        if (rc < 0) { n_fa_cpu_err++; fprintf(stderr, "gen9: stream attention on the GPU failed (%s); ggml-cpu\n", gen9blas_attn_error()); }
+        if (rc < 0) { n_fa_cpu_err++; fprintf(stderr, "gen9: stream attention on the GPU failed (%s); ggml-cpu\n", gen9blas_error()); }
         else n_fa_cpu_lib++;
         n_fa_streams_cpu++; fa_on_cpu(ctx, cg, i); return;
     }
@@ -1043,7 +1043,7 @@ static void gen9_flash_attn(gen9_context * ctx, struct ggml_cgraph * cg, int i) 
                                  (const uint16_t *) v->data, reg_bytes(v), (float *) dst->data, fa_param(dst, 0), vis0, dvis, &launches);
     }
     if (rc) {
-        if (rc < 0) { n_fa_cpu_err++; fprintf(stderr, "gen9: attention on the GPU failed (%s); ggml-cpu\n", gen9blas_attn_error()); }
+        if (rc < 0) { n_fa_cpu_err++; fprintf(stderr, "gen9: attention on the GPU failed (%s); ggml-cpu\n", gen9blas_error()); }
         else n_fa_cpu_lib++;
         fa_on_cpu(ctx, cg, i); return;
     }
