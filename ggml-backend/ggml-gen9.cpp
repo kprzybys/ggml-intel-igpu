@@ -149,12 +149,17 @@ struct wkey {
     bool operator<(const wkey & o) const { return std::tie(data, nbytes, type, ne0, ne1) < std::tie(o.data, o.nbytes, o.type, o.ne0, o.ne1); }
 };
 
-// The cache lives and dies with the backend, which llama.cpp frees with the context, before the model
+// The cache lives until the last backend instance is freed (llama.cpp frees it with the context, before the model
 // (design section 3.1): a data pointer cannot be reused for another weight while an entry exists.
 struct packed_t { gen9blas_packed * P; int t; bool temp = false; };   // temp: not cached, free after use   // t: GEN9BLAS_S (F32 GEMM) or GEN9BLAS_HS (accurate FP16 GEMM)
+// Packed weights are shared by every backend instance of the process (whisper.cpp -p N: one instance per state, same
+// model): one cache, freed by the last instance. Guarded by gpu_mu like the rest of the library state.
+struct gen9_wcache { std::map<wkey, packed_t> map; size_t bytes = 0; int refs = 0; };
+static gen9_wcache g_wcache;
 struct gen9_context {
-    std::map<wkey, packed_t> cache;
-    size_t cached_bytes = 0;
+    std::map<wkey, packed_t> & cache = g_wcache.map;
+    size_t & cached_bytes = g_wcache.bytes;
+    gen9_context() { std::lock_guard<std::mutex> lk(gpu_mu); g_wcache.refs++; }
     bool ew_sync = false, ew_pending = false, ew_cpu = false;   // ew_cpu: split without a waiting GPU call: elementwise ops on ggml-cpu
     std::vector<char> done;   // per graph_compute: nodes already computed by a MUL_MAT group   // per graph_compute: wait after each elementwise op / ops queued, not waited for
     ggml_backend_t cpu = nullptr;   // ggml-cpu for FLASH_ATTN_EXT nodes whose mask turns out not to be supported (created on first use)
@@ -167,7 +172,8 @@ struct gen9_context {
     ~gen9_context() {
         for (auto * pa : pa_pool) gen9blas_packed_a_free(pa);
         if (cpu) ggml_backend_free(cpu);
-        std::lock_guard<std::mutex> lk(gpu_mu); for (auto & kv : cache) gen9blas_packed_free(kv.second.P);
+        std::lock_guard<std::mutex> lk(gpu_mu);
+        if (--g_wcache.refs == 0) { for (auto & kv : cache) gen9blas_packed_free(kv.second.P); cache.clear(); cached_bytes = 0; }
     }
 };
 
